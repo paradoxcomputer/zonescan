@@ -1,0 +1,5 @@
+# Keep the build context tiny: the image only needs the prebuilt binary and the
+# entrypoint (the logo is embedded in the binary at compile time).
+**
+!target/release/zone-scan
+!docker-entrypoint.sh

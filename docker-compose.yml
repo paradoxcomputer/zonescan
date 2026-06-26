@@ -1,0 +1,27 @@
+# zone-scan via docker compose.
+#
+# Build the binary first (the decode/explorer build needs the LEZ workspace
+# alongside - see README "Building"):
+#   cargo build --release --features decode
+#   docker compose up --build
+#
+# Then open http://127.0.0.1:8088 and, on first run, the /admin page:
+#   - L1 node URL: your Logos node (clearnet or .onion)
+#   - SOCKS5 proxy: 127.0.0.1:9050  (the bundled Tor, for .onion nodes)
+#   - one row per sequencer (channel id [+ optional RPC url])
+services:
+  zone-scan:
+    build: .
+    image: zone-scan
+    container_name: zone-scan
+    ports:
+      - "8088:8088"
+    volumes:
+      - zone-scan-data:/data        # config.json + redb store + tor state
+    environment:
+      ZONE_SCAN_PORT: "8088"
+      ZONE_SCAN_TOR: "1"            # bundled Tor for .onion L1s; set 0 to use an external SOCKS
+    restart: unless-stopped
+
+volumes:
+  zone-scan-data:

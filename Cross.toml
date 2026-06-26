@@ -1,0 +1,11 @@
+# `cross` config for the aarch64-linux decode build.
+#
+# The `--features decode` build pulls the logos-blockchain `pol` crate (via the LEZ
+# `common` crate), whose build script embeds zk verification keys with `include_bytes!`
+# - so the `logos-blockchain-circuits` release must be present INSIDE the cross
+# container at build time. We mount the directory that `LOGOS_BLOCKCHAIN_CIRCUITS`
+# points at into the container (same path) and pass the variable through, so the
+# build script resolves it exactly as a native build would.
+[build.env]
+passthrough = ["LOGOS_BLOCKCHAIN_CIRCUITS", "CARGO_NET_GIT_FETCH_WITH_CLI"]
+volumes = ["LOGOS_BLOCKCHAIN_CIRCUITS"]

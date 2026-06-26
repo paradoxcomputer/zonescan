@@ -1,0 +1,246 @@
+name: release
+
+# Builds zone-scan for every supported target - a LIGHT binary (always) and, where the
+# heavy stack compiles, a FULL `--features decode` binary - attaches them (+ checksums.txt)
+# to a GitHub Release, then publishes the npm package `@paradoxcomputer/zonescan`.
+#
+# Triggered by pushing a tag like `v0.3.0`.
+#
+# ── Maintainer setup ────────────────────────────────────────────────────────
+#  * Repo secret NPM_TOKEN  - an npm automation token with publish rights on the
+#    @paradoxcomputer scope. Required by the `npm-publish` job; without it the
+#    publish step fails. (Settings → Secrets and variables → Actions → New
+#    repository secret → name: NPM_TOKEN.)
+#  * GITHUB_TOKEN is provided automatically; the `permissions: contents: write`
+#    below lets it create the Release and upload assets.
+#
+# ── light vs. full (decode) ─────────────────────────────────────────────────
+#  Every target ships `zone-scan-<triple>-light` (no decode - fast, reliable, no heavy
+#  deps). Targets whose heavy stack builds also ship `zone-scan-<triple>` (full per-tx
+#  decode). The npm installer downloads the full binary by default, the light one when
+#  ZONE_SCAN_DECODE is off (or as a fallback when a platform has no full build), so
+#  ZONE_SCAN_DECODE=0 users never need a Rust toolchain.
+#
+# ── About the decode build ──────────────────────────────────────────────────
+#  `--features decode` pulls common/nssa from the PUBLIC git dependency
+#  github.com/logos-blockchain/logos-execution-zone (pinned to the immutable tag
+#  v0.2.0-rc4 in Cargo.toml - a tag, not a branch commit, so it can't be GC'd) plus the
+#  logos-blockchain node stack, whose `pol` build embeds the zk circuits release (fetched
+#  below). It is unproven on windows-msvc / Intel mac, so those are best-effort - a
+#  failure there drops only the full binary, never the light one.
+#
+# Actions are pinned to commit SHAs (the trailing `# vN` is the human-readable tag).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create releases + upload assets
+
+env:
+  # The decode build pulls logos-blockchain `pol`, whose build script embeds zk
+  # verification keys via include_bytes!, so the circuits release must be present at
+  # build time. Pin the version the LEZ rev expects (must equal EXPECTED_CIRCUITS_VERSION
+  # in pol's build). The keys are platform-independent - one release covers every target.
+  CIRCUITS_VERSION: v0.4.2
+  # Fetch git deps via the git CLI - robust against libgit2 TLS quirks (notably inside
+  # the `cross` build container). github.com is reachable in all CI environments.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  # ── 1. Build per target: light always, full (decode) best-effort ──────────
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # No job-level continue-on-error: best-effort tolerance lives PER-LEG in the build step
+    # (a failed decode build on an `experimental` target is swallowed there, dropping only
+    # the full binary). That keeps a real LIGHT-build failure loud instead of silently
+    # shipping nothing for a platform.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # linux x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+            ext: ""
+          # linux arm64 (cross-compiled)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            ext: ""
+          # darwin x64 (Intel) - logos ships no Intel-mac node, so the decode stack is
+          # unproven there → full build is best-effort; light always ships.
+          - os: macos-13
+            target: x86_64-apple-darwin
+            cross: false
+            ext: ""
+            experimental: true
+          # darwin arm64 - logos's supported mac (they ship a macos-aarch64 node), so the
+          # full build is expected to work. Kept best-effort until the first release run
+          # confirms it on a real macos-14 runner (can't be cross-built/verified from linux);
+          # promote to required (drop `experimental`) once green.
+          - os: macos-14
+            target: aarch64-apple-darwin
+            cross: false
+            ext: ""
+            experimental: true
+          # win32 x64 - logos/risc0 C++ stack unproven on windows-msvc → full build is
+          # best-effort; the light binary always ships (asset gets .exe).
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+            ext: ".exe"
+            experimental: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # The decode build's `pol` build script embeds zk verification keys via include_bytes!,
+      # so the circuits release must be on disk before the build. zone-scan only DECODES
+      # (never proves), so the keys are inert at runtime - but must exist at build time.
+      # Keys are platform-independent, so the linux-x86_64 archive satisfies every target,
+      # including the aarch64 cross container (mounted into it via Cross.toml).
+      # Non-fatal: only the (decode) build needs circuits. If the download fails, this step
+      # still exits 0 and leaves LOGOS_BLOCKCHAIN_CIRCUITS unset - the decode build then
+      # fails on its own (loudly on required targets, swallowed on experimental ones), and
+      # the light build, which needs no circuits, is never blocked by a circuits hiccup.
+      - name: Fetch logos-blockchain circuits
+        shell: bash
+        run: |
+          CIRC="$HOME/.logos-blockchain-circuits"
+          mkdir -p "$CIRC"
+          url="https://github.com/logos-blockchain/logos-blockchain-circuits/releases/download/${CIRCUITS_VERSION}/logos-blockchain-circuits-${CIRCUITS_VERSION}-linux-x86_64.tar.gz"
+          if curl -fsSL -o circuits.tar.gz "$url" && tar -xzf circuits.tar.gz -C "$CIRC" --strip-components=1; then
+            # The build script (native, even under bash) needs an OS-native path; convert on
+            # Windows runners where $HOME is a git-bash path the Rust build can't resolve.
+            if command -v cygpath >/dev/null 2>&1; then CIRC="$(cygpath -w "$CIRC")"; fi
+            echo "LOGOS_BLOCKCHAIN_CIRCUITS=$CIRC" >> "$GITHUB_ENV"
+            echo "circuits installed -> $CIRC"
+          else
+            echo "::warning::could not fetch logos-blockchain circuits ($url) - the decode build will be skipped; light binaries still ship"
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # `cross` is only needed for the aarch64 linux cross-compile.
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@682e7d9e49c5e653d371fc6adbda67653461378a # v2
+        with:
+          tool: cross
+
+      # Build the LIGHT binary (always - no heavy deps, no circuits) and, best-effort, the
+      # FULL decode binary. Light must succeed; a failed decode build just drops the full
+      # asset (the installer then serves light to that platform).
+      - name: Build (light always, decode best-effort)
+        shell: bash
+        run: |
+          set -e
+          builder="cargo"; [ "${{ matrix.cross }}" = "true" ] && builder="cross"
+          ext="${{ matrix.ext }}"
+          src="target/${{ matrix.target }}/release/zone-scan${ext}"
+          mkdir -p dist
+
+          # Light binary - no heavy deps, no circuits; always required, must succeed.
+          echo "== light build =="
+          $builder build --release --target ${{ matrix.target }}
+          cp "$src" "dist/zone-scan-${{ matrix.target }}-light${ext}"
+
+          # Full (decode) binary. REQUIRED on proven targets - a failure fails the leg
+          # loudly. BEST-EFFORT on experimental targets - a failure just drops the full
+          # asset and the light binary ships.
+          echo "== full (decode) build =="
+          if [ "${{ matrix.experimental }}" = "true" ]; then
+            if $builder build --release --features decode --target ${{ matrix.target }}; then
+              cp "$src" "dist/zone-scan-${{ matrix.target }}${ext}"
+              echo "full (decode) binary built"
+            else
+              echo "::warning::decode build failed on ${{ matrix.target }} - shipping light only (block-level data + liveness, no per-tx decode)"
+            fi
+          else
+            $builder build --release --features decode --target ${{ matrix.target }}
+            cp "$src" "dist/zone-scan-${{ matrix.target }}${ext}"
+          fi
+
+      - name: Upload light artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zone-scan-${{ matrix.target }}-light
+          path: dist/zone-scan-${{ matrix.target }}-light${{ matrix.ext }}
+          if-no-files-found: error
+
+      - name: Upload full (decode) artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zone-scan-${{ matrix.target }}
+          path: dist/zone-scan-${{ matrix.target }}${{ matrix.ext }}
+          if-no-files-found: warn # best-effort targets may have no full binary
+
+  # ── 2. Collect binaries, checksum them, cut the GitHub Release ────────────
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Flatten every per-target artifact (light + full) into ./dist
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          find artifacts -type f -name 'zone-scan-*' -exec cp {} dist/ \;
+          ls -l dist
+
+      # sha256sum format: "<hex>  zone-scan-<triple>[-light][.exe]" (two spaces), one per asset.
+      - name: Generate checksums.txt
+        working-directory: dist
+        run: |
+          sha256sum zone-scan-* > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          # Tag/name come from the pushed ref (refs/tags/v*).
+          files: |
+            dist/zone-scan-*
+            dist/checksums.txt
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── 3. Publish the npm package ────────────────────────────────────────────
+  # Runs after the Release exists so the package's postinstall can download the
+  # just-published binaries from the v<version> release assets.
+  npm-publish:
+    name: npm-publish
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm publish --provenance (sigstore attestation)
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      # Scoped public package -> --access public. Auth via NODE_AUTH_TOKEN.
+      # --provenance publishes a signed build-provenance attestation (needs
+      # id-token: write + npm >= 9.5). Requires repo secret NPM_TOKEN (see header).
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

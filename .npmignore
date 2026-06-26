@@ -1,0 +1,15 @@
+target/
+dist/
+node_modules/
+.git/
+.github/
+*.log
+.DS_Store
+server_creds
+.cargo/
+Dockerfile
+docker-compose.yml
+docker-entrypoint.sh
+PROGRESS.md
+.dockerignore
+zs.log

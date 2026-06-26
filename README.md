@@ -1,0 +1,99 @@
+# zonescan
+
+A live transaction explorer for **Logos Execution Zone (LEZ)** sequencers. It serves a
+web dashboard over public on-chain settlement data: a per-sequencer transaction feed,
+transaction detail, account / program / token pages, and liveness (tip, cadence, consistency).
+
+## Install
+
+```sh
+npm install -g @paradoxcomputer/zonescan
+```
+
+Downloads a prebuilt binary for your platform (or builds from source with Rust if none fits).
+
+### Transaction decoding (optional)
+
+By default zonescan includes **full per-transaction decoding** (tx type / program / shield
+vs. deshield). Every release also ships a **light** prebuilt that omits it, useful because
+the full build is heavy (it pulls the logos-blockchain + risc0 stack). To install the light
+binary instead:
+
+```sh
+ZONE_SCAN_DECODE=0 npm install -g @paradoxcomputer/zonescan
+```
+
+The light binary is fast and reliable and still shows block-level data + liveness/consistency,
+just not the per-transaction type/program breakdown. Both come as **prebuilt binaries**, so
+neither needs a Rust toolchain; the light one is also served automatically to any platform
+that has no full build. (If you *do* build the full binary from source and that heavy build
+fails, the launcher falls back to a light build automatically.)
+
+## Commands
+
+```sh
+zonescan setup     # configure via a token-gated setup page, then run
+zonescan up        # start in the background
+zonescan down      # stop the background server
+zonescan           # run in the foreground (Ctrl-C to stop)
+```
+
+`setup` starts the dashboard (default `http://127.0.0.1:8088`), prints a one-time setup
+URL with a token, and opens it. On that page you pick a data source (see **Modes**) and
+the sequencer(s) to watch, and it starts scanning. After that, `zonescan up` / `zonescan`
+just run it. The dashboard and read APIs are open; **changing configuration requires the
+setup token**.
+
+## Modes
+
+zonescan reads the **same** settlement data from one of two vantage points. Pick one on
+the setup page, or set it via env / `.env` (copy `.env.example`).
+
+### With an L1 node (the trustless vantage)
+
+Point it at a **Logos L1 node**. Every sequencer settles its blocks to the L1, so a single
+node sees them all and a sequencer can neither lie about nor hide what it settled. This mode
+adds L1 finality / lag, on-chain channel collateral, and can auto-discover sequencers.
+
+```sh
+ZONE_SCAN_L1_NODE_URL=http://localhost:8080
+ZONE_SCAN_SEQUENCERS=<channel-id>          # or leave empty to track every channel on the L1
+# For a Tor .onion L1 node, route through a SOCKS5 proxy:
+# ZONE_SCAN_SOCKS5=127.0.0.1:9050
+```
+
+### Without an L1 (straight from a local sequencer)
+
+Leave the L1 URL empty and give a **sequencer's JSON-RPC** URL. zonescan reads blocks
+directly from the sequencer (`getLastBlockId` / `getBlock`). It works fully offline against
+a local sequencer with no L1 connection. (L1-only extras like finality and collateral aren't
+shown in this mode; everything else is.)
+
+```sh
+ZONE_SCAN_SEQUENCERS=<channel-id>|http://127.0.0.1:3040
+```
+
+## Configuration
+
+All settings are `ZONE_SCAN_*` environment variables (also loadable from `.env`). The common ones:
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `ZONE_SCAN_L1_NODE_URL` | L1 node URL. Empty ⇒ no-L1 (local sequencer) mode. | unset |
+| `ZONE_SCAN_SEQUENCERS` | Comma-separated `channel\|rpc_url\|label\|full` entries (only `channel` required). | unset |
+| `ZONE_SCAN_SOCKS5` | SOCKS5 proxy for a Tor `.onion` L1 node. | unset |
+| `ZONE_SCAN_HOST` / `ZONE_SCAN_PORT` | Bind address / port. | `127.0.0.1` / `8088` |
+| `ZONE_SCAN_DATA` | Data directory (config, store, setup token). | `~/.config/zone-scan` |
+| `ZONE_SCAN_ADMIN_TOKEN` | Stable setup token (otherwise one is generated). | generated |
+
+Full list with comments in [`.env.example`](.env.example).
+
+## Build from source
+
+```sh
+npm run build          # cargo build --release --features decode
+```
+
+## License
+
+GPLv3. See [LICENSE](LICENSE).
