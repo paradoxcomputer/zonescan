@@ -1197,6 +1197,37 @@ mod tests {
         assert_eq!(decode_inscription(&out[0].1).unwrap().block_id, 48);
     }
 
+    #[test]
+    fn collect_inscriptions_v02_opcode_payload_hex_shape() {
+        // v0.2 block: transactions[].mantle_tx.ops[] carry a tagged op
+        // {opcode:17, payload:{channel_id, inscription}} where the inscription is now a
+        // HEX STRING (0.1.x used an int array). The same recursive walk must find it and
+        // decode it, so the serve/CLI ingest ingests channel `0101…01`'s blocks.
+        let mut buf = vec![0u8; 148];
+        buf[0..8].copy_from_slice(&42u64.to_le_bytes()); // block_id @0
+        buf[144..148].copy_from_slice(&3u32.to_le_bytes()); // tx_count @144
+        let ins_hex = hex::encode(&buf);
+        let channel = "0101010101010101010101010101010101010101010101010101010101010101";
+        let block = json!({
+            "header": {"id": "abcd", "slot": 66997},
+            "transactions": [{"mantle_tx": {"hash": "ff", "ops": [
+                {"opcode": 17, "payload": {
+                    "channel_id": channel,
+                    "inscription": ins_hex,
+                    "parent": "00",
+                    "signer": "00"
+                }}
+            ]}}]
+        });
+        let mut out = Vec::new();
+        collect_inscriptions(&block, &mut out);
+        assert_eq!(out.len(), 1, "one inscription collected from the v0.2 shape");
+        assert_eq!(out[0].0, channel);
+        let d = decode_inscription(&out[0].1).expect("v0.2 hex-string inscription decodes");
+        assert_eq!(d.block_id, 42);
+        assert_eq!(d.tx_count, 3);
+    }
+
     // rc5 dropped the trailing `bedrock_parent_id` ([u8;32]) from Block; its header +
     // transaction layouts are identical to rc4. A block whose trailing 32 bytes are
     // stripped (the rc5 shape) must still recover the txs + the same hash verdict.

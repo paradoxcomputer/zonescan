@@ -1127,6 +1127,18 @@ async fn apply_config(app: &AppState) -> Result<()> {
     let focus: Option<BTreeSet<String>> =
         (!channel_ids.is_empty()).then(|| channel_ids.iter().cloned().collect());
     let discover = cfg.discover_slots.unwrap_or(DEFAULT_DISCOVER);
+    // Depth of the one-shot L1 history seed (slots back from lib_slot). Explicitly-
+    // configured channels seed their FULL finalized history by default: a sequencer's
+    // settled blocks may predate any recent window (it can settle a burst and then go
+    // quiet), and the blocks range endpoint only returns finalized blocks up to lib_slot
+    // - so a shallow recent window would ingest nothing and the dashboard would show the
+    // channel with zero txs. Broad (unfocused) discovery stays bounded to keep it light;
+    // an explicit ZONE_SCAN_DISCOVER_SLOTS overrides either way.
+    let seed_depth = match cfg.discover_slots {
+        Some(d) => d,
+        None if focus.is_some() => u64::MAX, // configured channel(s): scan back to genesis
+        None => discover,
+    };
 
     let generation = app.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -1218,7 +1230,7 @@ async fn apply_config(app: &AppState) -> Result<()> {
             if cfg.full_history {
                 tokio::spawn(async move { backfill_seed(&c, &b, &a, f, generation).await });
             } else {
-                tokio::spawn(async move { discover_seed(&c, &b, &a, f, discover, generation).await });
+                tokio::spawn(async move { discover_seed(&c, &b, &a, f, seed_depth, generation).await });
             }
         }
     }
@@ -3762,6 +3774,10 @@ const DASH_HTML: &str = r#"<!doctype html>
   .srow .sm{flex:1;min-width:0}
   .srow .sm .a{font-family:var(--mono);color:var(--link);font-size:13px}
   .srow .sm .b{font-size:11px;color:var(--muted);margin-top:1px}
+  /* per-zone labeled detail fields (Channel ID / Sequencer version) */
+  .srow .sm .zmeta{display:flex;flex-wrap:wrap;gap:1px 14px;margin:2px 0 1px}
+  .srow .sm .zf{display:inline-flex;align-items:baseline;gap:5px;font-size:11px}
+  .srow .sm .zk{color:var(--soft);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.3px}
   .srow .st{font-size:10px;font-weight:700;letter-spacing:.4px;padding:2px 7px;border-radius:6px}
   .st.alive{background:rgba(19,169,123,.12);color:var(--green)} .st.idle{background:#eef0f4;color:var(--soft)}
   .vchk{font-size:11px;margin-left:6px;cursor:help;font-weight:700}
@@ -4174,6 +4190,11 @@ function renderByLayout(w,layout,t){
 }
 
 function verBadge(s){ return s.version?`<span class="vbadge v-${esc(s.version)}" title="LEZ build">${esc(s.version)}</span>`:''; }
+// a zone's display title: the friendly alias when known, else the short hex.
+function zoneTitle(s){ return aliasOf(s.channel) || s.channel_short || sh(s.channel); }
+// sequencer (LEZ/zone) version as a labeled value: the rc-family badge (rc3/rc4/rc5),
+// or an em-dash when the zone has no decoded version yet (e.g. a light/no-decode build).
+function verValue(s){ return s.version?`<span class="vbadge v-${esc(s.version)}" title="LEZ build">${esc(s.version)}</span>`:'<span class="mut">—</span>'; }
 function consBadge(s){
   const c=s.consistency||{};
   const skew=c.checked>0 && c.hash_failures===c.checked; // uniform hash fail = version skew
@@ -4320,10 +4341,10 @@ function renderHome(){
     <div class="card"><div class="k">L1 Block Height</div><div class="v">${num(l1.height)}</div><div class="s">${l1.advancing===false?'not advancing':(l1.reachable?'advancing':'-')}</div></div>
     <div class="card"><div class="k">Finality Lag</div><div class="v">${num(l1.finality_lag)}</div><div class="s">tip slot ${num(l1.tip_slot)}</div></div>
     <div class="card"><div class="k">Transactions</div><div class="v">${num(state&&state.tx_total)}</div><div class="s">${state&&state.decode_feature?'decode on':'decode off'}</div></div>
-    <div class="card"><div class="k">Sequencers</div><div class="v">${num(seqs.length)}</div><div class="s">${alive} active</div></div>
+    <div class="card"><div class="k">Zones</div><div class="v">${num(seqs.length)}</div><div class="s">${alive} active</div></div>
   </div>
   <div class="grid">
-    <div class="panel"><div class="phead">Sequencers</div><div id="seqs"></div></div>
+    <div class="panel"><div class="phead">Zones</div><div id="seqs"></div></div>
     <div class="panel">
       <div class="phead"><span>Latest Transactions</span>
         <span style="display:flex;align-items:center;gap:10px">
@@ -4347,7 +4368,8 @@ function renderSeqs(){
   const slice=seqs.slice(0,cur.seqShown);
   el.innerHTML = seqs.length ? slice.map(s=>`<a class="srow" href="/zone/${u(s.channel)}" style="text-decoration:none;color:inherit">
       <span class="dot ${s.alive?'on':'off'}"></span>
-      <div class="sm"><div class="a">${chanLabel(s.channel, s.channel_short)}${verBadge(s)}${consBadge(s)}</div>
+      <div class="sm"><div class="a">${esc(zoneTitle(s))}${consBadge(s)}</div>
+        <div class="zmeta"><span class="zf"><span class="zk">Channel ID</span> <span class="chex">${esc(s.channel_short)}</span></span><span class="zf"><span class="zk">Sequencer version</span> ${verValue(s)}</span></div>
         <div class="b">L2 #${num(s.latest_block_id)} · L1 bal ${s.l1_balance!=null?num(s.l1_balance):'-'} · ${s.l1_signers||0} key(s)${tipNote(s)}</div></div>
       <span class="st ${s.alive?'alive':'idle'}">${s.alive?'ALIVE':'IDLE'}</span></a>`).join('')
       + (seqs.length>cur.seqShown?`<div class="empty" style="padding:12px">scroll for ${seqs.length-cur.seqShown} more…</div>`:'')
