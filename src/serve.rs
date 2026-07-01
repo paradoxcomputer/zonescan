@@ -1205,7 +1205,7 @@ async fn apply_config(app: &AppState) -> Result<()> {
             let full = sq.full || cfg.full_history;
             let (a, c) = (app.clone(), client.clone());
             tokio::spawn(
-                async move { sequencer_loop(c, rpc, channel, full, window, a, generation).await },
+                async move { sequencer_loop(c, rpc, channel, full, window, a, generation, false).await },
             );
         }
         broadcast(app);
@@ -1239,6 +1239,26 @@ async fn apply_config(app: &AppState) -> Result<()> {
             } else {
                 tokio::spawn(async move { discover_seed(&c, &b, &a, f, seed_depth, generation).await });
             }
+        }
+        // The finalized L1 inscriptions carry only the sequencer's CHANNEL-settlement layer
+        // (clock / validity / genesis) and trail the sequencer by the L1 finality lag. The
+        // user's ZONE transactions (auth-transfer, pinata, token, ata) live in the sequencer's
+        // zone blocks, so ALSO ingest those directly over its JSON-RPC (getBlock) when an
+        // rpc_url is configured - the authoritative tx feed that keeps up with the sequencer.
+        // The L1 read above still drives the version tag / sync / lag; db.commit dedupes by tx
+        // hash, so a block seen on both sources isn't double-counted.
+        for sq in &cfg.sequencers {
+            let rpc = sq.rpc_url.trim().to_string();
+            let chan = sq.channel_id.trim();
+            if rpc.is_empty() || chan.is_empty() {
+                continue;
+            }
+            let Ok(channel) = resolve_channel(chan) else { continue };
+            let full = sq.full || cfg.full_history;
+            let (a, c) = (app.clone(), client.clone());
+            tokio::spawn(async move {
+                sequencer_loop(c, rpc, channel, full, discover, a, generation, true).await
+            });
         }
     }
     // fetch each sequencer's program-id registry (getProgramIds) for human names
@@ -2202,16 +2222,23 @@ async fn sequencer_loop(
     window: u64,
     app: AppState,
     generation: u64,
+    // Running alongside an L1 read (L1 mode): don't clobber the L1 reachability/sync state,
+    // and don't trust the L1-seeded `latest_block_id` (the L1 lags + carries only the channel
+    // layer) - backfill the sequencer's zone blocks from its own floor so user txs are ingested.
+    with_l1: bool,
 ) {
     const CHUNK: u64 = 256;
-    let restored_latest = app
-        .inner
-        .lock()
-        .unwrap()
-        .seqs
-        .get(&channel)
-        .map(|t| t.latest_block_id)
-        .unwrap_or(0);
+    let restored_latest = if with_l1 {
+        0
+    } else {
+        app.inner
+            .lock()
+            .unwrap()
+            .seqs
+            .get(&channel)
+            .map(|t| t.latest_block_id)
+            .unwrap_or(0)
+    };
     let mut backfilled = false;
     println!("sequencer source {}: {rpc_url}", short(&channel));
 
@@ -2220,7 +2247,7 @@ async fn sequencer_loop(
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         };
-        {
+        if !with_l1 {
             let mut s = app.inner.lock().unwrap();
             s.l1.reachable = false; // no L1 in this mode
             s.l1.last_event_unix = now_unix();
