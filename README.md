@@ -73,6 +73,20 @@ shown in this mode; everything else is.)
 ZONE_SCAN_SEQUENCERS=<channel-id>|http://127.0.0.1:3040
 ```
 
+## Logos L1 compatibility
+
+zonescan speaks the **Logos Testnet v0.2 (0.2.0)** L1 REST API and stays **back-compatible
+with 0.1.x** — it auto-detects the response shape per node, so the same binary works against
+either. Point `ZONE_SCAN_L1_NODE_URL` at the node's API (`:8080`). The dashboard header shows
+an **L1-version tag** (`L1 v0.2.x` / `L1 v0.1.x`) next to the sync status, so you can see which
+API a node is serving at a glance.
+
+### Channel aliases
+
+Known sequencer channels render a friendly name as the primary label (with the raw short
+hex kept alongside) everywhere a channel id is shown — the channels list, a sequencer's
+header, and per-channel labels. Channels without an alias keep the plain short-hex display.
+
 ## Configuration
 
 All settings are `ZONE_SCAN_*` environment variables (also loadable from `.env`). The common ones:

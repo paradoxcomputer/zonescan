@@ -1,10 +1,11 @@
 //! `serve` mode: a live web dashboard fed by *streaming* the L1.
 //!
 //! A background task subscribes to `/cryptarchia/events/blocks/stream` (ndjson),
-//! updates the L1 finality boundary on every event, fetches each new block via
-//! `/storage/block`, decodes its inscriptions per channel, and pushes a fresh
-//! snapshot to connected browsers over SSE. A lighter periodic poll of
-//! `/cryptarchia/info` keeps height/lag fresh and detects an unreachable node.
+//! updates the L1 finality boundary on every event, reads each new block inlined
+//! in the event (v0.2.0; older nodes are fetched via `/cryptarchia/blocks/:id`),
+//! decodes its inscriptions per channel, and pushes a fresh snapshot to connected
+//! browsers over SSE. A lighter periodic poll of `/cryptarchia/info` keeps
+//! height/lag/sync-mode fresh and detects an unreachable node.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -31,8 +32,9 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::{
-    build_client, collect_inscriptions, decode_inscription, find_u64, get_json, jget_u64, jhex,
-    post_json, resolve_channel, scan_channels, short, Decoded, EndpointResult, ScanRec, TxMix,
+    build_client, channel_alias, channel_tip, collect_inscriptions, decode_inscription, find_u64,
+    get_json, info_l1_version, info_mode, info_u64, jget_u64, jhex, resolve_channel, scan_channels,
+    short, Decoded, EndpointResult, ScanRec, TxMix,
 };
 
 mod db;
@@ -462,6 +464,12 @@ struct L1Track {
     /// time window, so it doesn't flicker when consecutive events repeat the same slot.
     last_advance_unix: u64,
     last_event_unix: u64,
+    /// v0.2.0 `/cryptarchia/info` sync mode: "online" (synced) / "bootstrapping"
+    /// (IBD) / "awaiting"; None on a 0.1.2 node (no `mode` field).
+    mode: Option<String>,
+    /// L1 REST API version family detected from `/cryptarchia/info` ("0.2.x" nested /
+    /// "0.1.x" flat); None until the first successful info poll.
+    l1_version: Option<&'static str>,
     /// Consecutive failed info polls; only flips `reachable` off after a few, so
     /// a single flaky-Tor timeout doesn't blink the dashboard to "unreachable".
     fail_streak: u32,
@@ -813,6 +821,17 @@ struct L1Snap {
     finality_lag: Option<u64>,
     advancing: Option<bool>,
     last_event_unix: u64,
+    /// v0.2.0 sync mode ("online"/"bootstrapping"/"awaiting"); None on 0.1.2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    /// True when the node reports fully synced (`mode == "online"`); None when the
+    /// node doesn't expose a mode (0.1.2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    synced: Option<bool>,
+    /// L1 REST API version family ("0.2.x"/"0.1.x") for the header version tag; None
+    /// until the first successful `/cryptarchia/info` poll.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    l1_version: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -912,6 +931,9 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
             // advancing = the L1 frontier moved within the last 2 minutes
             advancing: Some(s.l1.reachable && now.saturating_sub(s.l1.last_advance_unix) <= 120),
             last_event_unix: s.l1.last_event_unix,
+            mode: s.l1.mode.clone(),
+            synced: s.l1.mode.as_deref().map(|m| m == "online"),
+            l1_version: s.l1.l1_version,
         },
         sequencers,
     }
@@ -1264,7 +1286,7 @@ async fn discover_compatible(app: &AppState, total_cap: usize) -> Result<Vec<Str
     let client = build_client(socks.as_deref(), Some(Duration::from_secs(90)), None)?;
     let gen = app.generation.load(Ordering::SeqCst);
     let lib = match get_json(&client, &format!("{base}/cryptarchia/info")).await {
-        EndpointResult::Ok(v) => jget_u64(&v, "lib_slot").unwrap_or(0),
+        EndpointResult::Ok(v) => info_u64(&v, "lib_slot").unwrap_or(0),
         _ => anyhow::bail!("cannot reach L1 node"),
     };
     if lib == 0 {
@@ -1741,7 +1763,7 @@ async fn backfill_seed(
             return;
         }
         if let EndpointResult::Ok(v) = get_json(client, &format!("{base}/cryptarchia/info")).await {
-            if let Some(l) = jget_u64(&v, "lib_slot") {
+            if let Some(l) = info_u64(&v, "lib_slot") {
                 lib_opt = Some(l);
                 break;
             }
@@ -1880,19 +1902,21 @@ async fn refresh_info(client: &Client, base: &str, app: &AppState) {
             let mut s = app.inner.lock().unwrap();
             s.l1.reachable = true;
             s.l1.fail_streak = 0;
-            s.l1.height = jget_u64(&v, "height");
-            if let Some(ts) = jget_u64(&v, "slot") {
+            s.l1.height = info_u64(&v, "height");
+            if let Some(ts) = info_u64(&v, "slot") {
                 if s.l1.tip_slot.is_none_or(|p| ts > p) {
                     s.l1.last_advance_unix = now;
                 }
                 s.l1.tip_slot = Some(ts);
             }
-            if let Some(l) = jget_u64(&v, "lib_slot") {
+            if let Some(l) = info_u64(&v, "lib_slot") {
                 if s.l1.lib_slot.is_none_or(|p| l > p) {
                     s.l1.last_advance_unix = now;
                 }
                 s.l1.lib_slot = Some(l);
             }
+            s.l1.mode = info_mode(&v);
+            s.l1.l1_version = Some(info_l1_version(&v));
             s.l1.last_event_unix = now;
         }
         _ => {
@@ -1931,8 +1955,13 @@ async fn refresh_channels(client: &Client, base: &str, app: &AppState) {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
             });
-            let signers = v.get("keys").and_then(Value::as_array).map_or(0, Vec::len);
-            let tip = v.get("tip").map(jhex).unwrap_or_default();
+            // v0.2.0 renamed `keys` -> `accredited_keys` and `tip` -> `tip_message`.
+            let signers = v
+                .get("accredited_keys")
+                .or_else(|| v.get("keys"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let tip = channel_tip(&v);
             let now = now_unix();
             let mut s = app.inner.lock().unwrap();
             if let Some(t) = s.seqs.get_mut(&ch) {
@@ -2320,6 +2349,19 @@ async fn stream_loop(
     }
 }
 
+/// The header id carried by a stream event: v0.2.0 nests it at `block.header.id`;
+/// 0.1.2 carried a top-level `block_id`. Empty/placeholder ids are treated as absent.
+fn block_id_of(ev: &Value) -> Option<String> {
+    let id = ev
+        .get("block")
+        .and_then(|b| b.get("header"))
+        .and_then(|h| h.get("id"))
+        .map(jhex)
+        .or_else(|| ev.get("block_id").map(jhex))
+        .unwrap_or_default();
+    (!id.is_empty() && id != "?").then_some(id)
+}
+
 async fn handle_event(
     client: &Client,
     base: &str,
@@ -2334,7 +2376,6 @@ async fn handle_event(
     let now = now_unix();
     let tip_slot = jget_u64(ev, "tip_slot");
     let lib_slot = jget_u64(ev, "lib_slot");
-    let block_id = ev.get("block_id").map(jhex);
 
     {
         let mut s = app.inner.lock().unwrap();
@@ -2356,33 +2397,44 @@ async fn handle_event(
         }
     }
 
-    if let Some(bid) = block_id {
-        let url = format!("{base}/storage/block");
-        if let EndpointResult::Ok(block) = post_json(client, &url, &Value::String(bid)).await {
-            let slot = find_u64(&block, "slot");
-            let mut found = Vec::new();
-            collect_inscriptions(&block, &mut found);
-            let mut decoded: Vec<(String, Decoded)> = Vec::new();
-            {
-                let mut s = app.inner.lock().unwrap();
-                for (ch, ins) in found {
-                    if let Some(f) = focus {
-                        if !f.contains(&ch) {
-                            continue;
-                        }
-                    }
-                    if let Some(d) = decode_inscription(&ins) {
-                        ingest(&mut s, &ch, slot, &d, now);
-                        let e = s.seqs.entry(ch.clone()).or_default();
-                        e.observe(&d, now);
-                        e.verify(&d); // re-check accuracy on every new block
-                        decoded.push((ch, d));
+    // v0.2.0 inlines the full block in the stream event (`ev.block`); use it directly.
+    // As a safety net (e.g. an event variant that omits the inline block) fall back to
+    // fetching by header id via the v0.2.0 route `GET /cryptarchia/blocks/:id`. (The old
+    // 0.1.2 `POST /storage/block` is removed — that endpoint no longer exists.)
+    let block: Option<Value> = match ev.get("block") {
+        Some(b) if b.is_object() => Some(b.clone()),
+        _ => match block_id_of(ev) {
+            Some(id) => match get_json(client, &format!("{base}/cryptarchia/blocks/{id}")).await {
+                EndpointResult::Ok(b) => Some(b),
+                _ => None,
+            },
+            None => None,
+        },
+    };
+    if let Some(block) = block {
+        let slot = find_u64(&block, "slot");
+        let mut found = Vec::new();
+        collect_inscriptions(&block, &mut found);
+        let mut decoded: Vec<(String, Decoded)> = Vec::new();
+        {
+            let mut s = app.inner.lock().unwrap();
+            for (ch, ins) in found {
+                if let Some(f) = focus {
+                    if !f.contains(&ch) {
+                        continue;
                     }
                 }
+                if let Some(d) = decode_inscription(&ins) {
+                    ingest(&mut s, &ch, slot, &d, now);
+                    let e = s.seqs.entry(ch.clone()).or_default();
+                    e.observe(&d, now);
+                    e.verify(&d); // re-check accuracy on every new block
+                    decoded.push((ch, d));
+                }
             }
-            if !decoded.is_empty() {
-                persist_blocks(app, slot, &decoded).await;
-            }
+        }
+        if !decoded.is_empty() {
+            persist_blocks(app, slot, &decoded).await;
         }
     }
     broadcast(app);
@@ -2456,11 +2508,35 @@ async fn index(State(app): State<AppState>, headers: axum::http::HeaderMap) -> R
         // inject the request origin so social/share (og:) URLs are absolute regardless
         // of where this is deployed.
         let origin = request_origin(&headers);
-        Html(DASH_HTML.replace("{{ORIGIN}}", &origin)).into_response()
+        Html(
+            DASH_HTML
+                .replace("{{ORIGIN}}", &origin)
+                .replace("{{CHANNEL_ALIASES}}", &channel_alias_js()),
+        )
+        .into_response()
     } else {
         // /setup is token-gated, so don't redirect there - tell the operator to run setup.
         Html(NOT_CONFIGURED_HTML).into_response()
     }
+}
+
+/// A JS object literal `{"<channel hex>":"<display name>", ...}` of the known channel
+/// display aliases, injected into the dashboard page so any channel id it renders (list,
+/// header, per-channel labels) can show its friendly name. Same source as `channel_alias`.
+fn channel_alias_js() -> String {
+    let pairs: Vec<String> = crate::CHANNEL_ALIASES
+        .iter()
+        .filter_map(|(id, _)| {
+            channel_alias(id).map(|name| {
+                format!(
+                    "{}:{}",
+                    serde_json::to_string(id).unwrap_or_default(),
+                    serde_json::to_string(name).unwrap_or_default()
+                )
+            })
+        })
+        .collect();
+    format!("{{{}}}", pairs.join(","))
 }
 
 /// `scheme://host` for absolute share URLs, honoring a reverse proxy's
@@ -3640,6 +3716,11 @@ const DASH_HTML: &str = r#"<!doctype html>
   .pill{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line2);border-radius:8px;
     padding:6px 11px;font-size:12px;color:var(--muted);background:linear-gradient(180deg,#ffffff,#f1f1f4);
     box-shadow:0 1px 1px rgba(0,0,0,.04),inset 0 1px 0 #fff}
+  /* L1 REST API version tag: same pill chrome, but mono + navy so it reads as a
+     version label, distinct from the coloured-dot sync pill next to it */
+  .vpill{font-family:var(--mono);font-weight:600;color:var(--navy);letter-spacing:.2px}
+  /* channel alias: friendly name as the primary label, raw short-hex as the secondary */
+  .calias{font-weight:600;color:var(--navy)} .chex{font-family:var(--mono);font-size:11px;color:var(--soft)}
   .node{font-family:var(--mono);font-size:11px;color:var(--soft);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .btn{border:1px solid var(--line2);border-radius:8px;padding:8px 14px;font-size:13px;color:var(--navy);
     background:linear-gradient(180deg,#ffffff,#ededf0);font-weight:600;box-shadow:0 1px 1px rgba(0,0,0,.05),inset 0 1px 0 #fff}
@@ -3789,6 +3870,7 @@ const DASH_HTML: &str = r#"<!doctype html>
   <a class="logo" href="/"><img class="mk" src="/logo.png" alt="zonescan"> <span><b>zone</b>scan</span></a>
   <div class="spacer"></div>
   <span class="pill"><span class="dot off" id="statdot"></span><span id="statmode">connecting…</span></span>
+  <span class="pill vpill" id="statver" title="L1 node REST API version" style="display:none"></span>
   <span class="node" id="node" title="L1 node">-</span>
 </div></div>
 
@@ -3810,6 +3892,15 @@ const $=(id)=>document.getElementById(id);
 const num=(n)=> (n==null?'-':Number(n).toLocaleString());
 const esc=(s)=> (s==null?'':String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));
 const sh=(s,a=12,b=8)=> !s?'-':(s.length>a+b+1?s.slice(0,a)+'…'+s.slice(-b):s);
+// channel display aliases (channel hex -> friendly name), injected from Rust CHANNEL_ALIASES.
+const CHAN_ALIAS={{CHANNEL_ALIASES}};
+const aliasOf=(ch)=> ch?(CHAN_ALIAS[String(ch).replace(/^0x/,'').toLowerCase()]||null):null;
+// render a channel: friendly alias as the primary label + short hex as secondary; falls
+// back to the plain short hex when the channel has no alias.
+function chanLabel(ch, shortHex){
+  const s=esc(shortHex||sh(ch)); const a=aliasOf(ch);
+  return a? `<span class="calias">${esc(a)}</span> <span class="chex">${s}</span>` : s;
+}
 const fmtAge=(u)=>{ if(!u) return '-'; let s=Math.max(0,Math.floor(Date.now()/1000)-u);
   if(s<60) return s+' secs ago'; if(s<3600) return Math.floor(s/60)+' mins ago'; if(s<86400) return Math.floor(s/3600)+' hrs ago'; return Math.floor(s/86400)+' days ago'; };
 function ageOf(t){ let ts=t.timestamp||0; if(ts>1e12) ts=Math.floor(ts/1000);
@@ -4127,7 +4218,7 @@ function txRows(list){
       <td>${visBadge(t)}</td><td>${typeBadge(t)}</td>
       <td class="mono">#${num(t.block_id)}</td>
       <td class="mut nowrap">${ageOf(t)}</td>
-      <td><a class="lnk" href="/zone/${u(z)}">${esc(t.channel_short)}</a></td>
+      <td><a class="lnk" href="/zone/${u(z)}">${chanLabel(z, t.channel_short)}</a></td>
       <td>${accs}</td></tr>`;
   }).join('');
 }
@@ -4205,8 +4296,14 @@ function renderHeader(){
   $('node').textContent=state.node; $('node').title=state.node;
   const l1=state.l1, dot=$('statdot'), mode=$('statmode');
   if(!l1.reachable){ dot.className='dot dead'; mode.textContent='L1 unreachable'; }
+  else if(l1.mode && l1.mode!=='online'){ dot.className='dot off'; mode.textContent='L1 '+(l1.mode==='bootstrapping'?'syncing':l1.mode); }
   else if(l1.advancing===false){ dot.className='dot off'; mode.textContent='L1 not advancing'; }
-  else { dot.className='dot on'; mode.textContent='L1 online'; }
+  else { dot.className='dot on'; mode.textContent=l1.synced===true?'L1 synced':'L1 online'; }
+  const ver=$('statver');
+  if(ver){
+    if(l1.reachable && l1.l1_version){ ver.textContent='L1 v'+l1.l1_version; ver.style.display=''; }
+    else { ver.style.display='none'; }
+  }
   $('foot').innerHTML='reads only public on-chain settlement data · updated '+fmtAge(state.updated_unix)+' · '+
     (state.decode_feature?'tx decode on':'tx decode off - rebuild with <code>--features decode</code>');
 }
@@ -4250,7 +4347,7 @@ function renderSeqs(){
   const slice=seqs.slice(0,cur.seqShown);
   el.innerHTML = seqs.length ? slice.map(s=>`<a class="srow" href="/zone/${u(s.channel)}" style="text-decoration:none;color:inherit">
       <span class="dot ${s.alive?'on':'off'}"></span>
-      <div class="sm"><div class="a">${esc(s.channel_short)}${verBadge(s)}${consBadge(s)}</div>
+      <div class="sm"><div class="a">${chanLabel(s.channel, s.channel_short)}${verBadge(s)}${consBadge(s)}</div>
         <div class="b">L2 #${num(s.latest_block_id)} · L1 bal ${s.l1_balance!=null?num(s.l1_balance):'-'} · ${s.l1_signers||0} key(s)${tipNote(s)}</div></div>
       <span class="st ${s.alive?'alive':'idle'}">${s.alive?'ALIVE':'IDLE'}</span></a>`).join('')
       + (seqs.length>cur.seqShown?`<div class="empty" style="padding:12px">scroll for ${seqs.length-cur.seqShown} more…</div>`:'')
@@ -4262,7 +4359,7 @@ async function renderZone(seq){
   cur={kind:'zone',seq};
   const s=((state&&state.sequencers)||[]).find(x=>x.channel===seq)||{channel:seq,channel_short:sh(seq)};
   $('view').innerHTML=`${crumb([{t:'Home',href:'/'},{t:'Zone '+sh(seq)}])}
-  <div class="panel" style="margin-bottom:16px"><div class="phead">Sequencer ${esc(s.channel_short)} ${verBadge(s)}${consBadge(s)}</div>
+  <div class="panel" style="margin-bottom:16px"><div class="phead">Sequencer ${chanLabel(s.channel, s.channel_short)} ${verBadge(s)}${consBadge(s)}</div>
     <div class="ovw">
       <div><div class="k">Latest L2 Block</div><div class="v">#${num(s.latest_block_id)}</div></div>
       <div><div class="k">L1 Channel Balance</div><div class="v">${s.l1_balance!=null?num(s.l1_balance):'-'}</div></div>
@@ -4434,7 +4531,7 @@ async function renderWallet(addr,seq){
   const l1 = a.l1_balance!=null
     ? esc(a.l1_balance)+(a.l1_balance_block?` <span class="mut" style="font-size:11px;font-weight:400">@ #${num(a.l1_balance_block)}</span>`:'')
     : muted('not settled / private');
-  const chans=(a.channels||[]).map(c=>`<a class="lnk" href="/zone/${u(c.channel)}/wallet/${u(addr)}">${esc(c.channel_short)}</a> <span class="mut">(${num(c.tx_count)} tx)</span>`).join(' &nbsp; ')||'<span class="mut">none</span>';
+  const chans=(a.channels||[]).map(c=>`<a class="lnk" href="/zone/${u(c.channel)}/wallet/${u(addr)}">${chanLabel(c.channel, c.channel_short)}</a> <span class="mut">(${num(c.tx_count)} tx)</span>`).join(' &nbsp; ')||'<span class="mut">none</span>';
   $('view').innerHTML=crumb(base)+
    `<div class="panel" style="margin-bottom:16px"><div class="phead">${seq?'Account on '+esc(sh(seq)):'Account'} <span class="count">${esc(sh(addr,10,8))}</span></div>
     <div class="ovw" style="grid-template-columns:repeat(4,1fr)">
@@ -4757,5 +4854,17 @@ mod tests {
         assert_eq!(bal, 950);
         assert_eq!(kind, "fungible");
         assert_eq!(def, b58encode(&[7u8; 32]));
+    }
+
+    #[test]
+    fn block_id_of_handles_v02_inline_and_v01_flat() {
+        // v0.2.0 nests the id at block.header.id (and inlines the whole block).
+        let v02 = serde_json::json!({"block":{"header":{"id":"ABcd","slot":5}},"tip":"x"});
+        assert_eq!(block_id_of(&v02).as_deref(), Some("abcd"));
+        // 0.1.2 carried a top-level block_id.
+        let v01 = serde_json::json!({"block_id":"ABcd"});
+        assert_eq!(block_id_of(&v01).as_deref(), Some("abcd"));
+        // neither present => None (so handle_event skips the fetch).
+        assert_eq!(block_id_of(&serde_json::json!({"tip_slot":1})), None);
     }
 }

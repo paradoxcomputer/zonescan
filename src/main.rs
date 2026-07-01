@@ -40,6 +40,25 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("psychopomp", "4242424242424242424242424242424242424242424242424242424242424242"),
 ];
 
+/// Display aliases: a sequencer channel id -> a friendly name shown in the UI as the
+/// primary label (the raw hex stays as the secondary/short form). Distinct from
+/// `ALIASES` above (which maps a typed name -> a channel id for CLI input). Extend by
+/// adding `(channel_hex, "Display Name")` pairs.
+pub const CHANNEL_ALIASES: &[(&str, &str)] = &[(
+    "0101010101010101010101010101010101010101010101010101010101010101",
+    "Paradox Computer",
+)];
+
+/// Friendly display name for a channel id, if one is known; else `None` (callers keep
+/// the existing short-hex rendering). Accepts an optional `0x` prefix and any case.
+pub fn channel_alias(channel: &str) -> Option<&'static str> {
+    let hex = channel.trim_start_matches("0x").to_ascii_lowercase();
+    CHANNEL_ALIASES
+        .iter()
+        .find(|(id, _)| *id == hex)
+        .map(|(_, name)| *name)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "zone-scan",
@@ -268,9 +287,9 @@ async fn cmd_watch(
         let info = get_json(client, &info_url).await;
         let (height, slot, lib_slot) = match &info {
             EndpointResult::Ok(v) => (
-                jget_u64(v, "height"),
-                jget_u64(v, "slot"),
-                jget_u64(v, "lib_slot"),
+                info_u64(v, "height"),
+                info_u64(v, "slot"),
+                info_u64(v, "lib_slot"),
             ),
             _ => (None, None, None),
         };
@@ -283,7 +302,7 @@ async fn cmd_watch(
         for ch in &channels {
             let res = get_json(client, &format!("{base}/channel/{ch}")).await;
             let tip = match &res {
-                EndpointResult::Ok(v) => Some(jhex(v.get("tip").unwrap_or(&Value::Null))),
+                EndpointResult::Ok(v) => Some(channel_tip(v)),
                 _ => None,
             };
             let moved = tip.as_ref().and_then(|t| prev_tips.get(ch).map(|p| p != t));
@@ -443,7 +462,7 @@ pub async fn scan_channels(
 ) -> Result<(BTreeMap<String, Agg>, Vec<ScanRec>, u64, u64)> {
     let info = get_json(client, &format!("{base}/cryptarchia/info")).await;
     let lib_slot = match &info {
-        EndpointResult::Ok(v) => jget_u64(v, "lib_slot").context("no lib_slot in /cryptarchia/info")?,
+        EndpointResult::Ok(v) => info_u64(v, "lib_slot").context("no lib_slot in /cryptarchia/info")?,
         EndpointResult::Status(s) => bail!("L1 /cryptarchia/info returned HTTP {s}"),
         EndpointResult::Unreachable(e) => bail!("cannot reach L1 node: {e}"),
     };
@@ -875,14 +894,6 @@ pub async fn get_json(client: &Client, url: &str) -> EndpointResult {
     }
 }
 
-/// POST a JSON body and decode the response (used for `/storage/block`).
-pub async fn post_json(client: &Client, url: &str, body: &Value) -> EndpointResult {
-    match client.post(url).json(body).send().await {
-        Err(e) => EndpointResult::Unreachable(trim_err(&e.to_string())),
-        Ok(resp) => decode_resp(resp).await,
-    }
-}
-
 async fn decode_resp(resp: reqwest::Response) -> EndpointResult {
     let status = resp.status();
     if !status.is_success() {
@@ -989,6 +1000,54 @@ pub fn jhex(v: &Value) -> String {
     }
 }
 
+/// Read a `/cryptarchia/info` numeric field across node versions. v0.2.0 wraps the
+/// fields in a `cryptarchia_info` object (`{cryptarchia_info:{...}, mode}`); 0.1.2
+/// returned them flat. Try nested, then flat, then a recursive search.
+pub fn info_u64(v: &Value, key: &str) -> Option<u64> {
+    v.get("cryptarchia_info")
+        .and_then(|i| jget_u64(i, key))
+        .or_else(|| jget_u64(v, key))
+        .or_else(|| find_u64(v, key))
+}
+
+/// Normalize `/cryptarchia/info`'s v0.2.0 `mode` field to a short tag: "online"
+/// (fully synced), "bootstrapping" (IBD), or "awaiting" (not started). None on a
+/// 0.1.2 node (no `mode` field).
+pub fn info_mode(v: &Value) -> Option<String> {
+    match v.get("mode")? {
+        Value::String(s) if s == "AwaitingStart" => Some("awaiting".into()),
+        Value::Object(o) => o
+            .get("Started")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase),
+        other => Some(other.to_string().trim_matches('"').to_ascii_lowercase()),
+    }
+}
+
+/// Detect the L1 node's REST API version family from a `/cryptarchia/info` response.
+/// v0.2.x wraps the fields in a nested `cryptarchia_info` object and/or carries a `mode`
+/// field; 0.1.x returned them flat (`{lib,lib_slot,tip,slot,height}`) with no `mode`.
+/// Pure + version-agnostic: defaults to "0.1.x" for the flat/legacy shape.
+pub fn info_l1_version(v: &Value) -> &'static str {
+    let nested = v.get("cryptarchia_info").is_some_and(Value::is_object);
+    if nested || v.get("mode").is_some() {
+        "0.2.x"
+    } else {
+        "0.1.x"
+    }
+}
+
+/// The settlement (inscription) tip of a `/channel/:id` response, as hex. v0.2.0
+/// renamed `tip` -> `tip_message`; accept either. Returns `""` when neither key is
+/// present, so a tip-less response reads as "no settlement" (not a spurious change).
+pub fn channel_tip(v: &Value) -> String {
+    v.get("tip_message")
+        .or_else(|| v.get("tip"))
+        .filter(|t| !t.is_null()) // an explicit null reads as "no settlement", not "?"
+        .map(jhex)
+        .unwrap_or_default()
+}
+
 pub fn short(s: &str) -> String {
     if s.len() > 14 {
         format!("{}…{}", &s[..8], &s[s.len() - 4..])
@@ -1041,6 +1100,72 @@ mod tests {
         assert_eq!(coerce_u64(&json!([42])), Some(42));
         assert_eq!(coerce_u64(&json!({"slot": 42})), Some(42));
         assert_eq!(coerce_u64(&json!(true)), None);
+    }
+
+    // --- v0.2.0 node API compatibility -------------------------------------
+
+    #[test]
+    fn info_u64_reads_v02_nested_and_v01_flat() {
+        // v0.2.0 wraps the fields in `cryptarchia_info`.
+        let v02 = json!({
+            "cryptarchia_info": {"lib":"ab","lib_slot":40,"tip":"cd","slot":42,"height":7},
+            "mode": {"Started":"Online"}
+        });
+        assert_eq!(info_u64(&v02, "height"), Some(7));
+        assert_eq!(info_u64(&v02, "slot"), Some(42));
+        assert_eq!(info_u64(&v02, "lib_slot"), Some(40));
+        // 0.1.2 returned them flat.
+        let v01 = json!({"lib_slot":40,"slot":42,"height":7});
+        assert_eq!(info_u64(&v01, "height"), Some(7));
+        assert_eq!(info_u64(&v01, "lib_slot"), Some(40));
+    }
+
+    #[test]
+    fn info_mode_normalizes_sync_state() {
+        assert_eq!(info_mode(&json!({"mode":{"Started":"Online"}})).as_deref(), Some("online"));
+        assert_eq!(
+            info_mode(&json!({"mode":{"Started":"Bootstrapping"}})).as_deref(),
+            Some("bootstrapping")
+        );
+        assert_eq!(info_mode(&json!({"mode":"AwaitingStart"})).as_deref(), Some("awaiting"));
+        // 0.1.2 has no `mode` field.
+        assert_eq!(info_mode(&json!({"height":1})), None);
+    }
+
+    #[test]
+    fn channel_tip_accepts_both_field_names() {
+        assert_eq!(channel_tip(&json!({"tip_message":"ABcd"})), "abcd"); // v0.2.0
+        assert_eq!(channel_tip(&json!({"tip":"ABcd"})), "abcd"); // 0.1.2
+        // tip_message wins when both somehow present
+        assert_eq!(channel_tip(&json!({"tip_message":"aa","tip":"bb"})), "aa");
+        // missing OR explicit-null => empty (refresh_channels: "no settlement")
+        assert_eq!(channel_tip(&json!({"balance":0})), "");
+        assert_eq!(channel_tip(&json!({"tip_message": Value::Null})), "");
+    }
+
+    #[test]
+    fn info_l1_version_detects_v01_flat_and_v02_nested() {
+        // v0.2.x: nested `cryptarchia_info` object and/or a `mode` field.
+        let v02 = json!({
+            "cryptarchia_info": {"lib":"ab","lib_slot":40,"tip":"cd","slot":42,"height":7},
+            "mode": {"Started":"Online"}
+        });
+        assert_eq!(info_l1_version(&v02), "0.2.x");
+        // the `mode` field alone (any shape) is enough to detect v0.2.x.
+        assert_eq!(info_l1_version(&json!({"mode":"AwaitingStart"})), "0.2.x");
+        // 0.1.x: flat fields, no wrapper, no `mode` => the legacy default.
+        let v01 = json!({"lib":"ab","lib_slot":40,"tip":"cd","slot":42,"height":7});
+        assert_eq!(info_l1_version(&v01), "0.1.x");
+    }
+
+    #[test]
+    fn channel_alias_known_and_unknown() {
+        let paradox = "0101010101010101010101010101010101010101010101010101010101010101";
+        // known id -> friendly name (accepts a 0x prefix / any case)
+        assert_eq!(channel_alias(paradox), Some("Paradox Computer"));
+        assert_eq!(channel_alias(&format!("0x{}", paradox.to_uppercase())), Some("Paradox Computer"));
+        // unknown id -> None (caller keeps the short-hex rendering)
+        assert_eq!(channel_alias(&"ab".repeat(32)), None);
     }
 
     #[test]
