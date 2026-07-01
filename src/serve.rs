@@ -2285,7 +2285,8 @@ async fn rpc_program_owner(client: &Client, url: &str, account: &str) -> Option<
     let hex: String = arr
         .iter()
         .filter_map(Value::as_u64)
-        .map(|w| format!("{:08x}", w as u32))
+        .flat_map(|w| (w as u32).to_le_bytes())
+        .map(|b| format!("{b:02x}"))
         .collect();
     (hex.len() == 64).then_some(hex)
 }
@@ -2303,14 +2304,21 @@ async fn rpc_get_program_ids(client: &Client, url: &str) -> Option<HashMap<Strin
     let obj = v.get("result")?.as_object()?;
     let mut out = HashMap::new();
     for (name, idv) in obj {
-        if let Some(arr) = idv.as_array() {
-            let hex: String = arr
-                .iter()
-                .filter_map(Value::as_u64)
-                .map(|w| format!("{:08x}", w as u32))
-                .collect();
-            if hex.len() == 64 {
-                out.insert(hex, name.clone());
+        // id is a `[u32;8]` array (serialize as LE bytes) or already a hex string.
+        let hex: Option<String> = if let Some(arr) = idv.as_array() {
+            Some(
+                arr.iter()
+                    .filter_map(Value::as_u64)
+                    .flat_map(|w| (w as u32).to_le_bytes())
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+            )
+        } else {
+            idv.as_str().map(|s| s.trim_start_matches("0x").to_ascii_lowercase())
+        };
+        if let Some(h) = hex {
+            if h.len() == 64 {
+                out.insert(h, name.clone());
             }
         }
     }
@@ -2671,43 +2679,42 @@ async fn api_config_post(State(app): State<AppState>, Json(cfg): Json<Config>) -
 /// rc3 LEZ built-in program ids (hex) -> name. The rc4 build we link doesn't know these,
 /// so baking them in lets rc3 sequencers (e.g. prod `8101`) resolve + decode offline
 /// alongside rc4 - purely additive (cryptographic ids never collide with rc4's).
+// Program ids are the risc0 image id ([u32;8]) serialized as LITTLE-ENDIAN bytes - the
+// on-chain / `getProgramIds` / wallet convention (matches `program_id_hex`).
 const RC3_PROGRAMS: &[(&str, &str)] = &[
-    ("7dc71e6d47b86d42b97ea3e2788db764179fb87037257ffc4600e5c050818abd", "token"),
-    ("1b55cba222931f20d3cd67711c080c8ad41c772bd95ec9fd32711650be9fe3b2", "amm"),
-    ("a60c21f6247ccfcafa0fe948269efe7992cf9bff90610a69c07ef39dc2adc631", "clock"),
-    ("6b34babe10e22af1a71a305b2d920faf1689672d6b2ac560fa6809f3cfaac2cb", "pinata"),
-    ("4cb3502c40ca09379d33d3f216e5824283ead5a800c9cb24fec45fd5e4f4d9f9", "pinata_token"),
-    ("89086ea909fcd742dbb1c7af8c552152ac72f7674dd03081dc86c0f17b8bab07", "authenticated_transfer"),
+    ("6d1ec77d426db847e2a37eb964b78d7870b89f17fc7f2537c0e50046bd8a8150", "token"),
+    ("a2cb551b201f93227167cdd38a0c081c2b771cd4fdc95ed950167132b2e39fbe", "amm"),
+    ("f6210ca6cacf7c2448e90ffa79fe9e26ff9bcf92690a61909df37ec031c6adc2", "clock"),
+    ("beba346bf12ae2105b301aa7af0f922d2d67891660c52a6bf30968facbc2aacf", "pinata"),
+    ("2c50b34c3709ca40f2d3339d4282e516a8d5ea8324cbc900d55fc4fef9d9f4e4", "pinata_token"),
+    ("a96e088942d7fc09afc7b1db5221558c67f772ac8130d04df1c086dc07ab8b7b", "authenticated_transfer"),
 ];
 
-/// rc5 (v0.2.0-rc5) LEZ built-in program ids (hex) -> name. rc5 bumped risc0 (new image
-/// ids) and added bridge / faucet / genesis-supply / vault. Computed from the rc5 guest
-/// artifacts (risc0 compute_image_id); baked in like rc3 so rc5 sequencers resolve names
-/// + version-tag offline. The rc4 build we link doesn't know these, so they arrive as raw
-/// hex on a tx and are matched here.
+/// rc5 (Testnet v0.2) LEZ built-in program ids -> name, in the canonical LITTLE-ENDIAN
+/// byte form (matches `program_id_hex` / the sequencer `getProgramIds` registry / wallet).
+/// The 12 non-clock natives are the deployed zone's own build (`netcup-program-methods.rs`,
+/// verified against wallet txs + `getProgramIds`). The CLOCK is the EMPIRICAL id read from
+/// a live settled block (`884e693a…`); the source-tree clock (`e23158e6…`) differs and is
+/// kept only as a fallback for a differently-built rc5 zone. User-deployed programs (not
+/// natives) are not here and correctly render as raw hex.
 const RC5_PROGRAMS: &[(&str, &str)] = &[
-    ("554a58c476f812934842debb5ff9dab1a495c86f4d7371219432fd3f24df0a0c", "token"),
-    ("3a82755d1a071b715c68a56d4d0a3084adcb2f4e88955ba2881de19e91674bc8", "amm"),
-    ("e65831e2eeaeb4e76e03d3e859c7d7af098a1de5927b824d21ba1057468fffde", "clock"),
-    ("8b8c3c9bb7caa2849efd51eea328f53054ca51bba50409ab9376baf1ec4b87fe", "pinata"),
-    ("ff15a014a364e23e6cd95b80012aaadba792aafd833d9048b076f7e12f883600", "pinata_token"),
-    ("3792a1d9b1226823760510f8199ad1ebf97841f7984c289e4ac44a3a72b4d5cb", "authenticated_transfer"),
-    ("1f0e87e444dff37e5eec2ba27d3fd000cafbd56a6ba5877a859dbe38a432b9e2", "ata"),
-    ("164d57af98ab36b29b85f0490faffd6edc708acbb9adb8f7afb75854a2349f76", "privacy_preserving_circuit"),
-    ("8d3601794a0ce5637f19b9e772b14beb3b02b466efc6008780e6fe5fd58d462d", "bridge"),
-    ("21771296f7b6a47acefca87b475279b260850d57b77e7f7327d54c670c197081", "faucet"),
-    ("a362c7f8727f32b9b1bc79a37fb7aec9c59a3fbbbf1d629cc1f5355681e4a214", "genesis_supply_account"),
-    ("37d6a2bbb19148a21400ccb81d80ee9de788d399b916258e9687ce3597036c21", "genesis_supply_private_account"),
-    ("6decd1a854fc3d80f53c5da57d8a3876a3021b4687cdd48b3708f3eb07dff1a2", "vault"),
-    // --- LIVE Testnet v0.2 (rc5) zone rebuild ids ---------------------------------------
-    // risc0 image ids are build-specific: the deployed (netcup) rc5 zone rebuilt its guest
-    // programs, so its ids differ from the v0.2.0-rc5 TAG artifacts above (e.g. its clock is
-    // 3a694e88…, not the tag's e65831e2…). These three are verified from the live zone; the
-    // rest (token/ata/pinata/faucet/bridge/amm) aren't sampled yet and show as raw hex until
-    // their live ids are added here.
-    ("3a694e88de572d3005c4c41a1dea5bcaded107f77df8d91184781be5638ea95a", "clock"),
+    // deployed clock (empirical, from a live settled block)
+    ("884e693a302d57de1ac4c405ca5bea1df707d1de11d9f87de51b78845aa98e63", "clock"),
+    // 12 non-clock natives (netcup build, LE-bytes)
+    ("c4584a559312f876bbde4248b1daf95f6fc895a42171734d3ffd32940c0adf24", "token"),
+    ("5d75823a711b071a6da5685c84300a4d4e2fcbada25b95889ee11d88c84b6791", "amm"),
+    ("e4870e1f7ef3df44a22bec5e00d03f7d6ad5fbca7a87a56b38be9d85e2b932a4", "ata"),
+    ("9b3c8c8b84a2cab7ee51fd9e30f528a3bb51ca54ab0904a5f1ba7693fe874bec", "pinata"),
+    ("14a015ff3ee264a3805bd96cdbaa2a01fdaa92a748903d83e1f776b00036882f", "pinata_token"),
     ("d9a19237236822b1f8100576ebd19a19f74178f99e284c983a4ac44acbd5b472", "authenticated_transfer"),
+    ("af574d16b236ab9849f0859b6efdaf0fcb8a70dcf7b8adb95458b7af769f34a2", "privacy_preserving_circuit"),
+    ("7901368d63e50c4ae7b9197feb4bb17266b4023b8700c6ef5ffee6802d468dd5", "bridge"),
+    ("961277217aa4b6f77ba8fcceb2795247570d8560737f7eb7674cd5278170190c", "faucet"),
+    ("f8c762a3b9327f72a379bcb1c9aeb77fbb3f9ac59c621dbf5635f5c114a2e481", "genesis_supply_account"),
+    ("bba2d637a24891b1b8cc00149dee801d99d388e78e2516b935ce8796216c0397", "genesis_supply_private_account"),
     ("a8d1ec6d803dfc54a55d3cf576388a7d461b02a38bd4cd87ebf30837a2f1df07", "vault"),
+    // source-tree rc5 clock fallback (a zone built straight from v0.2.0-rc5 uses this)
+    ("e23158e6e7b4aeeee8d3036eafd7c759e51d8a094d827b925710ba21deff8f46", "clock"),
 ];
 
 /// Set from `Config.skip_clock`; when true, clock-program txs aren't stored/indexed.
@@ -4838,11 +4845,11 @@ mod tests {
 
     #[test]
     fn rc5_live_zone_program_ids_recognized() {
-        // The live (netcup) rc5 zone rebuilt its guests, so its risc0 image ids differ from
-        // the v0.2.0-rc5 tag artifacts. These three are verified from the live zone and must
-        // be recognized as the clock (for skip_clock), as the rc5 LEZ family (version tag),
-        // and resolve to their human names (surfaced via /api/programs into the feed/UI).
-        let clock = "3a694e88de572d3005c4c41a1dea5bcaded107f77df8d91184781be5638ea95a";
+        // Program ids key on the canonical LITTLE-ENDIAN byte form (== the decoder's
+        // `program_id_hex`, `getProgramIds`, and the wallet). All three are the live zone's
+        // real ids: clock is the EMPIRICAL id read from a settled block (`884e693a…`, NOT
+        // the source-tree `e23158e6…`); auth/vault are the zone's natives (wallet-verified).
+        let clock = "884e693a302d57de1ac4c405ca5bea1df707d1de11d9f87de51b78845aa98e63";
         let auth = "d9a19237236822b1f8100576ebd19a19f74178f99e284c983a4ac44acbd5b472";
         let vault = "a8d1ec6d803dfc54a55d3cf576388a7d461b02a38bd4cd87ebf30837a2f1df07";
         // clock recognized => skip_clock drops the ~91% clock rows
@@ -4856,8 +4863,8 @@ mod tests {
         assert_eq!(name(clock), Some("clock"));
         assert_eq!(name(auth), Some("authenticated_transfer"));
         assert_eq!(name(vault), Some("vault"));
-        // the live clock id is NOT the tag clock id (documents the build-specific mismatch)
-        assert_ne!(clock, "e65831e2eeaeb4e76e03d3e859c7d7af098a1de5927b824d21ba1057468fffde");
+        // the deployed clock (LE) is NOT the word-order (BE) form the decoder used to emit
+        assert_ne!(clock, "3a694e88de572d3005c4c41a1dea5bcaded107f77df8d91184781be5638ea95a");
         // an unrelated id is neither a clock nor a known LEZ version
         assert!(!is_clock_program(&"ab".repeat(32)));
         assert_eq!(lez_version(&"ab".repeat(32)), None);

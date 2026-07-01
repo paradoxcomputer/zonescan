@@ -116,16 +116,16 @@ fn transfer_amount(t: &TxRecord) -> Option<i128> {
     // store the unresolved hex id, which the name match would otherwise miss).
     let kind = match t.program.as_deref()? {
         "authenticated_transfer" | "pinata" | "pinata_token"
-        | "89086ea909fcd742dbb1c7af8c552152ac72f7674dd03081dc86c0f17b8bab07" // rc3 auth_transfer
-        | "6b34babe10e22af1a71a305b2d920faf1689672d6b2ac560fa6809f3cfaac2cb" // rc3 pinata
-        | "4cb3502c40ca09379d33d3f216e5824283ead5a800c9cb24fec45fd5e4f4d9f9" // rc3 pinata_token
-        | "3792a1d9b1226823760510f8199ad1ebf97841f7984c289e4ac44a3a72b4d5cb" // rc5 auth_transfer
-        | "8b8c3c9bb7caa2849efd51eea328f53054ca51bba50409ab9376baf1ec4b87fe" // rc5 pinata
-        | "ff15a014a364e23e6cd95b80012aaadba792aafd833d9048b076f7e12f883600" // rc5 pinata_token
+        | "a96e088942d7fc09afc7b1db5221558c67f772ac8130d04df1c086dc07ab8b7b" // rc3 auth_transfer
+        | "beba346bf12ae2105b301aa7af0f922d2d67891660c52a6bf30968facbc2aacf" // rc3 pinata
+        | "2c50b34c3709ca40f2d3339d4282e516a8d5ea8324cbc900d55fc4fef9d9f4e4" // rc3 pinata_token
+        | "d9a19237236822b1f8100576ebd19a19f74178f99e284c983a4ac44acbd5b472" // rc5 auth_transfer
+        | "9b3c8c8b84a2cab7ee51fd9e30f528a3bb51ca54ab0904a5f1ba7693fe874bec" // rc5 pinata
+        | "14a015ff3ee264a3805bd96cdbaa2a01fdaa92a748903d83e1f776b00036882f" // rc5 pinata_token
             => "native",
         "token"
-        | "7dc71e6d47b86d42b97ea3e2788db764179fb87037257ffc4600e5c050818abd" // rc3 token
-        | "554a58c476f812934842debb5ff9dab1a495c86f4d7371219432fd3f24df0a0c" // rc5 token
+        | "6d1ec77d426db847e2a37eb964b78d7870b89f17fc7f2537c0e50046bd8a8150" // rc3 token
+        | "c4584a559312f876bbde4248b1daf95f6fc895a42171734d3ffd32940c0adf24" // rc5 token
             => "token",
         _ => return None,
     };
@@ -172,14 +172,14 @@ fn is_token_program(p: &str) -> bool {
     matches!(
         p,
         "token"
-            | "7dc71e6d47b86d42b97ea3e2788db764179fb87037257ffc4600e5c050818abd" // rc3
-            | "554a58c476f812934842debb5ff9dab1a495c86f4d7371219432fd3f24df0a0c" // rc5
+            | "6d1ec77d426db847e2a37eb964b78d7870b89f17fc7f2537c0e50046bd8a8150" // rc3
+            | "c4584a559312f876bbde4248b1daf95f6fc895a42171734d3ffd32940c0adf24" // rc5
     )
 }
 fn is_ata_program(p: &str) -> bool {
     matches!(
         p,
-        "ata" | "1f0e87e444dff37e5eec2ba27d3fd000cafbd56a6ba5877a859dbe38a432b9e2" // rc5
+        "ata" | "e4870e1f7ef3df44a22bec5e00d03f7d6ad5fbca7a87a56b38be9d85e2b932a4" // rc5
     )
 }
 

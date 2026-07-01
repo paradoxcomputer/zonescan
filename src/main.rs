@@ -774,7 +774,7 @@ fn decode_block_detail(bytes: &[u8]) -> (Option<TxMix>, Vec<TxInfo>, Option<(Str
                 let bytecode = d.clone().into_message().into_bytecode();
                 let deploy_program = nssa::program::Program::new(bytecode.clone())
                     .ok()
-                    .map(|p| p.id().iter().map(|w| format!("{w:08x}")).collect::<String>())
+                    .map(|p| program_id_hex(&p.id()))
                     .unwrap_or_default();
                 TxInfo {
                     hash: hex::encode(d.hash()),
@@ -810,6 +810,14 @@ fn decode_block_detail(_bytes: &[u8]) -> (Option<TxMix>, Vec<TxInfo>, Option<(St
     (None, vec![], None)
 }
 
+/// Canonical on-chain program-id hex: the `[u32; 8]` image id serialized as little-endian
+/// bytes (the sequencer `getProgramIds` / wallet / on-chain convention), e.g. the clock's
+/// `[0x3a694e88, ..]` -> `"884e693a.."`. NOT the `{w:08x}` word-order form (which reverses
+/// each 4-byte group and so never matched the registry / other tools).
+pub fn program_id_hex(pid: &[u32; 8]) -> String {
+    pid.iter().flat_map(|w| w.to_le_bytes()).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Human label for a program id: a known built-in name, else a short hex of the id.
 #[cfg(feature = "decode")]
 fn program_label(pid: &[u32; 8]) -> String {
@@ -829,7 +837,7 @@ fn program_label(pid: &[u32; 8]) -> String {
         m
     });
     map.get(pid).map_or_else(
-        || pid.iter().map(|w| format!("{w:08x}")).collect::<String>(),
+        || program_id_hex(pid),
         |name| (*name).to_string(),
     )
 }
@@ -840,7 +848,7 @@ fn program_label(pid: &[u32; 8]) -> String {
 #[cfg(feature = "decode")]
 pub fn builtin_program_ids() -> Vec<(String, String)> {
     use nssa::program::Program;
-    let hex = |id: [u32; 8]| id.iter().map(|w| format!("{w:08x}")).collect::<String>();
+    let hex = |id: [u32; 8]| program_id_hex(&id);
     vec![
         (hex(Program::authenticated_transfer_program().id()), "authenticated_transfer".into()),
         (hex(Program::token().id()), "token".into()),
@@ -1169,6 +1177,23 @@ mod tests {
     }
 
     #[test]
+    fn program_id_hex_is_little_endian_bytes() {
+        // The live clock's image-id words (as the decoder reads them from a settled block's
+        // Message.program_id) -> canonical on-chain LE-byte hex `884e693a…` (== getProgramIds
+        // / the wallet). NOT the old `{w:08x}` word form `3a694e88…`.
+        let clock = [
+            0x3a694e88u32, 0xde572d30, 0x05c4c41a, 0x1dea5bca, 0xded107f7, 0x7df8d911, 0x84781be5,
+            0x638ea95a,
+        ];
+        assert_eq!(
+            program_id_hex(&clock),
+            "884e693a302d57de1ac4c405ca5bea1df707d1de11d9f87de51b78845aa98e63"
+        );
+        // authenticated_transfer word0 = 0x3792a1d9 -> LE bytes "d9a19237.."
+        assert!(program_id_hex(&[0x3792a1d9, 0, 0, 0, 0, 0, 0, 0]).starts_with("d9a19237"));
+    }
+
+    #[test]
     fn decode_inscription_offsets() {
         // 148+ byte buffer: block_id=48 @0, timestamp=1000 @72, tx_count=3 @144
         let mut b = vec![0u8; 148];
@@ -1251,5 +1276,21 @@ mod tests {
         assert_eq!(txs5.len(), txs4.len(), "same transactions recovered");
         assert_eq!(txs5[0].hash, txs4[0].hash, "same first tx hash");
         assert_eq!(chk5.unwrap().2, chk4.unwrap().2, "same hash verdict (bedrock_parent_id isn't hashed)");
+    }
+
+    // A real settled clock block from the netcup L1 (rc5). Its single tx is the clock
+    // invocation; decode must surface program_id as the canonical LE-byte form
+    // `884e693a…` (== on-chain / getProgramIds), NOT the old `{w:08x}` word form.
+    #[cfg(feature = "decode")]
+    #[test]
+    fn decodes_live_rc5_clock_program_id_as_le_bytes() {
+        let fixture = "a205000000000000c397231c0f850a31916dc58702b1e10d434d1c8626905aa462bac626d2705621931180c4e7eac93beaa51ec66ff8f11a413c876b02f5bba161e7300c457353e66f3fc11d9f0100009df1300f0f147dd0e518116563d052d157901f1fbaab01f5293712eeb3b829399e67037055062e92dde94ce714b713a7db0db6458b0231189fc3f2dbcc1d8e620100000000884e693a302d57de1ac4c405ca5bea1df707d1de11d9f87de51b78845aa98e63030000002f4c455a2f436c6f636b50726f6772616d4163636f756e742f303030303030312f4c455a2f436c6f636b50726f6772616d4163636f756e742f303030303031302f4c455a2f436c6f636b50726f6772616d4163636f756e742f3030303030353000000000020000006f3fc11d9f0100000000000000";
+        let d = decode_inscription(&Value::String(fixture.into())).expect("rc5 clock block decodes");
+        let progs: Vec<Option<String>> = d.txs.iter().map(|t| t.program.clone()).collect();
+        assert!(
+            d.txs.iter().any(|t| t.program.as_deref()
+                == Some("884e693a302d57de1ac4c405ca5bea1df707d1de11d9f87de51b78845aa98e63")),
+            "clock program_id must decode to LE 884e693a..; got {progs:?}"
+        );
     }
 }
