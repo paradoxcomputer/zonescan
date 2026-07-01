@@ -648,6 +648,11 @@ pub struct Decoded {
     /// Whether the stated header hash matches a recompute of the block contents
     /// (tamper-evidence). `true` when not checked (light build).
     pub hash_ok: bool,
+    /// L1 finality: `true` when the sequencer marked this block `bedrock_status = Finalized`
+    /// (inscribed to L1 + confirmed beyond lib_slot). Only set in the decode build; `false`
+    /// otherwise. Drives the per-sequencer `finalized_block_id` threshold.
+    #[serde(default)]
+    pub bedrock_final: bool,
 }
 
 /// Raw bytes of an inscription value (array-of-numbers or hex string).
@@ -679,7 +684,7 @@ pub fn decode_inscription(ins: &Value) -> Option<Decoded> {
     let tx_count = (bytes.len() >= 148)
         .then(|| u32::from_le_bytes(bytes[144..148].try_into().unwrap()))
         .unwrap_or(0);
-    let (tx_mix, txs, chk) = decode_block_detail(&bytes);
+    let (tx_mix, txs, chk, bedrock_final) = decode_block_detail(&bytes);
     let (hash, prev_hash, hash_ok) = chk.unwrap_or_else(|| (String::new(), String::new(), true));
     Some(Decoded {
         block_id,
@@ -690,12 +695,16 @@ pub fn decode_inscription(ins: &Value) -> Option<Decoded> {
         hash,
         prev_hash,
         hash_ok,
+        bedrock_final,
     })
 }
 
-/// Returns `(tx_mix, txs, Some((header_hash_hex, prev_hash_hex, hash_matches_recompute)))`.
+/// Returns `(tx_mix, txs, Some((header_hash_hex, prev_hash_hex, hash_matches_recompute)),
+/// bedrock_finalized)`.
 #[cfg(feature = "decode")]
-fn decode_block_detail(bytes: &[u8]) -> (Option<TxMix>, Vec<TxInfo>, Option<(String, String, bool)>) {
+fn decode_block_detail(
+    bytes: &[u8],
+) -> (Option<TxMix>, Vec<TxInfo>, Option<(String, String, bool)>, bool) {
     use common::transaction::NSSATransaction as T;
     use borsh::BorshDeserialize;
     // The linked build is rc4, whose Block = header + body + bedrock_status + a trailing
@@ -714,9 +723,10 @@ fn decode_block_detail(bytes: &[u8]) -> (Option<TxMix>, Vec<TxInfo>, Option<(Str
         })();
         match parsed {
             Some(b) => b,
-            None => return (None, vec![], None),
+            None => return (None, vec![], None, false),
         }
     };
+    let bedrock_final = matches!(block.bedrock_status, common::block::BedrockStatus::Finalized);
     let mut mix = TxMix::default();
     let txs = block
         .body
@@ -802,12 +812,14 @@ fn decode_block_detail(bytes: &[u8]) -> (Option<TxMix>, Vec<TxInfo>, Option<(Str
     };
     let hash = hex::encode(block.header.hash.0);
     let prev_hash = hex::encode(block.header.prev_block_hash.0);
-    (Some(mix), txs, Some((hash, prev_hash, hash_ok)))
+    (Some(mix), txs, Some((hash, prev_hash, hash_ok)), bedrock_final)
 }
 
 #[cfg(not(feature = "decode"))]
-fn decode_block_detail(_bytes: &[u8]) -> (Option<TxMix>, Vec<TxInfo>, Option<(String, String, bool)>) {
-    (None, vec![], None)
+fn decode_block_detail(
+    _bytes: &[u8],
+) -> (Option<TxMix>, Vec<TxInfo>, Option<(String, String, bool)>, bool) {
+    (None, vec![], None, false)
 }
 
 /// Canonical on-chain program-id hex: the `[u32; 8]` image id serialized as little-endian
@@ -1266,11 +1278,11 @@ mod tests {
         let block = common::test_utils::produce_dummy_block(7, Some(common::HashType([1; 32])), txs);
         let full = borsh::to_vec(&block).unwrap(); // rc4 shape (trailing bedrock_parent_id present)
 
-        let (mix4, txs4, chk4) = decode_block_detail(&full);
+        let (mix4, txs4, chk4, _f4) = decode_block_detail(&full);
         assert!(mix4.is_some() && chk4.is_some() && !txs4.is_empty(), "rc4-shaped block decodes");
 
         let rc5 = &full[..full.len() - 32]; // strip the trailing bedrock_parent_id (the rc5 shape)
-        let (mix5, txs5, chk5) = decode_block_detail(rc5);
+        let (mix5, txs5, chk5, _f5) = decode_block_detail(rc5);
         assert!(mix5.is_some(), "rc5-shaped block (trailing field dropped) still decodes");
         // full (rc4) and stripped (rc5) must recover the identical transactions + hash verdict
         assert_eq!(txs5.len(), txs4.len(), "same transactions recovered");

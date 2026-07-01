@@ -138,6 +138,32 @@ fn transfer_amount(t: &TxRecord) -> Option<i128> {
     }
 }
 
+/// The amount to DISPLAY for a token/native op - broader than `transfer_amount` (which is
+/// only the Transfer amount used for balance replay). Adds the token `NewFungibleDefinition`
+/// total_supply (variant 1, the u128 AFTER the risc0-encoded name string) and Mint (5) /
+/// Burn (4). Returned as the raw u128 string. Layout is identical across rc3/rc4/rc5.
+fn token_display_amount(rec: &TxRecord) -> Option<String> {
+    // native + token Transfer (variant 0) already handled by transfer_amount
+    if let Some(a) = transfer_amount(rec) {
+        return Some(a.to_string());
+    }
+    if !is_token_program(rec.program.as_deref().unwrap_or("")) {
+        return None;
+    }
+    let w = &rec.instruction_data;
+    match w.first().copied() {
+        // Mint{amount} (5) / Burn{amount} (4): u128 right after the variant tag
+        Some(4 | 5) if w.len() >= 5 => Some(u128_le_at(w, 1).to_string()),
+        // NewFungibleDefinition{name: String, total_supply: u128} (1): supply after the name.
+        // e.g. [1, 4, <"BRNZ" packed>, 20000000, 0, 0, 0] -> name len 4 (1 word) -> supply @3.
+        Some(1) => {
+            let off = 1 + r0_str_words(w, 1);
+            (w.len() >= off + 4).then(|| u128_le_at(w, off).to_string())
+        }
+        _ => None,
+    }
+}
+
 fn ser<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(v)?)
 }
@@ -491,7 +517,7 @@ impl Db {
     /// learned maps + the known-token fallback. Either may be `None`.
     pub fn token_op(&self, rec: &TxRecord) -> (Option<String>, Option<String>) {
         let prog = rec.program.as_deref().unwrap_or("");
-        let amount = transfer_amount(rec).map(|a| a.to_string());
+        let amount = token_display_amount(rec);
         let name = if is_token_program(prog) || is_ata_program(prog) {
             rec.accounts.iter().find_map(|a| {
                 known_token(a).map(str::to_string).or_else(|| {
@@ -502,6 +528,19 @@ impl Db {
             None
         };
         (amount, name)
+    }
+
+    /// If `account` is a known token's definition or a holding of one, its (symbol, role) -
+    /// role is "definition" (the account IS the token definition) or "holding" (a holding
+    /// whose definition resolves to that symbol). Used to label WHICH account produced a
+    /// token tag in the tx-detail accounts list, so the tag is visibly sourced.
+    pub fn account_token(&self, account: &str) -> Option<(String, String)> {
+        let (definition, name, _supply) = self.resolve_token(account)?;
+        if name.is_empty() {
+            return None;
+        }
+        let role = if definition == account { "definition" } else { "holding" };
+        Some((name, role.to_string()))
     }
 
     /// Persist a token mapping learned from the sequencer RPC, so later lookups are offline.
@@ -1083,6 +1122,19 @@ mod tests {
         u.instruction_data = vec![0, 7, 0, 0, 0];
         u.accounts = vec!["HOLD1".into()];
         assert_eq!(db.token_op(&u), (Some("7".into()), Some("MED".into())));
+        // NewFungibleDefinition{name:"BRNZ", total_supply:20000000} (variant 1) - amount is
+        // the supply, which sits AFTER the risc0 name string (the live-feed bug).
+        let mut d = rec("h4", "ch", 4, Some(token));
+        d.instruction_data = vec![1, 4, 1515082306, 20000000, 0, 0, 0]; // [var, len, "BRNZ", supply..]
+        d.accounts = vec!["5QWkMsv6cQX7AGj21g7j6kdDeebAmaK3wqeDbavsxUoU".into()]; // BRNZ def
+        assert_eq!(db.token_op(&d), (Some("20000000".into()), Some("BRNZ".into())));
+        // account_token labels WHICH account produced the tag + its role
+        assert_eq!(
+            db.account_token("EvBnxwtWYAA5E3cWwxFAC8j6PDUECruhk4kEzaFPSmE8"),
+            Some(("GOLD".into(), "definition".into()))
+        );
+        assert_eq!(db.account_token("HOLD1"), Some(("MED".into(), "holding".into())));
+        assert_eq!(db.account_token("nope"), None);
         // a non-token public program: no amount, no token
         let n = rec("h3", "ch", 3, Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"));
         assert_eq!(db.token_op(&n), (None, None));

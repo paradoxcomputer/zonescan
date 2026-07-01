@@ -538,6 +538,9 @@ fn verify_chain<'a>(blocks_ascending: impl Iterator<Item = &'a Decoded>) -> Cons
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct SeqTrack {
     latest_block_id: u64,
+    /// Highest block id the sequencer marked `bedrock_status = Finalized` (on L1, beyond
+    /// lib_slot). A tx is "final on L1" when its block_id <= this; above it, "pending".
+    finalized_block_id: u64,
     first_block_id: u64,
     first_seen_unix: u64,
     last_block_unix: u64,
@@ -764,6 +767,10 @@ fn ingest(s: &mut ServerState, channel: &str, slot: Option<u64>, d: &Decoded, no
         if let Some(sl) = slot {
             e.latest_slot = e.latest_slot.max(sl);
         }
+        // advance the L1-finality threshold: this block is settled on L1 (bedrock Finalized)
+        if d.bedrock_final {
+            e.finalized_block_id = e.finalized_block_id.max(d.block_id);
+        }
         // tag the sequencer's LEZ build from a recognized program id (clock every block)
         if e.version.is_none() {
             for t in &d.txs {
@@ -839,6 +846,9 @@ struct SeqSnap {
     channel: String,
     channel_short: String,
     latest_block_id: u64,
+    /// highest L1-finalized block id (see SeqTrack); the client tags a tx final if its
+    /// block_id <= this, else pending. 0 = unknown (light build / no finality info yet).
+    finalized_block_id: u64,
     inscriptions_seen: u64,
     tx_count_last: u32,
     tx_mix: Option<TxMix>,
@@ -888,6 +898,7 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
                 channel: ch.clone(),
                 channel_short: short(ch),
                 latest_block_id: t.latest_block_id,
+                finalized_block_id: t.finalized_block_id,
                 inscriptions_seen: t.inscriptions_seen,
                 tx_count_last: t.tx_count_last,
                 tx_mix: t.tx_mix.clone(),
@@ -2290,6 +2301,24 @@ async fn sequencer_loop(
             next = end + 1;
         }
         backfilled = true;
+        // Advance the L1-finality frontier: re-read a bounded chunk of blocks just above the
+        // finalized threshold so their bedrock_status pending->Finalized flips are picked up
+        // (ingest raises finalized_block_id). Re-ingest is idempotent (db dedups by hash).
+        {
+            let fin = app
+                .inner
+                .lock()
+                .unwrap()
+                .seqs
+                .get(&channel)
+                .map(|t| t.finalized_block_id)
+                .unwrap_or(0);
+            if fin + 1 <= tip {
+                let to = (fin + CHUNK).min(tip);
+                let chunk = seq_fetch_chunk(&client, &rpc_url, fin + 1, to).await;
+                ingest_seq_chunk(&app, &channel, &chunk).await;
+            }
+        }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
@@ -3026,6 +3055,35 @@ fn enrich_tx(app: &AppState, rec: &TxRecord) -> Value {
     v
 }
 
+/// For the tx-detail: annotate each account that maps to a known token with its symbol +
+/// role, so a token tag is visibly SOURCED (e.g. "EvBnxw… — GOLD (definition)") - reusing
+/// the same resolve_token map that produced the tag.
+fn token_accounts_json(app: &AppState, rec: &TxRecord) -> Vec<Value> {
+    let Some(db) = app.db.as_ref() else {
+        return vec![];
+    };
+    rec.accounts
+        .iter()
+        .filter_map(|a| {
+            db.account_token(a)
+                .map(|(sym, role)| json!({"account": a, "symbol": sym, "role": role}))
+        })
+        .collect()
+}
+
+/// tx-detail enrichment: `enrich_tx` (token name+amount) plus the per-account token
+/// annotations (which account sourced the tag).
+fn enrich_tx_detail(app: &AppState, rec: &TxRecord) -> Value {
+    let mut v = enrich_tx(app, rec);
+    let ta = token_accounts_json(app, rec);
+    if let Value::Object(o) = &mut v {
+        if !ta.is_empty() {
+            o.insert("token_accounts".into(), json!(ta));
+        }
+    }
+    v
+}
+
 async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<Vec<Value>> {
     let limit = q.limit.unwrap_or(150).min(1000);
     let needle = q.q.as_deref().map(str::to_string).filter(|n| !n.is_empty());
@@ -3178,15 +3236,11 @@ async fn api_tx(
     if let Some(db) = app.db.clone() {
         let h = hash.clone();
         if let Ok(Ok(Some(t))) = tokio::task::spawn_blocking(move || db.get_tx(&h)).await {
-            return Ok(Json(enrich_tx(&app, &t)));
+            return Ok(Json(enrich_tx_detail(&app, &t)));
         }
     }
-    let s = app.inner.lock().unwrap();
-    s.txs
-        .iter()
-        .find(|t| t.hash == hash)
-        .map(|t| Json(enrich_tx(&app, t)))
-        .ok_or(StatusCode::NOT_FOUND)
+    let found = app.inner.lock().unwrap().txs.iter().find(|t| t.hash == hash).cloned();
+    found.map(|t| Json(enrich_tx_detail(&app, &t))).ok_or(StatusCode::NOT_FOUND)
 }
 
 #[derive(serde::Deserialize)]
@@ -3928,6 +3982,10 @@ const DASH_HTML: &str = r#"<!doctype html>
     margin-left:6px;vertical-align:middle;letter-spacing:.3px;text-transform:uppercase}
   .v-rc4{background:#dcfce7;color:#166534}
   .v-rc5{background:#e0e7ff;color:#3730a3} .v-rc3{background:#fef3c7;color:#92400e}
+  /* L1-finality badge: green "on L1" vs amber "pending" */
+  .fbadge{display:inline-block;font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;vertical-align:middle}
+  .fbadge.fin{background:rgba(19,169,123,.14);color:var(--green)}
+  .fbadge.pend{background:#fef3c7;color:#92400e}
   .filt{display:flex;gap:6px}
   .kbtn{border:1px solid var(--line2);background:#fff;color:var(--muted);border-radius:7px;padding:5px 11px;font-size:12px;cursor:pointer}
   .kbtn.sel{border-color:var(--fg);color:var(--fg);background:#ececef}
@@ -4328,6 +4386,48 @@ function tipNote(s){
 }
 
 // tx table rows; links route to per-tx and per-wallet pages (scoped to the tx's sequencer)
+// short account id for action sentences
+function accShort(a){ return a?esc(sh(a,6,4)):'?'; }
+// bigint-safe thousands grouping (amounts are u128 strings, may exceed Number precision)
+function grp(s){ return s==null?'':String(s).replace(/\B(?=(\d{3})+(?!\d))/g,','); }
+// L1-finality: a tx is "on L1" once its block_id <= the sequencer's finalized threshold
+// (bedrock Finalized = inscribed to L1 + confirmed beyond lib_slot); above it, "pending".
+function seqFinalized(ch){ const q=((state&&state.sequencers)||[]).find(x=>x.channel===ch); return q?(q.finalized_block_id||0):0; }
+function finalityBadge(t){
+  const fin=seqFinalized(t.channel); if(!fin) return '';
+  return (t.block_id<=fin)
+    ? `<span class="fbadge fin" title="settled on L1 - the zone is finalized up to block #${num(fin)}">on L1</span>`
+    : `<span class="fbadge pend" title="pending - not yet irreversibly settled on L1 (finalized up to #${num(fin)})">pending</span>`;
+}
+// A human one-line ACTION for a tx: "<verb> <amount> <token> from <a> to <b>", derived from
+// the program name + instruction variant + resolved token/amount/accounts. Never blank -
+// falls back to "<program> · variant N". rc4 + rc5 (LE program ids resolve via progName).
+function txAction(t){
+  const w=t.instruction_data||[], a=t.accounts||[], name=progName(t.program), tok=t.token, amt=t.amount;
+  const amtS=amt!=null?grp(amt):'';
+  const ft=(a[0]?' from '+accShort(a[0]):'')+(a[1]?' to '+accShort(a[1]):'');
+  if(t.kind==='deploy') return 'Deploy program'+(t.deploy_program?' '+esc(progShort(t.deploy_program)):'');
+  if(t.kind==='private'){ const s=t.subtype; if(s==='shield') return 'Shield (private deposit)'; if(s==='deshield') return 'Deshield (private withdraw)'; return 'Private transfer'; }
+  if(name==='ata'){ const v=w[0]>>>0;
+    if(v===0) return `Create ${tok?esc(tok)+' ':''}token account${a[0]?' for '+accShort(a[0]):''}`;
+    if(v===1) return `Transfer ${amtS?amtS+' ':''}${tok?esc(tok)+' ':''}via ATA${ft}`;
+    if(v===2) return `Burn ${amtS?amtS+' ':''}${tok?esc(tok)+' ':''}via ATA`; }
+  if(name==='token'){ const v=w[0]>>>0;
+    if(v===0) return `Transfer ${amtS?amtS+' ':''}${tok?esc(tok):'tokens'}${ft}`;
+    if(v===1) return `Create token ${tok?esc(tok):''}${amtS?' · supply '+amtS:''}`;
+    if(v===3) return `Initialize ${tok?esc(tok)+' ':''}token account`;
+    if(v===4) return `Burn ${amtS?amtS+' ':''}${tok?esc(tok):'tokens'}`;
+    if(v===5) return `Mint ${amtS?amtS+' ':''}${tok?esc(tok):'tokens'}`; }
+  if(name==='authenticated_transfer'){
+    if(w.length>=4 && u128le(w,0)===0n) return `Register native account${a[0]?' '+accShort(a[0]):''}`;
+    const na=w.length>=4?grp(u128le(w,0).toString()):amtS;
+    return `Transfer ${na?na+' ':''}LEZ${ft}`; }
+  if(name==='pinata') return `Claim native LEZ${a[0]?' to '+accShort(a[0]):''}`;
+  if(name==='faucet') return `Faucet dispense ${tok?esc(tok)+' ':''}${a[0]?'to '+accShort(a[0]):''}`.replace(/ +$/,'');
+  if(name==='clock') return 'Clock tick';
+  const pn=(name&&!/^[0-9a-f]{40,}$/i.test(name))?name.replace(/_/g,' '):progShort(t.program);
+  return `${esc(cap(pn||'program'))}${w.length?' · variant '+(w[0]>>>0):''}`;
+}
 function txRows(list){
   if(!list||!list.length) return '<tr><td colspan="7" class="empty">no transactions</td></tr>';
   return list.map(t=>{
@@ -4336,14 +4436,15 @@ function txRows(list){
     const accs=a0?`<a class="lnk" href="/zone/${u(z)}/wallet/${u(a0)}">${esc(sh(a0,6,4))}</a>`+(t.accounts.length>1?` <span class="mut">+${t.accounts.length-1}</span>`:''):'<span class="mut">-</span>';
     return `<tr>
       <td><a class="lnk" href="/zone/${u(z)}/tx/${u(t.hash)}">${esc(sh(t.hash))}</a></td>
-      <td>${visBadge(t)}</td><td>${typeBadge(t)}${(t.token||t.amount)?` <span class="mut nowrap" style="font-size:11px">${t.token?'<b>'+esc(t.token)+'</b> ':''}${t.amount!=null?esc(t.amount):''}</span>`:''}</td>
+      <td>${visBadge(t)}</td>
+      <td><div style="font-weight:600">${txAction(t)}</div><div class="mut" style="font-size:11px;margin-top:1px">${typeBadge(t)} ${finalityBadge(t)}</div></td>
       <td class="mono">#${num(t.block_id)}</td>
       <td class="mut nowrap">${ageOf(t)}</td>
       <td><a class="lnk" href="/zone/${u(z)}">${chanLabel(z, t.channel_short)}</a></td>
       <td>${accs}</td></tr>`;
   }).join('');
 }
-const txHead='<thead><tr><th>Txn Hash</th><th>Visibility</th><th>Type</th><th>Block</th><th>Age</th><th>Sequencer</th><th>Accounts</th></tr></thead>';
+const txHead='<thead><tr><th>Txn Hash</th><th>Visibility</th><th>Action</th><th>Block</th><th>Age</th><th>Sequencer</th><th>Accounts</th></tr></thead>';
 const crumb=(parts)=>`<div style="font-size:13px;color:var(--soft);padding:14px 0 10px">${parts.map((p,i)=>(i?' <span style="color:var(--soft)">/</span> ':'')+(p.href?`<a href="${p.href}">${esc(p.t)}</a>`:`<span style="color:var(--fg)">${esc(p.t)}</span>`)).join('')}</div>`;
 
 // ---- reusable infinite-scroll tx feed (appends into #rows; updates #count) ----
@@ -4519,10 +4620,16 @@ async function renderTx(seq,hash){
   let t; try{ const r=await fetch('/api/tx/'+u(hash)); if(r.ok) t=await r.json(); }catch(e){}
   if(!t){ $('view').innerHTML=crumb([{t:'Home',href:'/'},{t:'Zone '+sh(seq),href:'/zone/'+u(seq)},{t:'Tx '+sh(hash)}])+'<div class="panel"><div class="empty">transaction not found in the current window</div></div>'; return; }
   const z=t.channel||seq;
-  const accLinks=(arr)=> arr&&arr.length?`<div class="chips">${arr.map(x=>`<a href="/zone/${u(z)}/wallet/${u(x)}">${esc(x)}</a>`).join('')}</div>`:'<span class="mut">none</span>';
+  const taMap={}; (t.token_accounts||[]).forEach(x=>{ taMap[x.account]=x; }); // account -> {symbol, role}
+  const accLinks=(arr)=> arr&&arr.length?`<div class="chips">${arr.map(x=>{
+    const ta=taMap[x];
+    return `<a href="/zone/${u(z)}/wallet/${u(x)}">${esc(x)}${ta?` <span class="mut">· <b>${esc(ta.symbol)}</b> ${esc(ta.role)}</span>`:''}</a>`;
+  }).join('')}</div>`:'<span class="mut">none</span>';
   const li=(arr)=> arr&&arr.length?`<div class="chips">${arr.map(x=>`<span>${esc(x)}</span>`).join('')}</div>`:'<span class="mut">none</span>';
   $('view').innerHTML=crumb([{t:'Home',href:'/'},{t:'Zone '+sh(z),href:'/zone/'+u(z)},{t:'Tx '+sh(hash)}])+
-   `<div class="panel"><div class="phead">Transaction ${visBadge(t)} ${typeBadge(t)}</div><div class="kv" style="padding:18px">
+   `<div class="panel"><div class="phead">Transaction ${visBadge(t)} ${typeBadge(t)}</div>
+    <div style="padding:16px 18px 2px;font-size:17px;font-weight:600;color:var(--navy)">${txAction(t)} ${finalityBadge(t)}</div>
+    <div class="kv" style="padding:14px 18px 18px">
     <div class="k">Txn Hash</div><div class="v">${esc(t.hash)}</div>
     <div class="k">Visibility</div><div class="v">${cap(txVis(t))}</div>
     <div class="k">Type</div><div class="v">${esc(typeLabel(txType(t)))}</div>
