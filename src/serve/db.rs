@@ -183,6 +183,17 @@ fn is_ata_program(p: &str) -> bool {
     )
 }
 
+/// Known token DEFINITION accounts (base58) -> ticker on the deployed zone, as a fallback
+/// when the on-chain `NewFungibleDefinition` op that names them wasn't ingested to learn it.
+const KNOWN_TOKENS: &[(&str, &str)] = &[
+    ("EvBnxwtWYAA5E3cWwxFAC8j6PDUECruhk4kEzaFPSmE8", "GOLD"),
+    ("EbPSjo2MEQuZjEveNSspeLCeqX1Z5e3GtHiY1M7DyytK", "SILV"),
+    ("5QWkMsv6cQX7AGj21g7j6kdDeebAmaK3wqeDbavsxUoU", "BRNZ"),
+];
+fn known_token(def: &str) -> Option<&'static str> {
+    KNOWN_TOKENS.iter().find(|(d, _)| *d == def).map(|(_, n)| *n)
+}
+
 /// Token mappings a tx establishes:
 ///   (Some((definition, name, supply)) from a NewFungibleDefinition,
 ///    Some((holding, definition))      from its supply account or an ata Create).
@@ -458,12 +469,39 @@ impl Db {
             let (name, supply) = unpack(g.value());
             return Some((account.to_string(), name, supply));
         }
+        if let Some(n) = known_token(account) {
+            return Some((account.to_string(), n.to_string(), String::new()));
+        }
         // account is a holding -> its definition -> name
         let hdef = r.open_table(HOLDING_DEF).ok()?;
         let definition = hdef.get(account).ok()??.value().to_string();
-        let g = tdef.get(definition.as_str()).ok()??;
-        let (name, supply) = unpack(g.value());
-        Some((definition, name, supply))
+        match tdef.get(definition.as_str()).ok()? {
+            Some(g) => {
+                let (name, supply) = unpack(g.value());
+                Some((definition, name, supply))
+            }
+            // learned holding->definition, but the name wasn't learned: known-token fallback
+            None => known_token(&definition).map(|n| (definition.clone(), n.to_string(), String::new())),
+        }
+    }
+
+    /// For a token / ATA / native transfer, the (amount, token_name) to render in the feed
+    /// and tx page (e.g. "250", "GOLD"). Amount is decoded from `instruction_data`; the name
+    /// is resolved from any account (a definition, or a holding -> definition) via the
+    /// learned maps + the known-token fallback. Either may be `None`.
+    pub fn token_op(&self, rec: &TxRecord) -> (Option<String>, Option<String>) {
+        let prog = rec.program.as_deref().unwrap_or("");
+        let amount = transfer_amount(rec).map(|a| a.to_string());
+        let name = if is_token_program(prog) || is_ata_program(prog) {
+            rec.accounts.iter().find_map(|a| {
+                known_token(a).map(str::to_string).or_else(|| {
+                    self.resolve_token(a).map(|(_, n, _)| n).filter(|n| !n.is_empty())
+                })
+            })
+        } else {
+            None
+        };
+        (amount, name)
     }
 
     /// Persist a token mapping learned from the sequencer RPC, so later lookups are offline.
@@ -1026,6 +1064,29 @@ mod tests {
             timestamp: 1_700_000_000_000,
             seen_unix: 0,
         }
+    }
+
+    #[test]
+    fn token_op_resolves_name_and_amount() {
+        let path = std::env::temp_dir().join(format!("zs-tokop-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let token = "c4584a559312f876bbde4248b1daf95f6fc895a42171734d3ffd32940c0adf24"; // rc5 token LE
+        // Transfer{amount:250} (variant 0) touching the GOLD definition account (known-token)
+        let mut t = rec("h1", "ch", 1, Some(token));
+        t.instruction_data = vec![0, 250, 0, 0, 0];
+        t.accounts = vec!["EvBnxwtWYAA5E3cWwxFAC8j6PDUECruhk4kEzaFPSmE8".into()]; // GOLD def
+        assert_eq!(db.token_op(&t), (Some("250".into()), Some("GOLD".into())));
+        // learned holding -> definition -> name (no known-token needed)
+        db.learn_token("HOLD1", "DEF1", "MED", "1000").unwrap();
+        let mut u = rec("h2", "ch", 2, Some(token));
+        u.instruction_data = vec![0, 7, 0, 0, 0];
+        u.accounts = vec!["HOLD1".into()];
+        assert_eq!(db.token_op(&u), (Some("7".into()), Some("MED".into())));
+        // a non-token public program: no amount, no token
+        let n = rec("h3", "ch", 3, Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"));
+        assert_eq!(db.token_op(&n), (None, None));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

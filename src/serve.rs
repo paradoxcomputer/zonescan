@@ -957,9 +957,9 @@ fn broadcast_txs(app: &AppState, recs: &[TxRecord]) {
     if recs.is_empty() {
         return;
     }
-    if let Ok(d) = serde_json::to_value(recs) {
-        let _ = app.tx.send(json!({"t": "txs", "d": d}).to_string());
-    }
+    // enrich with token name+amount so a live-pushed row shows "GOLD 250" like a fetched one
+    let enriched: Vec<Value> = recs.iter().map(|r| enrich_tx(app, r)).collect();
+    let _ = app.tx.send(json!({"t": "txs", "d": enriched}).to_string());
 }
 
 // --- entrypoint ------------------------------------------------------------
@@ -2717,6 +2717,15 @@ const RC5_PROGRAMS: &[(&str, &str)] = &[
     ("a8d1ec6d803dfc54a55d3cf576388a7d461b02a38bd4cd87ebf30837a2f1df07", "vault"),
     // source-tree rc5 clock fallback (a zone built straight from v0.2.0-rc5 uses this)
     ("e23158e6e7b4aeeee8d3036eafd7c759e51d8a094d827b925710ba21deff8f46", "clock"),
+    // --- genesis / test programs, identified by on-chain instruction FINGERPRINT (best
+    // guess). The deployed zone rebuilt these guests, so their image ids match no local
+    // source artifact (verified: e.g. the source `time_locked_transfer` computes to
+    // 4badfd16.., but the deployed id is 2ac6039d..). Named from the instruction shape +
+    // genesis balances; the remaining unidentified ids render cleanly as raw hex.
+    ("c316e2bed1d90687b35b80d460d35e7fe40130bbd2563cf19ee12e0e06c74508", "genesis_supply_bridge"), // instr [1, 1000000]
+    ("40acaa4547c36a0e243d1bcb3e880b7fa3fd2175002a3977fa5b7299c5e5754f", "genesis_supply"), // instr [1, 20000]
+    ("2ac6039da4df524ac8448f5b41b56887934f6d7081279a70042b072625bc67e1", "time_locked_transfer"), // instr [3, 86400000] = 1 day (ms)
+    ("df89eefa733d4e4b26ec2094b593c1a719a7ff99885f5a4f69c4a9e89a888d05", "validity_window"), // instr [3, 15, 30, 45, 60]
 ];
 
 /// Set from `Config.skip_clock`; when true, clock-program txs aren't stored/indexed.
@@ -2973,7 +2982,24 @@ struct TxQuery {
 
 /// Filtered, newest-first transaction feed. `q` is a free-text search across tx
 /// hash, program, accounts, nullifier/commitment digests, block id and channel.
-async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<Vec<TxRecord>> {
+/// Attach the resolved token `amount` + `token` ticker to a tx's JSON for token / ATA /
+/// native transfers (e.g. `"amount":"250","token":"GOLD"`), so the feed + tx page can
+/// render "GOLD 250" without a per-row lookup on the client.
+fn enrich_tx(app: &AppState, rec: &TxRecord) -> Value {
+    let mut v = serde_json::to_value(rec).unwrap_or(Value::Null);
+    if let (Value::Object(o), Some(db)) = (&mut v, app.db.as_ref()) {
+        let (amount, token) = db.token_op(rec);
+        if let Some(a) = amount {
+            o.insert("amount".into(), json!(a));
+        }
+        if let Some(t) = token {
+            o.insert("token".into(), json!(t));
+        }
+    }
+    v
+}
+
+async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<Vec<Value>> {
     let limit = q.limit.unwrap_or(150).min(1000);
     let needle = q.q.as_deref().map(str::to_string).filter(|n| !n.is_empty());
     let kind = q.kind.as_deref().filter(|k| !k.is_empty() && *k != "all").map(str::to_string);
@@ -3051,7 +3077,7 @@ async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<
         })
         .await;
         if let Ok(Ok(v)) = res {
-            return Json(v);
+            return Json(v.iter().map(|r| enrich_tx(&app, r)).collect());
         }
     }
 
@@ -3115,25 +3141,24 @@ async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<
         .take(limit)
         .cloned()
         .collect();
-    Json(out)
+    Json(out.iter().map(|r| enrich_tx(&app, r)).collect())
 }
 
 async fn api_tx(
     State(app): State<AppState>,
     Path(hash): Path<String>,
-) -> Result<Json<TxRecord>, StatusCode> {
+) -> Result<Json<Value>, StatusCode> {
     if let Some(db) = app.db.clone() {
         let h = hash.clone();
         if let Ok(Ok(Some(t))) = tokio::task::spawn_blocking(move || db.get_tx(&h)).await {
-            return Ok(Json(t));
+            return Ok(Json(enrich_tx(&app, &t)));
         }
     }
     let s = app.inner.lock().unwrap();
     s.txs
         .iter()
         .find(|t| t.hash == hash)
-        .cloned()
-        .map(Json)
+        .map(|t| Json(enrich_tx(&app, t)))
         .ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -4284,7 +4309,7 @@ function txRows(list){
     const accs=a0?`<a class="lnk" href="/zone/${u(z)}/wallet/${u(a0)}">${esc(sh(a0,6,4))}</a>`+(t.accounts.length>1?` <span class="mut">+${t.accounts.length-1}</span>`:''):'<span class="mut">-</span>';
     return `<tr>
       <td><a class="lnk" href="/zone/${u(z)}/tx/${u(t.hash)}">${esc(sh(t.hash))}</a></td>
-      <td>${visBadge(t)}</td><td>${typeBadge(t)}</td>
+      <td>${visBadge(t)}</td><td>${typeBadge(t)}${(t.token||t.amount)?` <span class="mut nowrap" style="font-size:11px">${t.token?'<b>'+esc(t.token)+'</b> ':''}${t.amount!=null?esc(t.amount):''}</span>`:''}</td>
       <td class="mono">#${num(t.block_id)}</td>
       <td class="mut nowrap">${ageOf(t)}</td>
       <td><a class="lnk" href="/zone/${u(z)}">${chanLabel(z, t.channel_short)}</a></td>
