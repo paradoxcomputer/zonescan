@@ -37,6 +37,12 @@ const SEQ_SUMMARY: TableDefinition<&str, &[u8]> = TableDefinition::new("seq_summ
 const ACCT_BAL: TableDefinition<&str, &[u8]> = TableDefinition::new("acct_bal");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const DEPLOY_ELF: TableDefinition<&str, &[u8]> = TableDefinition::new("deploy_elf");
+// Token-name resolution learned from the chain (no sequencer RPC needed):
+//   token_def     definition account -> "name\tsupply"   (from NewFungibleDefinition)
+//   holding_def   holding/ATA account -> definition       (supply acct + ata Create ops)
+const TOKEN_DEF: TableDefinition<&str, &str> = TableDefinition::new("token_def");
+const HOLDING_DEF: TableDefinition<&str, &str> = TableDefinition::new("holding_def");
+const TOKEN_MAP_VERSION: u64 = 1;
 
 /// Cap how many index entries a filtered/account scan will walk, so a rare
 /// free-text match can't turn into an unbounded scan.
@@ -136,6 +142,69 @@ fn ser<T: Serialize>(v: &T) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(v)?)
 }
 
+// ---- offline token-name learning -----------------------------------------------------
+// A token's name lives in its definition account, but a Transfer only carries the two
+// holding (ATA) accounts. We learn name <- definition and holding <- definition directly
+// from the on-chain instructions (no sequencer RPC), so transfers resolve their token name
+// even when the sequencer is down.
+
+// risc0 serializes a String as [len: u32][ceil(len/4) words], 4 little-endian bytes/word.
+fn r0_string(w: &[u32], off: usize) -> String {
+    let len = *w.get(off).unwrap_or(&0) as usize;
+    let nw = len.div_ceil(4);
+    let mut b = Vec::with_capacity(nw * 4);
+    for i in 0..nw {
+        let x = *w.get(off + 1 + i).unwrap_or(&0);
+        for k in 0..4 {
+            b.push(((x >> (8 * k)) & 0xff) as u8);
+        }
+    }
+    b.truncate(len);
+    String::from_utf8_lossy(&b).into_owned()
+}
+fn r0_str_words(w: &[u32], off: usize) -> usize {
+    1 + (*w.get(off).unwrap_or(&0) as usize).div_ceil(4)
+}
+fn u128_le_at(w: &[u32], off: usize) -> u128 {
+    (0..4).map(|i| (*w.get(off + i).unwrap_or(&0) as u128) << (32 * i)).sum()
+}
+fn is_token_program(p: &str) -> bool {
+    matches!(
+        p,
+        "token"
+            | "7dc71e6d47b86d42b97ea3e2788db764179fb87037257ffc4600e5c050818abd" // rc3
+            | "554a58c476f812934842debb5ff9dab1a495c86f4d7371219432fd3f24df0a0c" // rc5
+    )
+}
+fn is_ata_program(p: &str) -> bool {
+    matches!(
+        p,
+        "ata" | "1f0e87e444dff37e5eec2ba27d3fd000cafbd56a6ba5877a859dbe38a432b9e2" // rc5
+    )
+}
+
+/// Token mappings a tx establishes:
+///   (Some((definition, name, supply)) from a NewFungibleDefinition,
+///    Some((holding, definition))      from its supply account or an ata Create).
+fn token_mappings(rec: &TxRecord) -> (Option<(String, String, u128)>, Option<(String, String)>) {
+    let prog = rec.program.as_deref().unwrap_or("");
+    let w = &rec.instruction_data;
+    let a = &rec.accounts;
+    // token NewFungibleDefinition{name, total_supply} (variant 1); accounts [definition, supply]
+    if is_token_program(prog) && w.first().copied() == Some(1) && a.len() >= 2 {
+        let name = r0_string(w, 1);
+        let supply = u128_le_at(w, 1 + r0_str_words(w, 1));
+        if !name.is_empty() {
+            return (Some((a[0].clone(), name, supply)), Some((a[1].clone(), a[0].clone())));
+        }
+    }
+    // ata Create (variant 0); accounts [owner, definition, ata]
+    if is_ata_program(prog) && w.first().copied() == Some(0) && a.len() >= 3 {
+        return (None, Some((a[2].clone(), a[1].clone())));
+    }
+    (None, None)
+}
+
 impl Db {
     /// Open (or create) the database at `path`.
     pub fn open(path: &Path) -> Result<Db> {
@@ -146,6 +215,11 @@ impl Db {
         let db = Db { db: Arc::new(db) };
         if let Err(e) = db.ensure_time_index() {
             eprintln!("warning: could not build time-ordered feed index: {e:#}");
+        }
+        match db.backfill_token_mappings() {
+            Ok(n) if n > 0 => eprintln!("token-name index: learned {n} token definition(s) from stored txs"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: token-name backfill failed: {e:#}"),
         }
         Ok(db)
     }
@@ -167,9 +241,20 @@ impl Db {
             let mut feed_time = w.open_table(IDX_FEED_TIME)?;
             let mut chan = w.open_table(IDX_CHANNEL)?;
             let mut acct = w.open_table(IDX_ACCOUNT)?;
+            let mut tdef = w.open_table(TOKEN_DEF)?;
+            let mut hdef = w.open_table(HOLDING_DEF)?;
             for r in recs {
                 if r.hash.is_empty() {
                     continue;
+                }
+                // learn token name <- definition <- holding from this op (idempotent, runs
+                // even on a dedup re-scan so older token/ata ops get indexed too).
+                let (def, hold) = token_mappings(r);
+                if let Some((d, name, supply)) = def {
+                    tdef.insert(d.as_str(), format!("{name}\t{supply}").as_str())?;
+                }
+                if let Some((h, d)) = hold {
+                    hdef.insert(h.as_str(), d.as_str())?;
                 }
                 // dedup - but if a re-scan now carries a field the stored record
                 // predates (instruction_data / deploy fields added after it was first
@@ -356,6 +441,93 @@ impl Db {
             }
         }
         true
+    }
+
+    /// Resolve which token an account belongs to from the on-chain mappings learned at
+    /// ingest (no sequencer RPC). `account` may be a definition or a holding/ATA. Returns
+    /// (definition, name, supply).
+    pub fn resolve_token(&self, account: &str) -> Option<(String, String, String)> {
+        let r = self.db.begin_read().ok()?;
+        let tdef = r.open_table(TOKEN_DEF).ok()?;
+        let unpack = |v: &str| {
+            let (name, supply) = v.split_once('\t').unwrap_or((v, ""));
+            (name.to_string(), supply.to_string())
+        };
+        // account is itself a token definition
+        if let Some(g) = tdef.get(account).ok()? {
+            let (name, supply) = unpack(g.value());
+            return Some((account.to_string(), name, supply));
+        }
+        // account is a holding -> its definition -> name
+        let hdef = r.open_table(HOLDING_DEF).ok()?;
+        let definition = hdef.get(account).ok()??.value().to_string();
+        let g = tdef.get(definition.as_str()).ok()??;
+        let (name, supply) = unpack(g.value());
+        Some((definition, name, supply))
+    }
+
+    /// Persist a token mapping learned from the sequencer RPC, so later lookups are offline.
+    pub fn learn_token(&self, holding: &str, definition: &str, name: &str, supply: &str) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut tdef = w.open_table(TOKEN_DEF)?;
+            let mut hdef = w.open_table(HOLDING_DEF)?;
+            if !name.is_empty() {
+                tdef.insert(definition, format!("{name}\t{supply}").as_str())?;
+            }
+            if !holding.is_empty() && holding != definition {
+                hdef.insert(holding, definition)?;
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// One-time backfill: scan stored txs for token/ata ops and populate the token-name
+    /// maps, so tokens indexed before this feature resolve offline too. Gated by a version.
+    pub fn backfill_token_mappings(&self) -> Result<usize> {
+        {
+            let r = self.db.begin_read()?;
+            if let Ok(m) = r.open_table(META) {
+                if m.get("token_map_version")?.map(|v| v.value()) == Some(TOKEN_MAP_VERSION) {
+                    return Ok(0);
+                }
+            }
+        }
+        let mut defs: Vec<(String, String)> = Vec::new();
+        let mut holds: Vec<(String, String)> = Vec::new();
+        {
+            let r = self.db.begin_read()?;
+            if let Ok(txs) = r.open_table(TXS) {
+                for item in txs.iter()? {
+                    let (_, v) = item?;
+                    let rec: TxRecord = de(v.value())?;
+                    let (def, hold) = token_mappings(&rec);
+                    if let Some((d, name, supply)) = def {
+                        defs.push((d, format!("{name}\t{supply}")));
+                    }
+                    if let Some((h, d)) = hold {
+                        holds.push((h, d));
+                    }
+                }
+            }
+        }
+        let n = defs.len();
+        let w = self.db.begin_write()?;
+        {
+            let mut tdef = w.open_table(TOKEN_DEF)?;
+            let mut hdef = w.open_table(HOLDING_DEF)?;
+            for (d, v) in &defs {
+                tdef.insert(d.as_str(), v.as_str())?;
+            }
+            for (h, d) in &holds {
+                hdef.insert(h.as_str(), d.as_str())?;
+            }
+            let mut m = w.open_table(META)?;
+            m.insert("token_map_version", TOKEN_MAP_VERSION)?;
+        }
+        w.commit()?;
+        Ok(n)
     }
 
     /// Newest-first transaction feed: scoped to a channel, filtered by kind /
@@ -812,6 +984,25 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_mappings_learns_name_offline() {
+        // MED0707 NewFungibleDefinition (variant 1, name len 7, supply 1_000_000)
+        let w = vec![1u32, 7, 809780557, 3616823, 1_000_000, 0, 0, 0];
+        assert_eq!(r0_string(&w, 1), "MED0707");
+        let mut t = rec("h1", "ch", 1, Some("token"));
+        t.instruction_data = w;
+        t.accounts = vec!["DEF".into(), "SUPPLY".into()];
+        assert_eq!(
+            token_mappings(&t),
+            (Some(("DEF".into(), "MED0707".into(), 1_000_000)), Some(("SUPPLY".into(), "DEF".into())))
+        );
+        // ata Create (variant 0): accounts [owner, definition, ata] -> ata maps to def
+        let mut a = rec("h2", "ch", 1, Some("ata"));
+        a.instruction_data = vec![0u32];
+        a.accounts = vec!["OWNER".into(), "DEF".into(), "ATA".into()];
+        assert_eq!(token_mappings(&a).1, Some(("ATA".into(), "DEF".into())));
+    }
 
     fn rec(hash: &str, ch: &str, blk: u64, program: Option<&str>) -> TxRecord {
         let private = program.is_none();

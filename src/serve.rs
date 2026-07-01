@@ -974,7 +974,14 @@ pub async fn cmd_serve(
     seed: Option<Config>,
 ) -> Result<()> {
     let from_file = load_config(&config_path);
-    let mut config = from_file.clone().or(seed).unwrap_or_default();
+    // A brand-new install defaults to skipping clock txs: the clock ticks every block
+    // (~99% of all txs) and adds nothing to liveness/consistency, so indexing it just
+    // floods the store + feed. Existing config files and CLI-seeded configs are left as
+    // they are, and ZONE_SCAN_SKIP_CLOCK / the admin toggle still override either way.
+    let mut config = from_file.clone().or(seed).unwrap_or_else(|| Config {
+        skip_clock: true,
+        ..Default::default()
+    });
     // Persist a CLI-seeded config so it survives restarts.
     if from_file.is_none() && config.is_configured() {
         if let Err(e) = save_config(&config_path, &config) {
@@ -2692,6 +2699,15 @@ const RC5_PROGRAMS: &[(&str, &str)] = &[
     ("a362c7f8727f32b9b1bc79a37fb7aec9c59a3fbbbf1d629cc1f5355681e4a214", "genesis_supply_account"),
     ("37d6a2bbb19148a21400ccb81d80ee9de788d399b916258e9687ce3597036c21", "genesis_supply_private_account"),
     ("6decd1a854fc3d80f53c5da57d8a3876a3021b4687cdd48b3708f3eb07dff1a2", "vault"),
+    // --- LIVE Testnet v0.2 (rc5) zone rebuild ids ---------------------------------------
+    // risc0 image ids are build-specific: the deployed (netcup) rc5 zone rebuilt its guest
+    // programs, so its ids differ from the v0.2.0-rc5 TAG artifacts above (e.g. its clock is
+    // 3a694e88…, not the tag's e65831e2…). These three are verified from the live zone; the
+    // rest (token/ata/pinata/faucet/bridge/amm) aren't sampled yet and show as raw hex until
+    // their live ids are added here.
+    ("3a694e88de572d3005c4c41a1dea5bcaded107f77df8d91184781be5638ea95a", "clock"),
+    ("d9a19237236822b1f8100576ebd19a19f74178f99e284c983a4ac44acbd5b472", "authenticated_transfer"),
+    ("a8d1ec6d803dfc54a55d3cf576388a7d461b02a38bd4cd87ebf30837a2f1df07", "vault"),
 ];
 
 /// Set from `Config.skip_clock`; when true, clock-program txs aren't stored/indexed.
@@ -3445,6 +3461,24 @@ fn rpc_for_channel(app: &AppState, channel: &str) -> Option<(Client, String)> {
 /// Resolve a token **holding** account to its token (definition id, name, supply) via
 /// two `getAccount` hops: holding → `TokenHolding.definition_id` → `TokenDefinition`.
 async fn resolve_token_of(app: &AppState, account: &str, channel: &str) -> Option<Value> {
+    // Offline first: from the on-chain mappings learned at ingest (no sequencer RPC), so
+    // token names resolve even while the sequencer is down.
+    if let Some(db) = app.db.as_ref() {
+        if let Some((definition, name, supply)) = db.resolve_token(account) {
+            if !name.is_empty() {
+                return Some(json!({
+                    "resolved": true,
+                    "definition": definition,
+                    "name": name,
+                    "kind": "fungible",
+                    "supply": supply,
+                    "holding_balance": "",
+                }));
+            }
+        }
+    }
+    // Fallback: the sequencer RPC (holding -> definition -> name), cached durably so the
+    // next lookup is offline.
     let ch = resolve_channel(channel).ok()?;
     let (client, url) = rpc_for_channel(app, &ch)?;
     let hdata = rpc_get_account_data(&client, &url, account).await?;
@@ -3453,6 +3487,9 @@ async fn resolve_token_of(app: &AppState, account: &str, channel: &str) -> Optio
         Some(d) => parse_token_definition(&d).unwrap_or((String::new(), "fungible", 0)),
         None => (String::new(), "fungible", 0),
     };
+    if let Some(db) = app.db.as_ref() {
+        let _ = db.learn_token(account, &definition, &name, &supply.to_string());
+    }
     Some(json!({
         "resolved": true,
         "definition": definition,
@@ -4798,6 +4835,33 @@ load();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rc5_live_zone_program_ids_recognized() {
+        // The live (netcup) rc5 zone rebuilt its guests, so its risc0 image ids differ from
+        // the v0.2.0-rc5 tag artifacts. These three are verified from the live zone and must
+        // be recognized as the clock (for skip_clock), as the rc5 LEZ family (version tag),
+        // and resolve to their human names (surfaced via /api/programs into the feed/UI).
+        let clock = "3a694e88de572d3005c4c41a1dea5bcaded107f77df8d91184781be5638ea95a";
+        let auth = "d9a19237236822b1f8100576ebd19a19f74178f99e284c983a4ac44acbd5b472";
+        let vault = "a8d1ec6d803dfc54a55d3cf576388a7d461b02a38bd4cd87ebf30837a2f1df07";
+        // clock recognized => skip_clock drops the ~91% clock rows
+        assert!(is_clock_program(clock), "live rc5 clock must be recognized for skip_clock");
+        // all three resolve to rc5 => the "Sequencer version" tag shows rc5
+        assert_eq!(lez_version(clock), Some("rc5"));
+        assert_eq!(lez_version(auth), Some("rc5"));
+        assert_eq!(lez_version(vault), Some("rc5"));
+        // and resolve to human names (program_name_map merges RC5_PROGRAMS)
+        let name = |id: &str| RC5_PROGRAMS.iter().find(|(p, _)| *p == id).map(|(_, n)| *n);
+        assert_eq!(name(clock), Some("clock"));
+        assert_eq!(name(auth), Some("authenticated_transfer"));
+        assert_eq!(name(vault), Some("vault"));
+        // the live clock id is NOT the tag clock id (documents the build-specific mismatch)
+        assert_ne!(clock, "e65831e2eeaeb4e76e03d3e859c7d7af098a1de5927b824d21ba1057468fffde");
+        // an unrelated id is neither a clock nor a known LEZ version
+        assert!(!is_clock_program(&"ab".repeat(32)));
+        assert_eq!(lez_version(&"ab".repeat(32)), None);
+    }
 
     fn blk(id: u64, hash: &str, prev: &str, ok: bool) -> Decoded {
         Decoded {
