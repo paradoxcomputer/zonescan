@@ -2176,18 +2176,19 @@ async fn persist_seq_blocks(app: &AppState, items: &[(String, u64, Decoded)]) {
         (summaries, accts)
     };
     let cursors: Vec<(String, u64)> = top.into_iter().collect();
-    broadcast_txs(app, &recs);
     let elfs = collect_elfs(items.iter().map(|(_, _, d)| d));
+    // Persist first, then broadcast (see persist_blocks): the live feed must not lead the
+    // durable store the zone view + tx page read.
     match tokio::task::spawn_blocking(move || {
         db.commit(&recs, &summaries, &cursors, &accts)?;
         db.put_elfs(&elfs)?;
-        anyhow::Ok(())
+        anyhow::Ok(recs)
     })
     .await
     {
+        Ok(Ok(recs)) => broadcast_txs(app, &recs),
         Ok(Err(e)) => eprintln!("store: seq commit error: {e:#}"),
         Err(e) => eprintln!("store: seq join error: {e}"),
-        Ok(Ok(())) => {}
     }
 }
 
@@ -2502,19 +2503,20 @@ async fn persist_blocks(app: &AppState, slot: Option<u64>, decoded: &[(String, D
         Some(sl) => channels.iter().map(|c| (c.clone(), sl)).collect(),
         None => Vec::new(),
     };
-    // push these new txs to clients so the feed updates live (no reload).
-    broadcast_txs(app, &recs);
     let elfs = collect_elfs(decoded.iter().map(|(_, d)| d));
+    // Persist to the durable store FIRST, then push these new txs to clients - so a tx
+    // never appears in the live feed before it's in the store that the zone view + tx page
+    // read (otherwise the home feed shows txs a zone fetch / /api/tx can't find yet).
     match tokio::task::spawn_blocking(move || {
         db.commit(&recs, &summaries, &cursors, &accts)?;
         db.put_elfs(&elfs)?;
-        anyhow::Ok(())
+        anyhow::Ok(recs)
     })
     .await
     {
+        Ok(Ok(recs)) => broadcast_txs(app, &recs),
         Ok(Err(e)) => eprintln!("store: stream commit error: {e:#}"),
         Err(e) => eprintln!("store: stream join error: {e}"),
-        Ok(Ok(())) => {}
     }
 }
 
@@ -4153,9 +4155,11 @@ function instrText(t,tok){
       return `${tag}<b>u64</b> ${esc(d)} <span class="mut">timestamp</span>${bt}${pos} ${raw}`;
     }
   }
-  // (c) otherwise: a likely leading enum-variant tag + the raw words
+  // (c) otherwise: show the raw risc0 instruction words - this IS the decoded structure
+  // (risc0 words aren't self-describing); a registered schema would name the fields. Lead
+  // with a likely enum-variant tag so an unnamed program still reads as decoded, not blank.
   const v0=w.length?`<b>variant ${w[0]>>>0}</b> · `:'';
-  return `${tag}${v0}<span class="mut">${w.length} u32 word${w.length===1?'':'s'}</span> ${raw}`;
+  return `${v0}<span class="mut">${w.length} u32 word${w.length===1?'':'s'} · no schema</span> ${raw}`;
 }
 // recognize a (length-prefixed) printable-ASCII byte string in raw instruction words -
 // the common shape for simple custom-program inputs (e.g. a deployed "Hola mundo!" demo).
@@ -4337,9 +4341,14 @@ function attachScroll(buildUrl, list){
 }
 // live updates: new txs pushed over SSE slide in at the top (home + zone feeds).
 function clockOk(t){ return FLT.types.has('clock') || progName(t.program)!=='clock'; }
+// With a single tracked zone the home feed IS that zone's feed, so scope it to that
+// channel: the home (`/`) and zone (`/zone/:id`) views then draw from the identical
+// `/api/txs` query + the same live-update set, so they never diverge as blocks stream.
+function soloChannel(){ const s=state&&state.sequencers; return (s&&s.length===1)?s[0].channel:null; }
 function feedMatches(t){
   if(cur.kind==='zone'){ if(t.channel!==cur.seq) return false; }
-  else if(cur.kind!=='home') return false;
+  else if(cur.kind==='home'){ const solo=soloChannel(); if(solo && t.channel!==solo) return false; }
+  else return false;
   if(!filterMatches(t)) return false;
   // clock hidden unless the "clock" type chip is selected (clockOk checks FLT)
   if(!clockOk(t)) return false;
@@ -4403,6 +4412,7 @@ function renderHome(){
 }
 function homeFeedUrl(cursor){
   const p=new URLSearchParams(); p.set('limit',PAGE);
+  const solo=soloChannel(); if(solo) p.set('channel',solo); // one zone => same query as /zone/:id
   filterParams(p);
   return '/api/txs?'+cursorParams(p,cursor);
 }
