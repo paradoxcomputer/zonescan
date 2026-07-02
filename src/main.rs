@@ -44,10 +44,18 @@ pub const ALIASES: &[(&str, &str)] = &[
 /// primary label (the raw hex stays as the secondary/short form). Distinct from
 /// `ALIASES` above (which maps a typed name -> a channel id for CLI input). Extend by
 /// adding `(channel_hex, "Display Name")` pairs.
-pub const CHANNEL_ALIASES: &[(&str, &str)] = &[(
-    "0101010101010101010101010101010101010101010101010101010101010101",
-    "Paradox Computer",
-)];
+pub const CHANNEL_ALIASES: &[(&str, &str)] = &[
+    // Live netcup zone (rc5, 60s clocks) — the current "Paradox Computer".
+    (
+        "8888888888888888888888888888888888888888888888888888888888888888",
+        "Paradox Computer",
+    ),
+    // Prior zone (pre 2026-07-01 reset), abandoned but still on the L1 / auto-discovered.
+    (
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "Paradox Computer (old)",
+    ),
+];
 
 /// Friendly display name for a channel id, if one is known; else `None` (callers keep
 /// the existing short-hex rendering). Accepts an optional `0x` prefix and any case.
@@ -1180,10 +1188,13 @@ mod tests {
 
     #[test]
     fn channel_alias_known_and_unknown() {
-        let paradox = "0101010101010101010101010101010101010101010101010101010101010101";
+        let paradox = "8888888888888888888888888888888888888888888888888888888888888888";
         // known id -> friendly name (accepts a 0x prefix / any case)
         assert_eq!(channel_alias(paradox), Some("Paradox Computer"));
         assert_eq!(channel_alias(&format!("0x{}", paradox.to_uppercase())), Some("Paradox Computer"));
+        // prior zone kept as an archived alias
+        let old = "0101010101010101010101010101010101010101010101010101010101010101";
+        assert_eq!(channel_alias(old), Some("Paradox Computer (old)"));
         // unknown id -> None (caller keeps the short-hex rendering)
         assert_eq!(channel_alias(&"ab".repeat(32)), None);
     }
