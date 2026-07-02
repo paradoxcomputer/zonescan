@@ -50,10 +50,11 @@ pub const CHANNEL_ALIASES: &[(&str, &str)] = &[
         "8888888888888888888888888888888888888888888888888888888888888888",
         "Paradox Computer",
     ),
-    // Prior zone (pre 2026-07-01 reset), abandoned but still on the L1 / auto-discovered.
+    // The default LEZ "dev" channel: stock config (default all-0x25 key) settles here,
+    // so it's a shared/contended commons, not our zone. We were on it pre-2026-07-01 reset.
     (
         "0101010101010101010101010101010101010101010101010101010101010101",
-        "Paradox Computer (old)",
+        "dev · shared default channel",
     ),
 ];
 
@@ -1277,7 +1278,7 @@ mod tests {
         assert_eq!(channel_alias(&format!("0x{}", paradox.to_uppercase())), Some("Paradox Computer"));
         // prior zone kept as an archived alias
         let old = "0101010101010101010101010101010101010101010101010101010101010101";
-        assert_eq!(channel_alias(old), Some("Paradox Computer (old)"));
+        assert_eq!(channel_alias(old), Some("dev · shared default channel"));
         // unknown id -> None (caller keeps the short-hex rendering)
         assert_eq!(channel_alias(&"ab".repeat(32)), None);
     }
