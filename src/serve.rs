@@ -4398,6 +4398,9 @@ const DASH_HTML: &str = r#"<!doctype html>
   .b-ty-deploy{background:#ffedd5;color:#c2410c;border-color:#fdba74}
   .b-ty-raw{background:#fef9c3;color:#854d0e;border-color:#fde68a}
   .b-ty-other{background:#f1f1f3;color:#52525b;border-color:#e0e0e4}
+  /* best-guess Type badge: neutral pill hosting the muted/italic `≈ name` guess span */
+  .b-ty-guess{background:#f8fafc;border-color:var(--line2);font-weight:500}
+  .badge .pguess{border-bottom:0}
   /* raw (non-block) inscription: a distinct visibility chip + monospaced content blocks */
   .b-vis-raw{background:#fffbeb;color:#854d0e;border-color:#fde68a}
   .rawtext,.rawhex{font-family:var(--mono);font-size:12.5px;line-height:1.5;white-space:pre-wrap;
@@ -4531,7 +4534,13 @@ function tyClass(ty){ return TYPE_LABEL[ty]?ty.replace(/-/g,'_'):'other'; }
 function visBadge(t){ const v=txVis(t);
   if(v==='raw') return `<span class="badge b-vis-raw" title="a raw text/data inscription - not a sequencer block">Raw</span>`;
   return `<span class="badge b-vis-${v}">${v==='private'?'Private':'Public'}</span>`; }
-function typeBadge(t){ const ty=txType(t); return `<span class="badge b-ty-${tyClass(ty)}" title="${esc(ty)}">${esc(typeLabel(ty))}</span>`; }
+function typeBadge(t){
+  // Precedence: a verified program name renders exactly as before; else, for a public tx
+  // invoking a program with NO verified name but a fingerprint guess, show `≈ guessname` in the
+  // muted/italic guess style (tooltip + confidence); else the raw id / generic kind.
+  const g=(t.kind==='public')?guessFor(t.program,t):null;
+  if(g) return `<span class="badge b-ty-guess">${guessHtml(g)}</span>`;
+  const ty=txType(t); return `<span class="badge b-ty-${tyClass(ty)}" title="${esc(ty)}">${esc(typeLabel(ty))}</span>`; }
 // map a filter key to query params (kind / subtype / program_name)
 // ---- shared transactions filter: Visibility + multi-select Type + Sort ----
 // FLT persists across screens; feeds re-fetch with these as server params, and the
@@ -5169,7 +5178,7 @@ async function renderTx(seq,hash){
     <div class="kv" style="padding:14px 18px 18px">
     <div class="k">Txn Hash</div><div class="v">${esc(t.hash)}</div>
     <div class="k">Visibility</div><div class="v">${cap(txVis(t))}</div>
-    <div class="k">Type</div><div class="v">${esc(typeLabel(txType(t)))}</div>
+    <div class="k">Type</div><div class="v">${(()=>{const g=(t.kind==='public')?guessFor(t.program,t):null;return g?guessHtml(g):esc(typeLabel(txType(t)));})()}</div>
     ${t.program?`<div class="k">Program</div><div class="v"><a class="lnk" href="/zone/${u(z)}/program/${u(t.program)}" title="${esc(t.program)}">${(()=>{const g=guessFor(t.program,t);return g?guessHtml(g)+` <span class="mut mono" style="font-size:11px">${esc(sh(t.program,6,5))}</span>`:esc(progShort(t.program));})()}</a></div>`:''}
     <div class="k">${t.kind==='raw'?'Channel':'Sequencer'}</div><div class="v"><a class="lnk" href="/zone/${u(z)}">${esc(z)}</a></div>
     ${t.kind==='raw'
