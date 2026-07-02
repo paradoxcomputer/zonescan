@@ -34,7 +34,7 @@ use tokio::sync::broadcast;
 use crate::{
     build_client, channel_alias, channel_tip, collect_inscriptions, decode_inscription, find_u64,
     get_json, info_l1_version, info_mode, info_u64, jget_u64, jhex, resolve_channel, scan_channels,
-    short, Decoded, EndpointResult, ScanRec, TxMix,
+    short, Decoded, EndpointResult, ScanRec, TxMix, MAX_PLAUSIBLE_BLOCK_ID,
 };
 
 mod db;
@@ -596,6 +596,14 @@ struct SeqTrack {
     /// Threshold to withdraw the channel balance (`withdraw_threshold`).
     #[serde(default)]
     l1_withdraw_threshold: Option<u64>,
+    /// True once we've decoded a real *user* transaction (any non-clock tx) for this
+    /// channel - so its tx table has content and needs no "activity" explainer panel.
+    #[serde(default)]
+    user_tx_seen: bool,
+    /// True once an inscription failed to decode as an rc5 block (implausible block_id):
+    /// an unrecognized block format we can detect but not render.
+    #[serde(default)]
+    saw_undecodable: bool,
 }
 
 impl SeqTrack {
@@ -627,6 +635,14 @@ impl SeqTrack {
 
 impl SeqTrack {
     fn observe(&mut self, d: &Decoded, now: u64) {
+        self.inscriptions_seen += 1;
+        self.last_block_unix = now;
+        self.seeded = false;
+        // An undecodable (non-rc5) block carries a garbage block_id and no txs: count it,
+        // but don't let it corrupt the tip / first / tx fields.
+        if d.undecodable {
+            return;
+        }
         if !self.inited || self.first_seen_unix == 0 {
             self.first_block_id = d.block_id;
             self.first_seen_unix = now;
@@ -634,13 +650,10 @@ impl SeqTrack {
         }
         self.latest_block_id = self.latest_block_id.max(d.block_id);
         self.first_block_id = self.first_block_id.min(d.block_id);
-        self.inscriptions_seen += 1;
-        self.last_block_unix = now;
         self.tx_count_last = d.tx_count;
         if d.tx_mix.is_some() {
             self.tx_mix = d.tx_mix.clone();
         }
-        self.seeded = false;
     }
 }
 
@@ -794,6 +807,15 @@ fn ingest(s: &mut ServerState, channel: &str, slot: Option<u64>, d: &Decoded, no
         if let Some(sl) = slot {
             e.latest_slot = e.latest_slot.max(sl);
         }
+        // Classify the channel's content (drives the activity panel, idempotent):
+        // - an undecodable block => unrecognized format (can detect, can't render).
+        // - any non-clock tx => real user activity (the tx table has content).
+        if d.undecodable {
+            e.saw_undecodable = true;
+        }
+        if d.txs.iter().any(|t| !t.program.as_deref().is_some_and(is_clock_program)) {
+            e.user_tx_seen = true;
+        }
         // advance the L1-finality thresholds from the block's own bedrock_status (the
         // sequencer-RPC source). Finalized => beyond lib (irreversible); Safe => inscribed
         // but not yet past lib. Finalized implies Safe, so raise both accordingly. NOTE:
@@ -846,6 +868,32 @@ fn has_pending_activity(t: &SeqTrack, lib_slot: Option<u64>) -> bool {
                 t.inscriptions_seen == 0 && t.l1_tip_start_slot.is_some_and(|st| tip > st);
             above_lib || unindexed_but_active
         })
+}
+
+/// Classify a channel that has detected activity but renders no user-tx rows, so the zone
+/// page can show an HONEST explainer instead of a blank/misleading page. Three cases:
+/// - `"finalizing"`: recent inscriptions above finality (`tip_slot > lib`) we can't read
+///   yet - could be clock heartbeats OR user txs, unknown until final. Neutral wording.
+/// - `"undecodable"`: finalized inscriptions whose block bodies don't decode (unrecognized
+///   / non-rc5 format) - detected but not rendered.
+/// - `"clock-only"`: finalized inscriptions that decode cleanly but carry only the clock
+///   heartbeat (no user tx) - an idle channel, not a decode failure.
+/// Returns `None` when the channel renders user txs (table has content) or has nothing.
+fn activity_state(t: &SeqTrack, lib_slot: Option<u64>) -> Option<&'static str> {
+    if has_pending_activity(t, lib_slot) {
+        return Some("finalizing");
+    }
+    // Finalized: only explain channels that render no user-tx rows.
+    if t.user_tx_seen {
+        return None;
+    }
+    if t.saw_undecodable {
+        return Some("undecodable"); // decode failed => unrecognized block format
+    }
+    if t.inscriptions_seen > 0 {
+        return Some("clock-only"); // decoded fine, but every tx was a clock heartbeat
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -955,9 +1003,11 @@ struct SeqSnap {
     /// Threshold to withdraw the channel balance.
     #[serde(skip_serializing_if = "Option::is_none")]
     withdraw_threshold: Option<u64>,
-    /// True when the channel has recent on-L1 inscriptions we can't decode yet (settled
-    /// above `lib`, no queryable copy until finality); drives the pending-activity panel.
-    pending_activity: bool,
+    /// Honest explainer state when the channel shows no user-tx rows despite activity:
+    /// "finalizing" (recent, above finality), "undecodable" (unrecognized block format),
+    /// or "clock-only" (idle heartbeats). None => normal (user txs render, or nothing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity_state: Option<&'static str>,
 }
 
 fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
@@ -984,11 +1034,18 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
                     _ => false,
                 }
             };
-            let pending_activity = has_pending_activity(t, s.l1.lib_slot);
+            let activity_state = activity_state(t, s.l1.lib_slot);
+            // Never surface a garbage block_id from a mis-parsed non-rc5 body (belt-and-
+            // suspenders for any value restored from the durable store): show 0 ("—").
+            let latest_block_id = if t.latest_block_id >= MAX_PLAUSIBLE_BLOCK_ID {
+                0
+            } else {
+                t.latest_block_id
+            };
             SeqSnap {
                 channel: ch.clone(),
                 channel_short: short(ch),
-                latest_block_id: t.latest_block_id,
+                latest_block_id,
                 finalized_block_id: t.finalized_block_id,
                 // guarantee safe >= finalized for the client thresholds, even if a source
                 // raised finalized without a matching safe (shouldn't happen, but cheap).
@@ -1013,7 +1070,7 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
                 accredited_keys: t.l1_accredited_keys.clone(),
                 config_threshold: t.l1_config_threshold,
                 withdraw_threshold: t.l1_withdraw_threshold,
-                pending_activity,
+                activity_state,
             }
         })
         .collect();
@@ -1579,9 +1636,12 @@ async fn discover_seed(
             for r in &recs {
                 ingest(&mut s, &r.channel, r.slot, &r.decoded, 0);
                 // the discovery scan reads the finalized-only blocks endpoint, so every
-                // block it returns is irreversibly settled on the L1.
-                let e = s.seqs.entry(r.channel.clone()).or_default();
-                raise_finality(e, r.decoded.block_id, true);
+                // decodable block it returns is irreversibly settled on the L1. Skip
+                // undecodable blocks - their garbage block_id would corrupt the threshold.
+                if !r.decoded.undecodable {
+                    let e = s.seqs.entry(r.channel.clone()).or_default();
+                    raise_finality(e, r.decoded.block_id, true);
+                }
             }
             // verify each channel's settled chain: hash recompute + parent links + id contiguity
             for (ch, mut list) in by_ch {
@@ -1746,24 +1806,29 @@ async fn backfill_walk(
             for (cid, slot, d) in &decoded {
                 ingest(&mut s, cid, *slot, d, 0);
                 let e = s.seqs.entry(cid.clone()).or_default();
-                // `/cryptarchia/blocks` returns only finalized (<= lib) blocks, so every
-                // block seen here is irreversibly settled on the L1.
-                raise_finality(e, d.block_id, true);
-                // descending walk: only the highest id seen sets the "latest" fields
-                let is_new_tip = !e.inited || d.block_id >= e.latest_block_id;
-                if !e.inited {
-                    e.first_block_id = d.block_id;
-                    e.inited = true;
-                }
-                e.latest_block_id = e.latest_block_id.max(d.block_id);
-                e.first_block_id = e.first_block_id.min(d.block_id);
-                // Idempotent across restarts/re-walks: derive the count from the
-                // contiguous id span rather than incrementing (which would inflate).
-                e.inscriptions_seen = e.latest_block_id.saturating_sub(e.first_block_id) + 1;
-                if is_new_tip {
-                    e.tx_count_last = d.tx_count;
-                    if d.tx_mix.is_some() {
-                        e.tx_mix = d.tx_mix.clone();
+                // An undecodable (non-rc5) block has a garbage block_id and no txs: don't
+                // let it set the tip/first/span/finality fields; `ingest` already flagged
+                // `saw_undecodable`, and its L1 slot (below) still marks liveness.
+                if !d.undecodable {
+                    // `/cryptarchia/blocks` returns only finalized (<= lib) blocks, so every
+                    // block seen here is irreversibly settled on the L1.
+                    raise_finality(e, d.block_id, true);
+                    // descending walk: only the highest id seen sets the "latest" fields
+                    let is_new_tip = !e.inited || d.block_id >= e.latest_block_id;
+                    if !e.inited {
+                        e.first_block_id = d.block_id;
+                        e.inited = true;
+                    }
+                    e.latest_block_id = e.latest_block_id.max(d.block_id);
+                    e.first_block_id = e.first_block_id.min(d.block_id);
+                    // Idempotent across restarts/re-walks: derive the count from the
+                    // contiguous id span rather than incrementing (which would inflate).
+                    e.inscriptions_seen = e.latest_block_id.saturating_sub(e.first_block_id) + 1;
+                    if is_new_tip {
+                        e.tx_count_last = d.tx_count;
+                        if d.tx_mix.is_some() {
+                            e.tx_mix = d.tx_mix.clone();
+                        }
                     }
                 }
                 if let Some(sl) = slot {
@@ -2284,7 +2349,11 @@ async fn ingest_seq_chunk(app: &AppState, channel: &str, chunk: &[(u64, Vec<u8>)
                 // Pending/Finalized (never Safe; confirmed on the live rc5 node), so lift
                 // the Safe cursor to the ingested block id ourselves. `finalized_block_id`
                 // still advances only from a genuine bedrock Finalized status (via ingest).
-                raise_finality(e, d.block_id, false);
+                // (Defensive: skip an undecodable block's garbage id - normal rc5 blocks
+                // from getBlock decode fine.)
+                if !d.undecodable {
+                    raise_finality(e, d.block_id, false);
+                }
                 e.observe(&d, now);
                 e.verify(&d);
                 e.seq_tip = Some(e.latest_block_id);
@@ -2644,7 +2713,9 @@ async fn handle_event(
                 if let Some(d) = decode_inscription(&ins) {
                     ingest(&mut s, &ch, slot, &d, now);
                     let e = s.seqs.entry(ch.clone()).or_default();
-                    raise_finality(e, d.block_id, l1_final);
+                    if !d.undecodable {
+                        raise_finality(e, d.block_id, l1_final);
+                    }
                     e.observe(&d, now);
                     e.verify(&d); // re-check accuracy on every new block
                     decoded.push((ch, d));
@@ -4578,7 +4649,7 @@ function txRows(list){
     return `<tr>
       <td><a class="lnk" href="/zone/${u(z)}/tx/${u(t.hash)}">${esc(sh(t.hash))}</a></td>
       <td>${visBadge(t)}</td>
-      <td>${typeBadge(t)}${(t.token||t.amount)?` <span class="mut nowrap" style="font-size:11px">${t.token?'<b>'+esc(t.token)+'</b> ':''}${t.amount!=null?esc(t.amount):''}</span>`:''} ${finalityBadge(t)}</td>
+      <td>${typeBadge(t)} ${finalityBadge(t)}</td>
       <td class="mono">#${num(t.block_id)}</td>
       <td class="mut nowrap">${ageOf(t)}</td>
       <td><a class="lnk" href="/zone/${u(z)}">${chanLabel(z, t.channel_short)}</a></td>
@@ -4718,36 +4789,68 @@ function renderSeqs(){
       <span class="dot ${s.alive?'on':'off'}"></span>
       <div class="sm"><div class="a">${esc(zoneTitle(s))}${consBadge(s)}</div>
         <div class="zmeta"><span class="zf"><span class="zk">Channel ID</span> <span class="chex">${esc(s.channel_short)}</span></span><span class="zf"><span class="zk">Sequencer version</span> ${verValue(s)}</span></div>
-        <div class="b">L2 #${num(s.latest_block_id)} · L1 bal ${s.l1_balance!=null?num(s.l1_balance):'-'} · ${s.l1_signers||0} key(s)${tipNote(s)}${s.pending_activity?' · <span class="fbadge safe" style="font-size:9px;padding:0 5px" title="on-L1 inscriptions awaiting finality">pending activity</span>':''}</div></div>
+        <div class="b">L2 ${l2Tip(s)} · L1 bal ${s.l1_balance!=null?num(s.l1_balance):'-'} · ${s.l1_signers||0} key(s)${tipNote(s)}${activityChip(s)}</div></div>
       <span class="st ${s.alive?'alive':'idle'}">${s.alive?'ALIVE':'IDLE'}</span></a>`).join('')
       + (seqs.length>cur.seqShown?`<div class="empty" style="padding:12px">scroll for ${seqs.length-cur.seqShown} more…</div>`:'')
     : `<div class="empty">${state&&state.discovering?'scanning the L1 for sequencers…':'no sequencers found'}</div>`;
   el.onscroll=()=>{ if(el.scrollTop+el.clientHeight>=el.scrollHeight-100 && cur.seqShown<seqs.length){ cur.seqShown+=60; renderSeqs(); } };
 }
 
-// Panel for a channel with on-L1 inscriptions that aren't finalized yet - the node
-// can't serve their contents (finalized-only reader, forward-only stream, no by-hash /
-// mempool fetch), so we surface everything /channel/:id DOES tell us, flagged finalizing.
-function pendingActivityPanel(s){
-  if(!s||!s.pending_activity) return '';
+// The L2 tip to display: a real height, else an em dash for a channel with activity but
+// no decodable tip (undecodable format), else block zero (a genuine genesis-only channel).
+function l2Tip(s){ return (s&&s.latest_block_id>0)?'#'+num(s.latest_block_id):(s&&s.activity_state?'—':'#0'); }
+
+// Small zones-list chip mirroring the activity_state (honest, never implies user txs).
+function activityChip(s){
+  const st=s&&s.activity_state; if(!st) return '';
+  const m={finalizing:['safe','finalizing','on-L1 inscriptions awaiting finality'],
+           'clock-only':['pend','clock-only','idle — clock heartbeats only'],
+           undecodable:['pend','format?','unrecognized block format (non-rc5)']}[st];
+  if(!m) return '';
+  return ` · <span class="fbadge ${m[0]}" style="font-size:9px;padding:0 5px" title="${esc(m[2])}">${esc(m[1])}</span>`;
+}
+
+// Honest explainer panel for a channel that shows NO user-tx rows but has activity. Three
+// server-classified states (activity_state), each worded so we never imply user txs that
+// aren't there: "finalizing" (recent, not-yet-final — contents unknown), "clock-only"
+// (idle heartbeats), "undecodable" (unrecognized non-rc5 block format).
+function activityPanel(s){
+  const st=s&&s.activity_state; if(!st) return '';
   const lib=(state&&state.l1&&state.l1.lib_slot)||0;
   const tip=s.l1_tip_slot||0, start=s.l1_tip_start_slot||0;
-  const gap=tip>lib?tip-lib:0;
-  const eta=gap>0?`${num(gap)} slot${gap===1?'':'s'} to finalize (~${Math.max(1,Math.round(gap/60))} min)`:'finalizing now';
+  const n=s.inscriptions_seen||0, nS=n>0?num(n)+' ':'';
   const keys=s.accredited_keys||[];
   const insc=keys.length?keys.map(k=>`<code title="${esc(k)}">${esc(sh(k,10,6))}</code>`).join(', '):'<span class="mut">-</span>';
   const thr=s.config_threshold!=null?` <span class="mut" style="font-size:11px">· ${num(s.config_threshold)} of ${keys.length||'?'} to inscribe</span>`:'';
   const tiph=s.tip_message?`<code title="${esc(s.tip_message)}">${esc(sh(s.tip_message,10,6))}</code>`:'<span class="mut">-</span>';
+  let badge,headline,note,extra='';
+  if(st==='finalizing'){
+    const gap=tip>lib?tip-lib:0;
+    const eta=gap>0?`${num(gap)} slot${gap===1?'':'s'} to finalize (~${Math.max(1,Math.round(gap/60))} min)`:'finalizing now';
+    badge='<span class="fbadge safe" title="settled on the L1, awaiting finality">on L1 · finalizing</span>';
+    headline=`${nS}inscription${n===1?'':'s'} · finalizing`;
+    note='Recent inscriptions are settled on the L1 but not yet finalized. Their contents become visible once finalized — they may be clock heartbeats or user transactions; unknown until then. New inscriptions appear live.';
+    extra=`<div class="k">Finality</div><div class="v">${esc(eta)} <span class="mut" style="font-size:11px">(tip slot ${num(tip)} vs last-final ${num(lib)})</span></div>`;
+  } else if(st==='clock-only'){
+    badge='<span class="fbadge pend" title="settling only clock heartbeats">idle · clock-only</span>';
+    headline=`clock-only · ${nS}heartbeat inscription${n===1?'':'s'} · no user txs`;
+    note='This channel has settled only clock heartbeats in the scanned window — no user transactions. Clock ticks are hidden from the feed.';
+  } else {
+    badge='<span class="fbadge" style="background:#fef3c7;color:#92400e" title="unrecognized block format">format not recognized</span>';
+    headline=`${nS}inscription${n===1?'':'s'} detected · contents not decoded`;
+    note='These inscriptions are settled on the L1 but their block format is not recognized (unrecognized block format — non-rc5 sequencer), so their contents cannot be decoded. New inscriptions appear live.';
+  }
   return `<div class="panel" style="margin-bottom:16px">
-    <div class="phead">Pending activity <span class="fbadge safe" title="settled on the L1, awaiting finality">on L1 · finalizing</span></div>
-    <div class="kv" style="padding:16px">
+    <div class="phead">Channel activity ${badge}</div>
+    <div style="padding:14px 18px 2px;font-weight:600;color:var(--navy)">${esc(headline)}</div>
+    <div class="kv" style="padding:12px 18px 4px">
       <div class="k">Activity (L1 slots)</div><div class="v">${num(start)} → ${num(tip)}</div>
-      <div class="k">Finality</div><div class="v">${esc(eta)} <span class="mut" style="font-size:11px">(tip slot ${num(tip)} vs last-final ${num(lib)})</span></div>
+      ${extra}
       <div class="k">Inscriber</div><div class="v">${insc}${thr}</div>
       <div class="k">Tip hash</div><div class="v">${tiph}</div>
       <div class="k">Channel balance</div><div class="v">${s.l1_balance!=null?num(s.l1_balance):'-'}</div>
     </div>
-    <div class="mut" style="padding:0 18px 16px;font-size:12px;line-height:1.55">These inscriptions are settled on the L1 but not yet finalized; the node serves no queryable copy until finality, so their contents decode once finalized. New inscriptions appear live.</div>
+    <div class="mut" style="padding:6px 18px 16px;font-size:12px;line-height:1.55">${esc(note)}</div>
   </div>`;
 }
 
@@ -4757,7 +4860,7 @@ async function renderZone(seq){
   $('view').innerHTML=`${crumb([{t:'Home',href:'/'},{t:'Zone '+sh(seq)}])}
   <div class="panel" style="margin-bottom:16px"><div class="phead">Sequencer ${chanLabel(s.channel, s.channel_short)} ${verBadge(s)}${consBadge(s)}</div>
     <div class="ovw">
-      <div><div class="k">Latest L2 Block</div><div class="v">#${num(s.latest_block_id)}</div></div>
+      <div><div class="k">Latest L2 Block</div><div class="v">${l2Tip(s)}</div></div>
       <div><div class="k">L1 Channel Balance</div><div class="v">${s.l1_balance!=null?num(s.l1_balance):'-'}</div></div>
       <div><div class="k">Status</div><div class="v" style="color:${s.alive?'var(--green)':'var(--soft)'}">${s.alive?'ALIVE':'IDLE'}</div></div>
     </div>
@@ -4771,7 +4874,7 @@ async function renderZone(seq){
       <div class="k">Inscriptions seen</div><div class="v">${num(s.inscriptions_seen)}</div>
     </div>
   </div>
-  ${pendingActivityPanel(s)}
+  ${activityPanel(s)}
   <div class="panel"><div class="phead">Transactions <span class="count" id="count"></span>
     ${state&&state.skip_clock?'<span class="mut" style="margin-left:12px;font-weight:400;font-size:12px" title="clock txs tick every block and are not stored">clock ticks not indexed</span>':''}</div>
     ${filterBar()}
@@ -5245,6 +5348,37 @@ mod tests {
             ..Default::default()
         };
         assert!(!has_pending_activity(&done, Some(186706)), "tip<=lib, indexed => quiet");
+    }
+
+    #[test]
+    fn activity_state_distinguishes_finalizing_clock_and_undecodable() {
+        // finalizing: L1-only channel whose settlement tip is above finality.
+        let fin = SeqTrack { seq_tip: None, l1_tip_slot: Some(200), ..Default::default() };
+        assert_eq!(activity_state(&fin, Some(100)), Some("finalizing"));
+
+        // undecodable (guest f8aab825): finalized, an inscription failed to decode, no user tx.
+        let und = SeqTrack {
+            seq_tip: None,
+            l1_tip_slot: Some(50),
+            inscriptions_seen: 3,
+            saw_undecodable: true,
+            ..Default::default()
+        };
+        assert_eq!(activity_state(&und, Some(100)), Some("undecodable"));
+
+        // clock-only (82010101): finalized, decodes cleanly, only clock heartbeats.
+        let clk = SeqTrack {
+            seq_tip: Some(958),
+            l1_tip_slot: Some(50),
+            inscriptions_seen: 958,
+            ..Default::default()
+        };
+        assert_eq!(activity_state(&clk, Some(100)), Some("clock-only"));
+
+        // user txs present => the table has content => no panel.
+        let usr =
+            SeqTrack { inscriptions_seen: 5, user_tx_seen: true, saw_undecodable: true, ..Default::default() };
+        assert_eq!(activity_state(&usr, Some(100)), None);
     }
 
     #[test]

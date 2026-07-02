@@ -431,17 +431,21 @@ pub struct Agg {
 
 impl Agg {
     fn update(&mut self, d: &Decoded, slot: Option<u64>) {
-        if !self.inited {
-            self.latest_block_id = d.block_id;
-            self.min_block_id = d.block_id;
-            self.inited = true;
+        // Count every inscription, but never let an undecodable block's garbage `block_id`
+        // set the tip / min / tx fields - only its L1 slot (below) is trustworthy.
+        if !d.undecodable {
+            if !self.inited {
+                self.latest_block_id = d.block_id;
+                self.min_block_id = d.block_id;
+                self.inited = true;
+            }
+            if d.block_id >= self.latest_block_id {
+                self.tx_count = d.tx_count;
+                self.tx_mix = d.tx_mix.clone();
+            }
+            self.latest_block_id = self.latest_block_id.max(d.block_id);
+            self.min_block_id = self.min_block_id.min(d.block_id);
         }
-        if d.block_id >= self.latest_block_id {
-            self.tx_count = d.tx_count;
-            self.tx_mix = d.tx_mix.clone();
-        }
-        self.latest_block_id = self.latest_block_id.max(d.block_id);
-        self.min_block_id = self.min_block_id.min(d.block_id);
         self.count += 1;
         if let Some(s) = slot {
             self.latest_slot = Some(self.latest_slot.map_or(s, |x| x.max(s)));
@@ -670,7 +674,17 @@ pub struct Decoded {
     /// Safe tier is otherwise surfaced from the L1 inscription slot vs `lib` (see serve.rs).
     #[serde(default)]
     pub bedrock_safe: bool,
+    /// True when this inscription could NOT be decoded as an rc5 block: its parsed
+    /// `block_id` is implausibly large (the id offset landed on unrelated bytes of a
+    /// non-rc5 body). Such a block yields no txs and a garbage `block_id`, so callers
+    /// must count it but NOT let its `block_id` corrupt per-channel tip/finality state.
+    #[serde(default)]
+    pub undecodable: bool,
 }
+
+/// A plausible L2 `block_id` is small (sequencers count up from genesis). Anything at or
+/// above this is a mis-parse of a non-rc5 block body, not a real height.
+pub const MAX_PLAUSIBLE_BLOCK_ID: u64 = 1_000_000_000_000;
 
 /// Raw bytes of an inscription value (array-of-numbers or hex string).
 fn inscription_bytes(ins: &Value) -> Option<Vec<u8>> {
@@ -703,6 +717,9 @@ pub fn decode_inscription(ins: &Value) -> Option<Decoded> {
         .unwrap_or(0);
     let (tx_mix, txs, chk, bedrock_final, bedrock_safe) = decode_block_detail(&bytes);
     let (hash, prev_hash, hash_ok) = chk.unwrap_or_else(|| (String::new(), String::new(), true));
+    // A non-rc5 block body mis-parses: the id offset lands on unrelated bytes, so a huge
+    // `block_id` means "we detected an inscription but can't decode it".
+    let undecodable = block_id >= MAX_PLAUSIBLE_BLOCK_ID;
     Some(Decoded {
         block_id,
         timestamp,
@@ -714,6 +731,7 @@ pub fn decode_inscription(ins: &Value) -> Option<Decoded> {
         hash_ok,
         bedrock_final,
         bedrock_safe,
+        undecodable,
     })
 }
 
