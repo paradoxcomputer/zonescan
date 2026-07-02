@@ -1026,6 +1026,45 @@ impl Db {
         Ok((out, total))
     }
 
+    /// Aggregate recent public-tx invocation samples grouped by program id, for fingerprint
+    /// classification. Walks the newest-first global feed up to `SCAN_CAP`, keeping at most
+    /// `per_cap` samples per program (account count + raw instruction words). Clock txs are
+    /// skipped (heartbeat noise). The classifier learns reference profiles from the programs it
+    /// can already name and matches the rest against them.
+    pub fn program_samples(&self, per_cap: usize) -> Result<Vec<(String, Vec<(u16, String, Vec<u32>)>)>> {
+        use std::collections::HashMap;
+        let r = self.db.begin_read()?;
+        let txs = match r.open_table(TXS) {
+            Ok(t) => t,
+            Err(_) => return Ok(vec![]),
+        };
+        let idx = match r.open_table(IDX_FEED_TIME) {
+            Ok(t) => t,
+            Err(_) => return Ok(vec![]),
+        };
+        let mut by_prog: HashMap<String, Vec<(u16, String, Vec<u32>)>> = HashMap::new();
+        let mut scanned = 0usize;
+        for item in idx.range::<&[u8]>(..)? {
+            if scanned >= SCAN_CAP {
+                break;
+            }
+            scanned += 1;
+            let (_k, v) = item?;
+            let Some(g) = txs.get(v.value())? else { continue };
+            let rec: TxRecord = de(g.value())?;
+            // Only public txs carry an instruction to fingerprint.
+            if rec.kind != "public" {
+                continue;
+            }
+            let Some(prog) = rec.program.as_deref() else { continue };
+            let e = by_prog.entry(prog.to_string()).or_default();
+            if e.len() < per_cap {
+                e.push((rec.accounts.len() as u16, rec.kind.clone(), rec.instruction_data.clone()));
+            }
+        }
+        Ok(by_prog.into_iter().collect())
+    }
+
     /// Read a `u64` meta value (e.g. the backfill low-water `backfill:floor:<node>`).
     pub fn get_meta_u64(&self, key: &str) -> Option<u64> {
         (|| -> Result<Option<u64>> {

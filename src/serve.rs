@@ -38,6 +38,7 @@ use crate::{
     MAX_PLAUSIBLE_BLOCK_ID,
 };
 
+mod classify;
 mod db;
 use db::Db;
 
@@ -950,6 +951,9 @@ struct AppState {
     db: Option<Arc<Db>>,
     /// program-id hex -> human name, from each sequencer's `getProgramIds` registry.
     programs: Arc<Mutex<HashMap<String, String>>>,
+    /// program-id hex -> best-guess name (fingerprint classifier), for ids NOT in any name
+    /// map. Refreshed periodically from the store; rendered as `≈ name` (unverified).
+    guesses: Arc<Mutex<HashMap<String, classify::Guess>>>,
     /// cache of resolved token info, keyed by account id (holding or definition).
     token_cache: Arc<Mutex<HashMap<String, Value>>>,
     /// Token gating configuration changes (see `resolve_admin_token`); empty = open.
@@ -1239,6 +1243,7 @@ pub async fn cmd_serve(
         client: Arc::new(Mutex::new(None)),
         db,
         programs: Arc::new(Mutex::new(HashMap::new())),
+        guesses: Arc::new(Mutex::new(HashMap::new())),
         token_cache: Arc::new(Mutex::new(HashMap::new())),
         admin_token: Arc::new(admin_token),
     };
@@ -1278,6 +1283,20 @@ pub async fn cmd_serve(
         }
     }
 
+    // Standing program-fingerprint classification: periodically aggregate stored txs into
+    // per-program fingerprints and best-guess a name for ids no registry knows (rendered as
+    // `≈ name`, unverified). Cheap + bounded; a no-store / no-tx pass is a no-op.
+    if app.db.is_some() {
+        let a = app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(8)).await; // let the initial ingest settle
+            loop {
+                refresh_guesses(&a).await;
+                tokio::time::sleep(Duration::from_secs(120)).await;
+            }
+        });
+    }
+
     let router = Router::new()
         .route("/", get(index))
         .route("/admin", get(admin_page))
@@ -1291,6 +1310,7 @@ pub async fn cmd_serve(
         .route("/api/account/:id", get(api_account))
         .route("/api/program/:id", get(api_program))
         .route("/api/programs", get(api_programs))
+        .route("/api/program_guesses", get(api_program_guesses))
         .route("/api/schemas", get(api_schemas))
         .route("/api/schemas/submit", post(api_schema_submit))
         .route("/api/token_of", get(api_token_of))
@@ -3082,6 +3102,88 @@ async fn api_programs(State(app): State<AppState>) -> Json<HashMap<String, Strin
     Json(program_name_map(&app))
 }
 
+/// A program id looks "raw" (unnamed) when it's the 64-hex image id, not a human built-in name.
+fn is_raw_program_id(p: &str) -> bool {
+    p.len() >= 40 && p.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Build the classifier's reference profiles: the source-derived built-in interfaces (primary)
+/// augmented with runtime profiles LEARNED from the programs we can already name. `samples` is
+/// the store aggregation (id -> invocation samples); `names` maps a known id -> its name. Only
+/// ids with a known name contribute learned profiles, so an unrecognized program is never used
+/// to define the reference it's later matched against.
+fn build_reference_profiles(
+    samples: &[(String, Vec<classify::Sample>)],
+    names: &HashMap<String, String>,
+) -> Vec<classify::Profile> {
+    use std::collections::HashMap as Map;
+    let mut refs = classify::source_profiles();
+    // Group named ids' samples by NAME so several ids sharing a name (e.g. rc3/rc5 auth_transfer)
+    // pool into one learned profile.
+    let mut by_name: Map<String, Vec<classify::Sample>> = Map::new();
+    for (id, ss) in samples {
+        if let Some(name) = names.get(id) {
+            by_name.entry(name.clone()).or_default().extend(ss.iter().cloned());
+        }
+    }
+    for (name, ss) in by_name {
+        if let Some(p) = classify::learn_profile(&name, &ss) {
+            refs.push(p);
+        }
+    }
+    refs
+}
+
+/// Recompute the best-guess name map for unrecognized programs from the durable store, and
+/// store it in `app.guesses`. Learns reference profiles from named programs' on-chain txs +
+/// the source-derived built-ins, then classifies every id no registry knows.
+async fn refresh_guesses(app: &AppState) {
+    let Some(db) = app.db.clone() else { return };
+    let raw = match tokio::task::spawn_blocking(move || db.program_samples(48)).await {
+        Ok(Ok(v)) => v,
+        _ => return,
+    };
+    // Convert store tuples -> classifier samples.
+    let samples: Vec<(String, Vec<classify::Sample>)> = raw
+        .into_iter()
+        .map(|(id, rows)| {
+            let ss = rows
+                .into_iter()
+                .map(|(accts, kind, words)| {
+                    classify::Sample::new(classify::Kind::from_str(&kind), accts, words)
+                })
+                .collect();
+            (id, ss)
+        })
+        .collect();
+
+    let names = program_name_map(app);
+    let refs = build_reference_profiles(&samples, &names);
+
+    let mut out: HashMap<String, classify::Guess> = HashMap::new();
+    for (id, ss) in &samples {
+        // Only guess for ids no registry names, and only for raw 64-hex ids (skip built-in
+        // names, which are already resolved).
+        if names.contains_key(id) || !is_raw_program_id(id) {
+            continue;
+        }
+        if let Some(g) = classify::classify(ss, &refs) {
+            out.insert(id.clone(), g);
+        }
+    }
+    *app.guesses.lock().unwrap() = out;
+}
+
+/// The best-guess name for one program id, if the classifier surfaced one above threshold.
+fn program_guess(app: &AppState, id: &str) -> Option<classify::Guess> {
+    app.guesses.lock().unwrap().get(id).cloned()
+}
+
+/// The best-guess map (id -> guess), for the UI to render `≈ name` on unrecognized programs.
+async fn api_program_guesses(State(app): State<AppState>) -> Json<HashMap<String, classify::Guess>> {
+    Json(app.guesses.lock().unwrap().clone())
+}
+
 /// Decode `words[pos..]` per the schema type `t` (same grammar as the UI decoder),
 /// returning the next word index - or None on overrun, unknown type, no progress, or
 /// invalid UTF-8. A schema is "correct" for a sample iff this returns Some(words.len())
@@ -3316,6 +3418,15 @@ fn enrich_tx(app: &AppState, rec: &TxRecord) -> Value {
         }
         if let Some(t) = token {
             o.insert("token".into(), json!(t));
+        }
+    }
+    // Attach a best-guess program name for an unrecognized (raw-id) program, so the row can
+    // render `≈ name` distinctly from a verified name. Only for ids no registry knows.
+    if let Value::Object(o) = &mut v {
+        if let Some(p) = rec.program.as_deref().filter(|p| is_raw_program_id(p)) {
+            if let Some(g) = program_guess(app, p) {
+                o.insert("program_guess".into(), json!(g));
+            }
         }
     }
     v
@@ -3827,11 +3938,38 @@ async fn api_program(
         }
     }
 
+    // A best-guess name for an unrecognized program: prefer the standing classification, else
+    // classify on the spot from the txs we just fetched (so a program page resolves even before
+    // the periodic pass runs). Never guess for a program a registry already names.
+    let known = program_name_map(&app).contains_key(&id);
+    let guess = if known || !is_raw_program_id(&id) {
+        None
+    } else {
+        program_guess(&app, &id).or_else(|| {
+            let ss: Vec<classify::Sample> = txs
+                .iter()
+                .filter(|t| t.kind == "public")
+                .map(|t| {
+                    classify::Sample::new(
+                        classify::Kind::from_str(&t.kind),
+                        t.accounts.len() as u16,
+                        t.instruction_data.clone(),
+                    )
+                })
+                .collect();
+            let names = program_name_map(&app);
+            let sample_pairs: Vec<(String, Vec<classify::Sample>)> = vec![(id.clone(), ss.clone())];
+            let refs = build_reference_profiles(&sample_pairs, &names);
+            classify::classify(&ss, &refs)
+        })
+    };
+
     Json(json!({
         "id": id,
         "channel": channel,
         "tx_count": total,
         "txs": txs,
+        "guess": guess,
     }))
 }
 
@@ -4145,6 +4283,11 @@ const DASH_HTML: &str = r#"<!doctype html>
   .wrap{max-width:1240px;margin:0 auto;padding:0 18px}
   .mono{font-family:var(--mono)} .mut{color:var(--muted)} .nowrap{white-space:nowrap}
   .htag{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:#9a6a00;background:#fff7e6;border:1px solid #ffe2a8;border-radius:4px;padding:1px 5px;margin-right:6px;cursor:help}
+  /* best-guess program name (fingerprint classifier): italic + muted, never styled like a
+     verified name; the ≈ and tooltip mark it clearly as unverified. */
+  .pguess{font-style:italic;color:var(--muted);cursor:help;border-bottom:1px dotted var(--line2)}
+  .pguess .amp{font-style:normal;opacity:.7;margin-right:1px}
+  .pguess.lo{opacity:.75}
 
   /* top bar */
   .topbar{background:linear-gradient(180deg,#f1f1f3,#d9d9de);border-bottom:1px solid #c4c4cc;
@@ -4344,6 +4487,7 @@ const DASH_HTML: &str = r#"<!doctype html>
 <script>
 let state=null;
 let PROGS={};   // program_id_hex -> human name (from sequencers' getProgramIds)
+let GUESS={};   // program_id_hex -> {name,confidence,score,margin,samples} best-guess (fingerprint)
 let SCHEMAS={}; // program_id_hex -> deployer instruction schema (ABI), for typed decode
 const $=(id)=>document.getElementById(id);
 const num=(n)=> (n==null?'-':Number(n).toLocaleString());
@@ -4443,8 +4587,19 @@ const u=encodeURIComponent;
 // program ids for unknown programs are a 64-hex blob; shorten them (e.g. 625e05…8240c)
 // so they don't blow out the table, but keep readable built-in names (token, amm…) whole.
 function progShort(p){ if(p&&PROGS[p]) return PROGS[p]; return (p && /^[0-9a-f]{40,}$/i.test(p)) ? sh(p,6,5) : p; }
+// a program is "unnamed" when no registry names it (a raw 64-hex id, not a built-in name).
+function isRawId(p){ return !!(p && /^[0-9a-f]{40,}$/i.test(p) && !PROGS[p]); }
+// best-guess for a program: the per-row hint (from the tx) or the global GUESS map.
+function guessFor(p,row){ if(p&&PROGS[p]) return null; return (row&&row.program_guess)||GUESS[p]||null; }
+// render a best-guess as `≈ name` - italic/muted, tooltip, NEVER styled like a verified name.
+function guessHtml(g){ const pc=Math.round((g.confidence||0)*100);
+  const tip=`best-guess from tx fingerprint — unverified · ${pc}% confidence`+(g.samples?` · ${g.samples} tx${g.samples===1?'':'s'}`:'');
+  const lo=(g.confidence||0)<0.6?' lo':'';
+  return `<span class="pguess${lo}" title="${esc(tip)}"><span class="amp">≈</span> ${esc(g.name)}</span>`; }
 function progCell(t){ if(!t.program) return '-';
-  return `<a class="lnk nowrap" href="/zone/${u(t.channel)}/program/${u(t.program)}" title="${esc(t.program)}">${esc(progShort(t.program))}</a>`; }
+  const g=guessFor(t.program,t);
+  const inner=g?guessHtml(g):esc(progShort(t.program));
+  return `<a class="lnk nowrap" href="/zone/${u(t.channel)}/program/${u(t.program)}" title="${esc(t.program)}">${inner}</a>`; }
 // risc0 serializes u128 as 4 little-endian u32 words
 function u128le(w,off){ let v=0n; for(let i=0;i<4;i++){ v += BigInt((w[off+i]||0)>>>0) << BigInt(32*i); } return v; }
 // decode a public tx's instruction. token Transfer (variant 0) = [0,<u128 amount>] with
@@ -5015,7 +5170,7 @@ async function renderTx(seq,hash){
     <div class="k">Txn Hash</div><div class="v">${esc(t.hash)}</div>
     <div class="k">Visibility</div><div class="v">${cap(txVis(t))}</div>
     <div class="k">Type</div><div class="v">${esc(typeLabel(txType(t)))}</div>
-    ${t.program?`<div class="k">Program</div><div class="v"><a class="lnk" href="/zone/${u(z)}/program/${u(t.program)}" title="${esc(t.program)}">${esc(progShort(t.program))}</a></div>`:''}
+    ${t.program?`<div class="k">Program</div><div class="v"><a class="lnk" href="/zone/${u(z)}/program/${u(t.program)}" title="${esc(t.program)}">${(()=>{const g=guessFor(t.program,t);return g?guessHtml(g)+` <span class="mut mono" style="font-size:11px">${esc(sh(t.program,6,5))}</span>`:esc(progShort(t.program));})()}</a></div>`:''}
     <div class="k">${t.kind==='raw'?'Channel':'Sequencer'}</div><div class="v"><a class="lnk" href="/zone/${u(z)}">${esc(z)}</a></div>
     ${t.kind==='raw'
       ?`<div class="k">L1 slot</div><div class="v">${t.slot?num(t.slot):'—'}</div>`
@@ -5047,13 +5202,16 @@ async function renderTx(seq,hash){
 
 async function renderProgram(seq,prog){
   cur={kind:'program'};
-  const base=[{t:'Home',href:'/'},{t:'Zone '+sh(seq),href:'/zone/'+u(seq)},{t:'Program '+progShort(prog)}];
+  const g=guessFor(prog,null);
+  const nameCell=g?guessHtml(g):esc(progShort(prog));
+  const base=[{t:'Home',href:'/'},{t:'Zone '+sh(seq),href:'/zone/'+u(seq)},{t:'Program '+(g?('≈ '+g.name):progShort(prog))}];
   $('view').innerHTML=crumb(base)+
-   `<div class="panel" style="margin-bottom:16px"><div class="phead">Program <span class="count">${esc(progShort(prog))}</span></div>
+   `<div class="panel" style="margin-bottom:16px"><div class="phead">Program <span class="count">${nameCell}</span></div>
     <div class="ovw">
-      <div><div class="k">Program</div><div class="v" style="font-size:15px;word-break:break-all">${esc(progShort(prog))}</div></div>
+      <div><div class="k">Program</div><div class="v" style="font-size:15px;word-break:break-all">${nameCell}</div></div>
       <div><div class="k">Sequencer</div><div class="v" style="font-size:13px"><a class="lnk" href="/zone/${u(seq)}">${esc(sh(seq))}</a></div></div>
     </div>
+    ${g?`<div class="kv" style="padding:0 16px 4px"><div class="k">Name</div><div class="v"><span class="pguess">≈ ${esc(g.name)}</span> <span class="mut" style="font-size:12px">best-guess from tx fingerprint — unverified · ${Math.round((g.confidence||0)*100)}% confidence${g.samples?' · '+g.samples+' tx'+(g.samples===1?'':'s'):''}</span></div></div>`:''}
     <div class="kv" style="padding:16px"><div class="k">Program id</div><div class="v">${esc(prog)}</div></div>
    </div>
    ${schemaPanel(seq,prog)}
@@ -5201,18 +5359,21 @@ $('q').addEventListener('keydown',e=>{ if(e.key==='Enter') doSearch(); });
 // ---- init + live ----
 async function loadState(){ try{ state=await (await fetch('/api/state')).json(); renderHeader(); }catch(e){} }
 async function loadProgs(){ try{ PROGS=await (await fetch('/api/programs')).json()||{}; }catch(e){} }
+async function loadGuesses(){ try{ GUESS=await (await fetch('/api/program_guesses')).json()||{}; }catch(e){} }
 async function loadSchemas(){ try{ SCHEMAS=await (await fetch('/api/schemas')).json()||{}; }catch(e){} }
 const es=new EventSource('/events');
 es.onmessage=(e)=>{ try{ const m=JSON.parse(e.data);
   if(m.t==='snap'){ state=m.d; renderHeader(); if(cur.kind==='home') renderSeqs(); }
   else if(m.t==='txs'){ prependTxs(m.d); }
 }catch(_){} };
-(async()=>{ await Promise.all([loadState(),loadProgs(),loadSchemas()]); route(); })();
+(async()=>{ await Promise.all([loadState(),loadProgs(),loadGuesses(),loadSchemas()]); route(); })();
 // the program registry is fetched from the sequencer RPC (async, over Tor) - keep
 // retrying until it populates, then stop.
 // the feed updates live via SSE (new txs slide in at the top); this just keeps the
-// header fresh if the event stream blips and retries the program registry once.
-setInterval(()=>{ if(!Object.keys(PROGS).length) loadProgs(); renderHeader(); }, 5000);
+// header fresh if the event stream blips and retries the program registry once. Guesses are
+// recomputed server-side on an interval, so refresh them periodically too.
+let guessTick=0;
+setInterval(()=>{ if(!Object.keys(PROGS).length) loadProgs(); if((++guessTick%6)===0) loadGuesses(); renderHeader(); }, 5000);
 </script>
 <footer id="sfoot">
   <span><a href="https://www.gnu.org/licenses/gpl-3.0.html" target="_blank" rel="noopener noreferrer">GPL-3.0</a> · <a href="https://github.com/paradoxcomputer" target="_blank" rel="noopener noreferrer">Paradox Computer</a></span>
@@ -5482,6 +5643,63 @@ mod tests {
         // an unrelated id is neither a clock nor a known LEZ version
         assert!(!is_clock_program(&"ab".repeat(32)));
         assert_eq!(lez_version(&"ab".repeat(32)), None);
+    }
+
+    /// End-to-end for the server-side guess pipeline: `build_reference_profiles` learns
+    /// `validity_window` from the txs of an id we already name (`df89eefa…`), and then
+    /// `classify` must NOT paste that label onto a DIFFERENT unnamed program (`53f7e0f8…`)
+    /// that merely shares its 7-account / 68-word shape - it must key on instruction content.
+    #[test]
+    fn guess_pipeline_breaks_validity_window_shape_collision() {
+        use classify::{Kind, Sample};
+        let s = |words: Vec<u32>| Sample::new(Kind::Public, 7, words);
+        // named: df89eefa = validity_window, instr [3, 15, 30, 45, 60, 0…] padded to 68 words.
+        let vw_id = "df89eefa733d4e4b26ec2094b593c1a719a7ff99885f5a4f69c4a9e89a888d05".to_string();
+        let mut vw_words = vec![3u32, 15, 30, 45, 60];
+        vw_words.resize(68, 0);
+        let vw_samples: Vec<Sample> = (0..12).map(|_| s(vw_words.clone())).collect();
+
+        // unknown 53f7e0f8: SAME shape (7 accts / 68 words) but a single big value at word 0
+        // (transfer-like content), NOT the [3, bounds…] window signature.
+        let x_id = "53f7e0f8000000000000000000000000000000000000000000000000000000aa".to_string();
+        let mut x_words = vec![1_000_000u32];
+        x_words.resize(68, 0);
+        let x_samples: Vec<Sample> = (0..6).map(|_| s(x_words.clone())).collect();
+
+        // a genuinely auth_transfer-shaped unknown (2 accts / 4-word u128 amount).
+        let a_id = "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcab111".to_string();
+        let a_samples: Vec<Sample> =
+            (0..4).map(|_| Sample::new(Kind::Public, 2, vec![250, 0, 0, 0])).collect();
+
+        let samples = vec![
+            (vw_id.clone(), vw_samples),
+            (x_id.clone(), x_samples.clone()),
+            (a_id.clone(), a_samples.clone()),
+        ];
+        let mut names = HashMap::new();
+        names.insert(vw_id, "validity_window".to_string());
+
+        let refs = build_reference_profiles(&samples, &names);
+
+        // the collision program must NOT be labeled validity_window on shape alone.
+        let gx = classify::classify(&x_samples, &refs);
+        assert!(
+            gx.as_ref().map_or(true, |g| g.name != "validity_window"),
+            "shape-collision wrongly labeled validity_window: {gx:?}"
+        );
+        // a real validity_window-content tx still resolves to validity_window.
+        let mut vw2 = vec![3u32, 12, 24, 36, 48];
+        vw2.resize(68, 0);
+        let vw2_samples: Vec<Sample> = (0..6).map(|_| s(vw2.clone())).collect();
+        assert_eq!(
+            classify::classify(&vw2_samples, &refs).map(|g| g.name),
+            Some("validity_window".to_string())
+        );
+        // the auth-shaped unknown resolves (from the SOURCE profile) to authenticated_transfer.
+        assert_eq!(
+            classify::classify(&a_samples, &refs).map(|g| g.name),
+            Some("authenticated_transfer".to_string())
+        );
     }
 
     fn blk(id: u64, hash: &str, prev: &str, ok: bool) -> Decoded {
