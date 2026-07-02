@@ -954,6 +954,10 @@ struct AppState {
     /// program-id hex -> best-guess name (fingerprint classifier), for ids NOT in any name
     /// map. Refreshed periodically from the store; rendered as `≈ name` (unverified).
     guesses: Arc<Mutex<HashMap<String, classify::Guess>>>,
+    /// account id -> token symbol learned from guessed token programs' NewFungibleDefinition
+    /// txs (the definition tx's accounts), for per-tx `≈ SYMBOL` attribution when a
+    /// program-level name doesn't apply. Refreshed alongside `guesses`.
+    token_defs: Arc<Mutex<HashMap<String, String>>>,
     /// cache of resolved token info, keyed by account id (holding or definition).
     token_cache: Arc<Mutex<HashMap<String, Value>>>,
     /// Token gating configuration changes (see `resolve_admin_token`); empty = open.
@@ -1244,6 +1248,7 @@ pub async fn cmd_serve(
         db,
         programs: Arc::new(Mutex::new(HashMap::new())),
         guesses: Arc::new(Mutex::new(HashMap::new())),
+        token_defs: Arc::new(Mutex::new(HashMap::new())),
         token_cache: Arc::new(Mutex::new(HashMap::new())),
         admin_token: Arc::new(admin_token),
     };
@@ -3143,17 +3148,21 @@ async fn refresh_guesses(app: &AppState) {
         Ok(Ok(v)) => v,
         _ => return,
     };
-    // Convert store tuples -> classifier samples.
+    // Convert store rows -> classifier samples (kept aligned with `raw` for the def scan).
     let samples: Vec<(String, Vec<classify::Sample>)> = raw
-        .into_iter()
+        .iter()
         .map(|(id, rows)| {
             let ss = rows
-                .into_iter()
-                .map(|(accts, kind, words)| {
-                    classify::Sample::new(classify::Kind::from_str(&kind), accts, words)
+                .iter()
+                .map(|(accounts, kind, words)| {
+                    classify::Sample::new(
+                        classify::Kind::from_str(kind),
+                        accounts.len() as u16,
+                        words.clone(),
+                    )
                 })
                 .collect();
-            (id, ss)
+            (id.clone(), ss)
         })
         .collect();
 
@@ -3161,7 +3170,8 @@ async fn refresh_guesses(app: &AppState) {
     let refs = build_reference_profiles(&samples, &names);
 
     let mut out: HashMap<String, classify::Guess> = HashMap::new();
-    for (id, ss) in &samples {
+    let mut defs: HashMap<String, String> = HashMap::new();
+    for ((id, rows), (_, ss)) in raw.iter().zip(&samples) {
         // Only guess for ids no registry names, and only for raw 64-hex ids (skip built-in
         // names, which are already resolved).
         if names.contains_key(id) || !is_raw_program_id(id) {
@@ -3169,11 +3179,32 @@ async fn refresh_guesses(app: &AppState) {
         }
         // Strict precedence: confident specific guess first; only when NO specific program
         // wins, fall back to the generic `≈ transfer` shape detection (never overrides).
-        if let Some(g) = classify::classify(ss, &refs).or_else(|| classify::generic_transfer(ss)) {
-            out.insert(id.clone(), g);
+        let Some(mut g) = classify::classify(ss, &refs).or_else(|| classify::generic_transfer(ss))
+        else {
+            continue;
+        };
+        // Token-name extraction for a `≈ token` program: scan its NewFungibleDefinition
+        // samples for symbols. Exactly ONE distinct name => program-level attribution (its
+        // [0, u128] transfers show `≈ SYMBOL`); multiple => per-tx via the def-account map
+        // only. Definition-tx accounts map to the symbol either way.
+        if g.name == "token" && !g.generic {
+            let mut seen: std::collections::BTreeSet<String> = Default::default();
+            for ((accounts, _, _), s) in rows.iter().zip(ss) {
+                if let Some((symbol, _supply)) = classify::fungible_definition(s) {
+                    seen.insert(symbol.clone());
+                    for a in accounts {
+                        defs.insert(a.clone(), symbol.clone());
+                    }
+                }
+            }
+            if seen.len() == 1 {
+                g.token = seen.into_iter().next();
+            }
         }
+        out.insert(id.clone(), g);
     }
     *app.guesses.lock().unwrap() = out;
+    *app.token_defs.lock().unwrap() = defs;
 }
 
 /// The best-guess name for one program id, if the classifier surfaced one above threshold.
@@ -3426,20 +3457,34 @@ fn enrich_tx(app: &AppState, rec: &TxRecord) -> Value {
     // render `≈ name` distinctly from a verified name. Only for ids no registry knows.
     if let Value::Object(o) = &mut v {
         if let Some(p) = rec.program.as_deref().filter(|p| is_raw_program_id(p)) {
-            if let Some(g) = program_guess(app, p) {
-                // Generic `≈ transfer`: the amount is decodable from the shape even though the
-                // program (and token) stay unresolved - surface the raw integer (token stays
-                // absent). Per-tx re-check: only when THIS instruction fits `[variant, u128]`.
-                if g.generic && rec.kind == "public" && !o.contains_key("amount") {
-                    let s = classify::Sample::new(
-                        classify::Kind::from_str(&rec.kind),
-                        rec.accounts.len() as u16,
-                        rec.instruction_data.clone(),
-                    );
-                    if let Some(amt) = classify::transfer_amount(&s) {
-                        o.insert("amount".into(), json!(amt.to_string()));
+            let g = program_guess(app, p);
+            // Per-TX amount for an UNRESOLVED program whose own instruction fits the
+            // value-transfer shape `[variant, u128]` - independent of any program-level guess
+            // (sibling samples may be definitions; the shape sanity checks still apply). The
+            // token symbol attaches separately when attribution exists: the program-level
+            // `≈ token` name (single definition), else a definition-account match; otherwise
+            // amount only. Never for verified-named programs (their decode is exact).
+            if rec.kind == "public"
+                && !o.contains_key("amount")
+                && !program_name_map(app).contains_key(p)
+            {
+                let s = classify::Sample::new(
+                    classify::Kind::from_str(&rec.kind),
+                    rec.accounts.len() as u16,
+                    rec.instruction_data.clone(),
+                );
+                if let Some(amt) = classify::transfer_amount(&s) {
+                    o.insert("amount".into(), json!(amt.to_string()));
+                    let symbol = g.as_ref().and_then(|g| g.token.clone()).or_else(|| {
+                        let defs = app.token_defs.lock().unwrap();
+                        rec.accounts.iter().find_map(|a| defs.get(a).cloned())
+                    });
+                    if let Some(t) = symbol {
+                        o.insert("token_guess".into(), json!(t));
                     }
                 }
+            }
+            if let Some(g) = g {
                 o.insert("program_guess".into(), json!(g));
             }
         }
@@ -3976,7 +4021,19 @@ async fn api_program(
             let sample_pairs: Vec<(String, Vec<classify::Sample>)> = vec![(id.clone(), ss.clone())];
             let refs = build_reference_profiles(&sample_pairs, &names);
             // specific guess first; generic `≈ transfer` only as the fallback.
-            classify::classify(&ss, &refs).or_else(|| classify::generic_transfer(&ss))
+            let mut g =
+                classify::classify(&ss, &refs).or_else(|| classify::generic_transfer(&ss))?;
+            // same token-symbol attribution rule as refresh_guesses: one distinct def name.
+            if g.name == "token" && !g.generic {
+                let seen: std::collections::BTreeSet<String> = ss
+                    .iter()
+                    .filter_map(|s| classify::fungible_definition(s).map(|(n, _)| n))
+                    .collect();
+                if seen.len() == 1 {
+                    g.token = seen.into_iter().next();
+                }
+            }
+            Some(g)
         })
     };
 
@@ -4506,7 +4563,7 @@ const DASH_HTML: &str = r#"<!doctype html>
 <script>
 let state=null;
 let PROGS={};   // program_id_hex -> human name (from sequencers' getProgramIds)
-let GUESS={};   // program_id_hex -> {name,confidence,score,margin,samples} best-guess (fingerprint)
+let GUESS={};   // program_id_hex -> {name,confidence,score,margin,samples,generic?,token?} best-guess (fingerprint)
 let SCHEMAS={}; // program_id_hex -> deployer instruction schema (ABI), for typed decode
 const $=(id)=>document.getElementById(id);
 const num=(n)=> (n==null?'-':Number(n).toLocaleString());
@@ -4727,12 +4784,17 @@ function instrText(t,tok){
   // the exact path). We recognize the common shapes; everything carries a "tentative" tag.
   const raw=`<span class="mono" style="font-size:11px;word-break:break-all">[${w.slice(0,20).join(', ')}${w.length>20?', …':''}]</span>`;
   const tag='<span class="htag" title="best-effort guess - no instruction schema is registered for this program; add one to decode exactly">tentative</span>';
-  // (a0) generic value-transfer shape on a program with the `≈ transfer` guess:
-  // [variant(small), u128 amount] with the high words zero => decode the amount.
-  const gg=guessFor(t.program,t);
-  if(gg&&gg.generic&&w.length===5&&(w[0]>>>0)<=15&&!(w[3]||w[4])&&(w[1]||w[2])){
-    const amt=u64le(w,1); // high u128 words are zero, so the amount fits a u64
-    return `${tag}<b>Transfer</b> <b>${amt.toString()}</b> <span class="mut" style="font-size:11px">· value-transfer shape · variant ${w[0]>>>0} · token/program unresolved</span>`+ft();
+  // (a0) content decodes on an UNNAMED program (per-tx shape, independent of siblings):
+  if(isRawId(t.program)){
+    // NewFungibleDefinition: [1, r0-string name, u128 supply]
+    const def=r0def(w);
+    if(def) return `${tag}<b>NewFungibleDefinition</b> - <b><span class="pguess">≈ ${esc(def.name)}</span></b> · supply ${grp(def.supply)}`;
+    // value-transfer: [variant(small), u128 amount] with the high words zero
+    if(w.length===5&&(w[0]>>>0)<=15&&!(w[3]||w[4])&&((w[1]|w[2])>>>0)){
+      const amt=u64le(w,1); // high u128 words are zero, so the amount fits a u64
+      const tg=t.token_guess?`<span class="pguess">≈ ${esc(t.token_guess)}</span>`:'<span class="mut">token/program unresolved</span>';
+      return `${tag}<b>Transfer</b> <b>${grp(amt.toString())}</b> ${tg} <span class="mut" style="font-size:11px">· value-transfer shape · variant ${w[0]>>>0}</span>`+ft();
+    }
   }
   // (a) a length-prefixed printable-ASCII string (e.g. a deployed demo’s text input)
   const str=asAsciiInstr(w);
@@ -4922,12 +4984,30 @@ function txAction(t){
   if(name==='pinata') return `Claim native LEZ${a[0]?' to '+accShort(a[0]):''}`;
   if(name==='faucet') return `Faucet dispense ${tok?esc(tok)+' ':''}${a[0]?'to '+accShort(a[0]):''}`.replace(/ +$/,'');
   if(name==='clock') return 'Clock tick';
-  // generic `≈ transfer` fallback: the amount is decoded from the [variant, u128] shape even
-  // though the exact program (and token) stay unresolved.
-  const gg=guessFor(t.program,t);
-  if(gg&&gg.generic&&amt!=null) return `Transfer ${amtS} <span class="mut">(token unresolved)</span>${ft}`;
+  // ---- unnamed (unresolved) program: decode what the instruction CONTENT tells us ----
+  if(isRawId(t.program)){
+    // NewFungibleDefinition content: [1, r0-string name, u128 supply] => "New token ≈ NAME".
+    const def=r0def(w);
+    if(def) return `New token <span class="pguess" title="name read from the on-chain NewFungibleDefinition instruction — program unverified">≈ ${esc(def.name)}</span> · supply ${grp(def.supply)}`;
+    // value-transfer shape (server decoded t.amount per-tx): show the amount, and the token
+    // symbol when attribution exists (program-level single definition, or def-account match).
+    if(amt!=null){
+      const tg=t.token_guess?` <span class="pguess" title="token symbol from this program's NewFungibleDefinition — best-guess, unverified">≈ ${esc(t.token_guess)}</span>`:' <span class="mut">(token unresolved)</span>';
+      return `Transfer ${amtS}${tg}${ft}`;
+    }
+  }
   const pn=(name&&!/^[0-9a-f]{40,}$/i.test(name))?name.replace(/_/g,' '):progShort(t.program);
   return `${esc(cap(pn||'program'))}${w.length?' · variant '+(w[0]>>>0):''}`;
+}
+// decode a NewFungibleDefinition-shaped instruction on an unnamed program:
+// [1 (variant), len, packed name chars…, u128 supply (4 words, high words zero)].
+function r0def(w){
+  if(!w||w.length<7||(w[0]>>>0)!==1) return null;
+  const len=(w[1]||0)>>>0; if(!len||len>64) return null;
+  const nw=Math.ceil(len/4); if(2+nw+4!==w.length) return null;
+  const name=r0str(w,1); if(!name||name.length!==len||!/^[\x20-\x7e]+$/.test(name)) return null;
+  const r=w.slice(2+nw); if(((r[2]|r[3])>>>0)!==0||!((r[0]|r[1])>>>0)) return null;
+  return {name, supply:(BigInt(r[0]>>>0)|(BigInt(r[1]>>>0)<<32n)).toString()};
 }
 // Tx tables show 7 columns (no Accounts - it crowded the rows; accounts stay on tx-detail).
 function txRows(list){
@@ -5253,7 +5333,7 @@ async function renderProgram(seq,prog){
       <div><div class="k">Program</div><div class="v" style="font-size:15px;word-break:break-all">${nameCell}</div></div>
       <div><div class="k">Sequencer</div><div class="v" style="font-size:13px"><a class="lnk" href="/zone/${u(seq)}">${esc(sh(seq))}</a></div></div>
     </div>
-    ${g?`<div class="kv" style="padding:0 16px 4px"><div class="k">${g.generic?'Shape':'Name'}</div><div class="v"><span class="pguess">≈ ${esc(g.name)}</span> <span class="mut" style="font-size:12px">${esc(guessTip(g))}</span></div></div>`:''}
+    ${g?`<div class="kv" style="padding:0 16px 4px"><div class="k">${g.generic?'Shape':'Name'}</div><div class="v"><span class="pguess">≈ ${esc(g.name)}</span>${g.token?` · defines <span class="pguess" title="token symbol read from this program's on-chain NewFungibleDefinition — unverified">≈ ${esc(g.token)}</span>`:''} <span class="mut" style="font-size:12px">${esc(guessTip(g))}</span></div></div>`:''}
     <div class="kv" style="padding:16px"><div class="k">Program id</div><div class="v">${esc(prog)}</div></div>
    </div>
    ${schemaPanel(seq,prog)}

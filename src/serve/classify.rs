@@ -126,6 +126,52 @@ fn has_ms_ts_at(w: &[u32], off: usize) -> bool {
     (1_500_000_000_000..=2_500_000_000_000).contains(&v)
 }
 
+/// Read a risc0-serialized String at `w[off..]`: `[len:u32][ceil(len/4) words of utf8, packed
+/// little-endian]`. Returns the decoded string and the number of words consumed, or None when
+/// the length is implausible (0 or > 64), overruns the instruction, or the bytes aren't
+/// printable ASCII (token names / symbols are).
+pub fn r0_string_at(w: &[u32], off: usize) -> Option<(String, usize)> {
+    let len = *w.get(off)? as usize;
+    if len == 0 || len > 64 {
+        return None;
+    }
+    let nw = len.div_ceil(4);
+    if off + 1 + nw > w.len() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(nw * 4);
+    for i in 0..nw {
+        bytes.extend_from_slice(&w[off + 1 + i].to_le_bytes());
+    }
+    bytes.truncate(len);
+    let s = String::from_utf8(bytes).ok()?;
+    if !s.chars().all(|c| (' '..='~').contains(&c)) {
+        return None;
+    }
+    Some((s, 1 + nw))
+}
+
+/// Decode a token-standard `NewFungibleDefinition{name, total_supply}` instruction:
+/// `[1 (variant), r0-string name, u128 total_supply]` - the variant byte, a length-prefixed
+/// printable name, then EXACTLY a trailing u128 whose high words are zero (sane supply).
+/// Returns `(name, total_supply)`. This is both a classification feature (multi-variant token
+/// programs) and the name-extraction source for guessed token programs (e.g. "RLNTOK").
+pub fn fungible_definition(s: &Sample) -> Option<(String, u128)> {
+    if s.kind != Kind::Public {
+        return None;
+    }
+    let w = &s.words;
+    if w.first() != Some(&1) {
+        return None;
+    }
+    let (name, consumed) = r0_string_at(w, 1)?;
+    let rest = &w[1 + consumed..];
+    if rest.len() != 4 || rest[2] != 0 || rest[3] != 0 || (rest[0] == 0 && rest[1] == 0) {
+        return None;
+    }
+    Some((name, (rest[0] as u128) | ((rest[1] as u128) << 32)))
+}
+
 /// The structural features of a single sample, derived once for scoring.
 #[derive(Clone, Debug)]
 pub struct Feat {
@@ -139,6 +185,10 @@ pub struct Feat {
     /// Smallest field-aligned offset (0/1/9) carrying a u128 amount, if any.
     pub amount_off: Option<u16>,
     pub has_ms_ts: bool,
+    /// The instruction decodes as a token `NewFungibleDefinition` (`fungible_definition`):
+    /// variant 1 + printable r0-string name + trailing sane u128 supply. Content-derived, so
+    /// it discriminates far harder than word classes for multi-variant token programs.
+    pub is_def: bool,
 }
 
 impl Feat {
@@ -160,6 +210,7 @@ impl Feat {
             pat,
             amount_off,
             has_ms_ts,
+            is_def: fungible_definition(s).is_some(),
         }
     }
 }
@@ -242,6 +293,11 @@ pub struct Template {
     pub pat: Vec<Cls>,
     /// Require an ms-epoch timestamp somewhere (clock ticks / deadlines).
     pub want_ts: bool,
+    /// Require the fungible-definition CONTENT shape (`Feat::is_def`): variant 1 + r0-string
+    /// name + trailing u128 supply. Lets a multi-variant token program match its
+    /// NewFungibleDefinition samples on content (the word-class pattern is name-dependent and
+    /// useless there); near-veto when the content doesn't decode as a definition.
+    pub want_def: bool,
 }
 
 impl Template {
@@ -310,6 +366,9 @@ impl Template {
         if !kind_ok {
             s *= 0.35; // wrong tx family (public vs private/deploy).
         }
+        if self.want_def && !f.is_def {
+            s *= 0.15; // definition template, but the content isn't a definition: near-veto.
+        }
         s
     }
 }
@@ -368,6 +427,12 @@ pub struct Guess {
     /// with its own tooltip ("value-transfer shape; exact program unresolved").
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub generic: bool,
+    /// Program-level token-symbol attribution for a `≈ token` guess: set when the program's
+    /// NewFungibleDefinition samples carry exactly ONE distinct name (e.g. "RLNTOK"), so its
+    /// `[0, u128]` transfers can display `≈ RLNTOK`. Attribution is fuzzy for foreign
+    /// programs - multiple distinct names stay per-tx (definition-account match) only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 // --- thresholds -------------------------------------------------------------
@@ -459,6 +524,7 @@ pub fn classify(samples: &[Sample], references: &[Profile]) -> Option<Guess> {
         margin: (margin * 1000.0).round() / 1000.0,
         samples: n_samples,
         generic: false,
+        token: None,
     })
 }
 
@@ -509,6 +575,7 @@ pub fn generic_transfer(samples: &[Sample]) -> Option<Guess> {
         margin: 0.0,
         samples: n,
         generic: true,
+        token: None,
     })
 }
 
@@ -541,8 +608,11 @@ pub fn learn_profile(name: &str, samples: &[Sample]) -> Option<Profile> {
                 len: LenSpec::Exact(f.len),
                 v0,
                 amount,
-                pat: f.pat.clone(),
+                // a learned definition-shaped cluster keys on content, not the (name-dependent)
+                // word classes - mirrors the source token profile's NewFungibleDefinition.
+                pat: if f.is_def { vec![] } else { f.pat.clone() },
                 want_ts: f.has_ms_ts,
+                want_def: f.is_def,
             }
         })
         .collect();
@@ -584,6 +654,7 @@ pub fn source_profiles() -> Vec<Profile> {
                 amount: At(0),
                 pat: vec![Any, Zero, Zero, Zero],
                 want_ts: false,
+                want_def: false,
             },
             Template {
                 variant: "register",
@@ -594,6 +665,7 @@ pub fn source_profiles() -> Vec<Profile> {
                 amount: NoAmt,
                 pat: vec![Zero, Zero, Zero, Zero],
                 want_ts: false,
+                want_def: false,
             },
         ],
     });
@@ -613,6 +685,7 @@ pub fn source_profiles() -> Vec<Profile> {
                 amount: At(1),
                 pat: vec![Zero, Big, Zero, Zero, Zero],
                 want_ts: false,
+                want_def: false,
             },
             Template {
                 variant: "InitializeAccount",
@@ -623,16 +696,22 @@ pub fn source_profiles() -> Vec<Profile> {
                 amount: NoAmt,
                 pat: vec![Tag],
                 want_ts: false,
+                want_def: false,
             },
+            // NewFungibleDefinition{name: String, total_supply: u128}: [1, len, packed name
+            // chars, u128]. The word-class pattern is name-dependent (useless), so match on
+            // CONTENT via want_def (variant 1 + printable r0-string + trailing sane u128).
+            // Min length = 1 (variant) + 1 (len) + 1 (>=1 char word) + 4 (u128) = 7.
             Template {
                 variant: "NewFungibleDefinition",
                 kind: Public,
                 accts: vec![1, 2],
-                len: Min(3),
+                len: Min(7),
                 v0: ExV0(1),
                 amount: NoAmt,
-                pat: vec![Tag],
+                pat: vec![],
                 want_ts: false,
+                want_def: true,
             },
             Template {
                 variant: "Burn",
@@ -643,6 +722,7 @@ pub fn source_profiles() -> Vec<Profile> {
                 amount: At(1),
                 pat: vec![Tag, Big, Zero, Zero, Zero],
                 want_ts: false,
+                want_def: false,
             },
             Template {
                 variant: "Mint",
@@ -653,6 +733,7 @@ pub fn source_profiles() -> Vec<Profile> {
                 amount: At(1),
                 pat: vec![Tag, Big, Zero, Zero, Zero],
                 want_ts: false,
+                want_def: false,
             },
         ],
     });
@@ -672,6 +753,7 @@ pub fn source_profiles() -> Vec<Profile> {
                 amount: At(1),
                 pat: vec![Zero, Big, Zero, Zero, Zero, Big, Zero, Zero, Zero],
                 want_ts: false,
+                want_def: false,
             },
             Template {
                 variant: "AddLiquidity",
@@ -683,6 +765,7 @@ pub fn source_profiles() -> Vec<Profile> {
                 // three u128 fields: [disc, a,0,0,0, b,0,0,0, c,0,0,0]
                 pat: vec![Tag, Big, Zero, Zero, Zero, Big, Zero, Zero, Zero, Big, Zero, Zero, Zero],
                 want_ts: false,
+                want_def: false,
             },
             Template {
                 variant: "RemoveLiquidity",
@@ -693,6 +776,7 @@ pub fn source_profiles() -> Vec<Profile> {
                 amount: At(1),
                 pat: vec![Tag, Big, Zero, Zero, Zero, Big, Zero, Zero, Zero, Big, Zero, Zero, Zero],
                 want_ts: false,
+                want_def: false,
             },
         ],
     });
@@ -712,6 +796,7 @@ pub fn source_profiles() -> Vec<Profile> {
                 amount: NoAmt,
                 pat: vec![Zero, Big, Big, Big, Big],
                 want_ts: false,
+                want_def: false,
             },
             Template {
                 variant: "Transfer",
@@ -722,6 +807,7 @@ pub fn source_profiles() -> Vec<Profile> {
                 amount: At(9),
                 pat: vec![Tag, Big, Big, Big, Big, Big, Big, Big, Big, Big, Zero, Zero, Zero],
                 want_ts: false,
+                want_def: false,
             },
             Template {
                 variant: "Burn",
@@ -732,6 +818,7 @@ pub fn source_profiles() -> Vec<Profile> {
                 amount: At(9),
                 pat: vec![Tag, Big, Big, Big, Big, Big, Big, Big, Big, Big, Zero, Zero, Zero],
                 want_ts: false,
+                want_def: false,
             },
         ],
     });
@@ -753,6 +840,7 @@ pub fn source_profiles() -> Vec<Profile> {
             amount: NoAmt,
             pat: vec![Big, Big, Big, Big],
             want_ts: false,
+            want_def: false,
         }],
     });
 
@@ -771,6 +859,7 @@ pub fn source_profiles() -> Vec<Profile> {
             amount: NoAmt,
             pat: vec![Big, Any],
             want_ts: true,
+            want_def: false,
         }],
     });
 
@@ -961,5 +1050,76 @@ mod tests {
         let g = classify(&s, &refs()).expect("specific guess should win");
         assert_eq!(g.name, "token");
         assert!(!g.generic);
+    }
+
+    /// The real ed01f2f4 NewFungibleDefinition words: `[1, 6, "RLNT", "OK", u128 supply]` =
+    /// variant 1, r0-string len 6 packed "RLNTOK", supply 100,000,000,000.
+    const RLNTOK_DEF: [u32; 8] = [1, 6, 1_414_417_490, 19_279, 1_215_752_192, 23, 0, 0];
+
+    /// Multi-variant token program (live ed01f2f4 mix): [0, u128] transfers AND
+    /// [1, name, u128] definitions must BOTH match token variants, yielding a confident
+    /// specific `≈ token` - not generic, not unknown.
+    #[test]
+    fn multi_variant_token_classifies_from_defs_plus_transfers() {
+        let mut ss: Vec<Sample> = Vec::new();
+        for _ in 0..9 {
+            ss.push(Sample::new(Kind::Public, 2, vec![0, 1, 0, 0, 0])); // transfer, amount 1
+        }
+        for _ in 0..10 {
+            ss.push(Sample::new(Kind::Public, 2, vec![0, 1_410_065_408, 2, 0, 0])); // 10e9
+        }
+        for _ in 0..7 {
+            ss.push(Sample::new(Kind::Public, 2, RLNTOK_DEF.to_vec())); // NewFungibleDefinition
+        }
+        let g = classify(&ss, &refs()).expect("mixed defs+transfers must classify");
+        assert_eq!(g.name, "token", "multi-variant program is the token program: {g:?}");
+        assert!(!g.generic);
+        assert!(g.confidence >= 0.5, "should be a confident specific guess: {g:?}");
+        // and the mixed shapes correctly do NOT satisfy the all-transfers generic gate
+        assert!(generic_transfer(&ss).is_none());
+    }
+
+    /// Name extraction from the real on-chain definition words.
+    #[test]
+    fn rlntok_definition_extracts_name_and_supply() {
+        let s = Sample::new(Kind::Public, 2, RLNTOK_DEF.to_vec());
+        assert_eq!(
+            fungible_definition(&s),
+            Some(("RLNTOK".to_string(), 100_000_000_000u128))
+        );
+        // rejections: wrong variant byte
+        let mut w = RLNTOK_DEF.to_vec();
+        w[0] = 0;
+        assert!(fungible_definition(&Sample::new(Kind::Public, 2, w)).is_none());
+        // unprintable name bytes
+        let mut w = RLNTOK_DEF.to_vec();
+        w[2] = 0x0101_0101;
+        assert!(fungible_definition(&Sample::new(Kind::Public, 2, w)).is_none());
+        // supply high words set (implausible)
+        let mut w = RLNTOK_DEF.to_vec();
+        w[6] = 9;
+        assert!(fungible_definition(&Sample::new(Kind::Public, 2, w)).is_none());
+        // truncated (missing supply words)
+        assert!(fungible_definition(&Sample::new(Kind::Public, 2, RLNTOK_DEF[..6].to_vec()))
+            .is_none());
+        // a plain transfer is not a definition
+        assert!(
+            fungible_definition(&Sample::new(Kind::Public, 2, vec![0, 5, 0, 0, 0])).is_none()
+        );
+    }
+
+    /// Per-tx amount decode is independent of sibling shapes: on a mixed defs+transfers
+    /// program the transfers still decode their amount, the definition does not.
+    #[test]
+    fn per_tx_amount_on_mixed_shape_program() {
+        let transfer = Sample::new(Kind::Public, 2, vec![0, 1_410_065_408, 2, 0, 0]);
+        let one = Sample::new(Kind::Public, 2, vec![0, 1, 0, 0, 0]);
+        let def = Sample::new(Kind::Public, 2, RLNTOK_DEF.to_vec());
+        assert_eq!(transfer_amount(&transfer), Some(10_000_000_000));
+        assert_eq!(transfer_amount(&one), Some(1));
+        assert_eq!(transfer_amount(&def), None, "a definition is not a transfer");
+        // program-level generic gate stays off for the mixed program (def sample breaks it),
+        // but that must NOT block the per-tx decode above - they are independent paths.
+        assert!(generic_transfer(&[transfer, one, def]).is_none());
     }
 }
