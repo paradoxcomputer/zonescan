@@ -661,6 +661,15 @@ pub struct Decoded {
     /// otherwise. Drives the per-sequencer `finalized_block_id` threshold.
     #[serde(default)]
     pub bedrock_final: bool,
+    /// L1 finality (middle tier): `true` when `bedrock_status` is `Safe` OR `Finalized` -
+    /// i.e. the block is inscribed on the L1 (whether or not yet past lib_slot). Drives the
+    /// per-sequencer `safe_block_id` threshold. Only set in the decode build. NOTE: the
+    /// sequencer freezes inscribed blocks at `Pending` (`into_pending_block`) and, in the
+    /// rc4/rc5 builds, only ever transitions its own store `Pending -> Finalized` (never
+    /// `Safe`), so this reflects a real `Safe` only if a source actually reports one; the
+    /// Safe tier is otherwise surfaced from the L1 inscription slot vs `lib` (see serve.rs).
+    #[serde(default)]
+    pub bedrock_safe: bool,
 }
 
 /// Raw bytes of an inscription value (array-of-numbers or hex string).
@@ -692,7 +701,7 @@ pub fn decode_inscription(ins: &Value) -> Option<Decoded> {
     let tx_count = (bytes.len() >= 148)
         .then(|| u32::from_le_bytes(bytes[144..148].try_into().unwrap()))
         .unwrap_or(0);
-    let (tx_mix, txs, chk, bedrock_final) = decode_block_detail(&bytes);
+    let (tx_mix, txs, chk, bedrock_final, bedrock_safe) = decode_block_detail(&bytes);
     let (hash, prev_hash, hash_ok) = chk.unwrap_or_else(|| (String::new(), String::new(), true));
     Some(Decoded {
         block_id,
@@ -704,15 +713,16 @@ pub fn decode_inscription(ins: &Value) -> Option<Decoded> {
         prev_hash,
         hash_ok,
         bedrock_final,
+        bedrock_safe,
     })
 }
 
 /// Returns `(tx_mix, txs, Some((header_hash_hex, prev_hash_hex, hash_matches_recompute)),
-/// bedrock_finalized)`.
+/// bedrock_finalized, bedrock_safe)`, where `bedrock_safe` is true for `Safe` OR `Finalized`.
 #[cfg(feature = "decode")]
 fn decode_block_detail(
     bytes: &[u8],
-) -> (Option<TxMix>, Vec<TxInfo>, Option<(String, String, bool)>, bool) {
+) -> (Option<TxMix>, Vec<TxInfo>, Option<(String, String, bool)>, bool, bool) {
     use common::transaction::NSSATransaction as T;
     use borsh::BorshDeserialize;
     // The linked build is rc4, whose Block = header + body + bedrock_status + a trailing
@@ -731,10 +741,16 @@ fn decode_block_detail(
         })();
         match parsed {
             Some(b) => b,
-            None => return (None, vec![], None, false),
+            None => return (None, vec![], None, false, false),
         }
     };
     let bedrock_final = matches!(block.bedrock_status, common::block::BedrockStatus::Finalized);
+    // Safe tier: inscribed on L1 (Safe) or already irreversible (Finalized). Finalized
+    // implies Safe, so `safe` is the union - the middle badge sits between them.
+    let bedrock_safe = matches!(
+        block.bedrock_status,
+        common::block::BedrockStatus::Safe | common::block::BedrockStatus::Finalized
+    );
     let mut mix = TxMix::default();
     let txs = block
         .body
@@ -820,14 +836,14 @@ fn decode_block_detail(
     };
     let hash = hex::encode(block.header.hash.0);
     let prev_hash = hex::encode(block.header.prev_block_hash.0);
-    (Some(mix), txs, Some((hash, prev_hash, hash_ok)), bedrock_final)
+    (Some(mix), txs, Some((hash, prev_hash, hash_ok)), bedrock_final, bedrock_safe)
 }
 
 #[cfg(not(feature = "decode"))]
 fn decode_block_detail(
     _bytes: &[u8],
-) -> (Option<TxMix>, Vec<TxInfo>, Option<(String, String, bool)>, bool) {
-    (None, vec![], None, false)
+) -> (Option<TxMix>, Vec<TxInfo>, Option<(String, String, bool)>, bool, bool) {
+    (None, vec![], None, false, false)
 }
 
 /// Canonical on-chain program-id hex: the `[u32; 8]` image id serialized as little-endian
@@ -1289,12 +1305,15 @@ mod tests {
         let block = common::test_utils::produce_dummy_block(7, Some(common::HashType([1; 32])), txs);
         let full = borsh::to_vec(&block).unwrap(); // rc4 shape (trailing bedrock_parent_id present)
 
-        let (mix4, txs4, chk4, _f4) = decode_block_detail(&full);
+        let (mix4, txs4, chk4, f4, s4) = decode_block_detail(&full);
         assert!(mix4.is_some() && chk4.is_some() && !txs4.is_empty(), "rc4-shaped block decodes");
+        // dummy blocks are Pending, and Finalized always implies Safe.
+        assert!(!f4 && !s4, "a pending dummy block is neither final nor safe");
 
         let rc5 = &full[..full.len() - 32]; // strip the trailing bedrock_parent_id (the rc5 shape)
-        let (mix5, txs5, chk5, _f5) = decode_block_detail(rc5);
+        let (mix5, txs5, chk5, f5, s5) = decode_block_detail(rc5);
         assert!(mix5.is_some(), "rc5-shaped block (trailing field dropped) still decodes");
+        assert_eq!((f4, s4), (f5, s5), "rc4/rc5 shapes recover the same bedrock status");
         // full (rc4) and stripped (rc5) must recover the identical transactions + hash verdict
         assert_eq!(txs5.len(), txs4.len(), "same transactions recovered");
         assert_eq!(txs5[0].hash, txs4[0].hash, "same first tx hash");

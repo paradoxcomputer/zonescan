@@ -538,9 +538,17 @@ fn verify_chain<'a>(blocks_ascending: impl Iterator<Item = &'a Decoded>) -> Cons
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct SeqTrack {
     latest_block_id: u64,
-    /// Highest block id the sequencer marked `bedrock_status = Finalized` (on L1, beyond
-    /// lib_slot). A tx is "final on L1" when its block_id <= this; above it, "pending".
+    /// Highest block id known irreversibly settled on the L1 - either the sequencer marked
+    /// it `bedrock_status = Finalized`, or we read its inscription from an L1 block at a slot
+    /// at/below the L1's last-irreversible slot (`lib`). A tx is "final" when block_id <= this.
     finalized_block_id: u64,
+    /// Highest block id known *inscribed* on the L1 but not necessarily past `lib` yet -
+    /// `bedrock_status` Safe/Finalized, or seen in an L1 block above `lib`. Always
+    /// `>= finalized_block_id`. A tx in `(finalized_block_id, safe_block_id]` is "on L1,
+    /// finalizing"; above it, "pending" (not yet inscribed / not yet observed on L1).
+    /// `#[serde(default)]`: added after 46ffac8, so old persisted summaries lack it.
+    #[serde(default)]
+    safe_block_id: u64,
     first_block_id: u64,
     first_seen_unix: u64,
     last_block_unix: u64,
@@ -767,7 +775,15 @@ fn ingest(s: &mut ServerState, channel: &str, slot: Option<u64>, d: &Decoded, no
         if let Some(sl) = slot {
             e.latest_slot = e.latest_slot.max(sl);
         }
-        // advance the L1-finality threshold: this block is settled on L1 (bedrock Finalized)
+        // advance the L1-finality thresholds from the block's own bedrock_status (the
+        // sequencer-RPC source). Finalized => beyond lib (irreversible); Safe => inscribed
+        // but not yet past lib. Finalized implies Safe, so raise both accordingly. NOTE:
+        // the sequencer freezes inscribed blocks at Pending and (rc4/rc5) only transitions
+        // its own store Pending->Finalized, so `bedrock_safe` rarely fires from the RPC; the
+        // Safe tier is mainly surfaced from the L1 read via `raise_finality` (see call sites).
+        if d.bedrock_safe {
+            e.safe_block_id = e.safe_block_id.max(d.block_id);
+        }
         if d.bedrock_final {
             e.finalized_block_id = e.finalized_block_id.max(d.block_id);
         }
@@ -780,6 +796,20 @@ fn ingest(s: &mut ServerState, channel: &str, slot: Option<u64>, d: &Decoded, no
                 }
             }
         }
+    }
+}
+
+/// Raise a channel's L1-finality thresholds for a block observed *inscribed on the L1*.
+/// Being in an L1 block means it is at least **Safe** (inscribed), so `safe_block_id` is
+/// raised unconditionally; it is additionally **Finalized** (irreversible) once its L1
+/// block is past the last-irreversible slot, which the caller passes as `finalized`.
+/// This is the primary Safe/Finalized signal in L1 mode, because the sequencer freezes
+/// inscribed blocks at `bedrock_status = Pending` (so the decoded status can't tell us).
+/// Additive: never lowers a threshold.
+fn raise_finality(e: &mut SeqTrack, block_id: u64, finalized: bool) {
+    e.safe_block_id = e.safe_block_id.max(block_id);
+    if finalized {
+        e.finalized_block_id = e.finalized_block_id.max(block_id);
     }
 }
 
@@ -846,9 +876,12 @@ struct SeqSnap {
     channel: String,
     channel_short: String,
     latest_block_id: u64,
-    /// highest L1-finalized block id (see SeqTrack); the client tags a tx final if its
-    /// block_id <= this, else pending. 0 = unknown (light build / no finality info yet).
+    /// highest L1-finalized block id (see SeqTrack); the client tags a tx "final" if its
+    /// block_id <= this. 0 = unknown (light build / no finality info yet).
     finalized_block_id: u64,
+    /// highest L1-inscribed ("Safe") block id (see SeqTrack); a tx with
+    /// finalized_block_id < block_id <= this tags "on L1 · finalizing". Always >= finalized.
+    safe_block_id: u64,
     inscriptions_seen: u64,
     tx_count_last: u32,
     tx_mix: Option<TxMix>,
@@ -899,6 +932,9 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
                 channel_short: short(ch),
                 latest_block_id: t.latest_block_id,
                 finalized_block_id: t.finalized_block_id,
+                // guarantee safe >= finalized for the client thresholds, even if a source
+                // raised finalized without a matching safe (shouldn't happen, but cheap).
+                safe_block_id: t.safe_block_id.max(t.finalized_block_id),
                 inscriptions_seen: t.inscriptions_seen,
                 tx_count_last: t.tx_count_last,
                 tx_mix: t.tx_mix.clone(),
@@ -1477,6 +1513,10 @@ async fn discover_seed(
             }
             for r in &recs {
                 ingest(&mut s, &r.channel, r.slot, &r.decoded, 0);
+                // the discovery scan reads the finalized-only blocks endpoint, so every
+                // block it returns is irreversibly settled on the L1.
+                let e = s.seqs.entry(r.channel.clone()).or_default();
+                raise_finality(e, r.decoded.block_id, true);
             }
             // verify each channel's settled chain: hash recompute + parent links + id contiguity
             for (ch, mut list) in by_ch {
@@ -1641,6 +1681,9 @@ async fn backfill_walk(
             for (cid, slot, d) in &decoded {
                 ingest(&mut s, cid, *slot, d, 0);
                 let e = s.seqs.entry(cid.clone()).or_default();
+                // `/cryptarchia/blocks` returns only finalized (<= lib) blocks, so every
+                // block seen here is irreversibly settled on the L1.
+                raise_finality(e, d.block_id, true);
                 // descending walk: only the highest id seen sets the "latest" fields
                 let is_new_tip = !e.inited || d.block_id >= e.latest_block_id;
                 if !e.inited {
@@ -2502,6 +2545,11 @@ async fn handle_event(
         let mut decoded: Vec<(String, Decoded)> = Vec::new();
         {
             let mut s = app.inner.lock().unwrap();
+            // This is a *live* L1 block off the stream: its inscriptions are on the L1 (at
+            // least Safe). It's Finalized only once we know its slot is at/below `lib`; a
+            // freshly streamed tip block (slot > lib) stays Safe until finality catches up.
+            let lib = s.l1.lib_slot;
+            let l1_final = matches!((slot, lib), (Some(sl), Some(l)) if sl <= l);
             for (ch, ins) in found {
                 if let Some(f) = focus {
                     if !f.contains(&ch) {
@@ -2511,6 +2559,7 @@ async fn handle_event(
                 if let Some(d) = decode_inscription(&ins) {
                     ingest(&mut s, &ch, slot, &d, now);
                     let e = s.seqs.entry(ch.clone()).or_default();
+                    raise_finality(e, d.block_id, l1_final);
                     e.observe(&d, now);
                     e.verify(&d); // re-check accuracy on every new block
                     decoded.push((ch, d));
@@ -3982,10 +4031,11 @@ const DASH_HTML: &str = r#"<!doctype html>
     margin-left:6px;vertical-align:middle;letter-spacing:.3px;text-transform:uppercase}
   .v-rc4{background:#dcfce7;color:#166534}
   .v-rc5{background:#e0e7ff;color:#3730a3} .v-rc3{background:#fef3c7;color:#92400e}
-  /* L1-finality badge: green "on L1" vs amber "pending" */
+  /* L1-finality badge: green "final" > blue "on L1 · finalizing" > grey "pending" */
   .fbadge{display:inline-block;font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;vertical-align:middle}
   .fbadge.fin{background:rgba(19,169,123,.14);color:var(--green)}
-  .fbadge.pend{background:#fef3c7;color:#92400e}
+  .fbadge.safe{background:rgba(37,99,235,.12);color:#1d4ed8}
+  .fbadge.pend{background:#eef0f3;color:#6b7280}
   .filt{display:flex;gap:6px}
   .kbtn{border:1px solid var(--line2);background:#fff;color:var(--muted);border-radius:7px;padding:5px 11px;font-size:12px;cursor:pointer}
   .kbtn.sel{border-color:var(--fg);color:var(--fg);background:#ececef}
@@ -4390,14 +4440,20 @@ function tipNote(s){
 function accShort(a){ return a?esc(sh(a,6,4)):'?'; }
 // bigint-safe thousands grouping (amounts are u128 strings, may exceed Number precision)
 function grp(s){ return s==null?'':String(s).replace(/\B(?=(\d{3})+(?!\d))/g,','); }
-// L1-finality: a tx is "on L1" once its block_id <= the sequencer's finalized threshold
-// (bedrock Finalized = inscribed to L1 + confirmed beyond lib_slot); above it, "pending".
-function seqFinalized(ch){ const q=((state&&state.sequencers)||[]).find(x=>x.channel===ch); return q?(q.finalized_block_id||0):0; }
+// L1-finality (three tiers) from a tx's block_id vs the sequencer's two thresholds:
+//   block_id <= finalized_block_id            -> "final"   (irreversible, past lib_slot)
+//   finalized < block_id <= safe_block_id     -> "on L1"   (inscribed, finalizing ~1h)
+//   block_id > safe_block_id                  -> "pending" (not yet inscribed / unseen on L1)
+function seqFinal(ch){ const q=((state&&state.sequencers)||[]).find(x=>x.channel===ch); return q?(q.finalized_block_id||0):0; }
+function seqSafe(ch){ const q=((state&&state.sequencers)||[]).find(x=>x.channel===ch); return q?Math.max(q.safe_block_id||0,q.finalized_block_id||0):0; }
 function finalityBadge(t){
-  const fin=seqFinalized(t.channel); if(!fin) return '';
-  return (t.block_id<=fin)
-    ? `<span class="fbadge fin" title="settled on L1 - the zone is finalized up to block #${num(fin)}">on L1</span>`
-    : `<span class="fbadge pend" title="pending - not yet irreversibly settled on L1 (finalized up to #${num(fin)})">pending</span>`;
+  const fin=seqFinal(t.channel), safe=seqSafe(t.channel);
+  if(!fin && !safe) return ''; // unknown (light build / no finality info yet)
+  if(t.block_id<=fin)
+    return `<span class="fbadge fin" title="final - irreversibly settled on the L1 (finalized up to block #${num(fin)})">final</span>`;
+  if(t.block_id<=safe)
+    return `<span class="fbadge safe" title="inscribed on the L1 and finalizing (irreversible once past the L1's last-final slot, ~1h); finalized up to #${num(fin)}">on L1 · finalizing</span>`;
+  return `<span class="fbadge pend" title="pending - not yet observed inscribed on the L1 (on L1 up to #${num(safe)})">pending</span>`;
 }
 // A human one-line ACTION for a tx: "<verb> <amount> <token> from <a> to <b>", derived from
 // the program name + instruction variant + resolved token/amount/accounts. Never blank -
