@@ -4501,14 +4501,14 @@ function txRows(list){
     return `<tr>
       <td><a class="lnk" href="/zone/${u(z)}/tx/${u(t.hash)}">${esc(sh(t.hash))}</a></td>
       <td>${visBadge(t)}</td>
-      <td><div style="font-weight:600">${txAction(t)}</div><div class="mut" style="font-size:11px;margin-top:1px">${typeBadge(t)} ${finalityBadge(t)}</div></td>
+      <td>${typeBadge(t)}${(t.token||t.amount)?` <span class="mut nowrap" style="font-size:11px">${t.token?'<b>'+esc(t.token)+'</b> ':''}${t.amount!=null?esc(t.amount):''}</span>`:''} ${finalityBadge(t)}</td>
       <td class="mono">#${num(t.block_id)}</td>
       <td class="mut nowrap">${ageOf(t)}</td>
       <td><a class="lnk" href="/zone/${u(z)}">${chanLabel(z, t.channel_short)}</a></td>
       <td>${accs}</td></tr>`;
   }).join('');
 }
-const txHead='<thead><tr><th>Txn Hash</th><th>Visibility</th><th>Action</th><th>Block</th><th>Age</th><th>Sequencer</th><th>Accounts</th></tr></thead>';
+const txHead='<thead><tr><th>Txn Hash</th><th>Visibility</th><th>Type</th><th>Block</th><th>Age</th><th>Sequencer</th><th>Accounts</th></tr></thead>';
 const crumb=(parts)=>`<div style="font-size:13px;color:var(--soft);padding:14px 0 10px">${parts.map((p,i)=>(i?' <span style="color:var(--soft)">/</span> ':'')+(p.href?`<a href="${p.href}">${esc(p.t)}</a>`:`<span style="color:var(--fg)">${esc(p.t)}</span>`)).join('')}</div>`;
 
 // ---- reusable infinite-scroll tx feed (appends into #rows; updates #count) ----
