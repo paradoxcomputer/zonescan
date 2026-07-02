@@ -740,13 +740,20 @@ fn records_from(channel: &str, slot: Option<u64>, d: &Decoded, seen_unix: u64) -
         if d.raw_tx_hash.is_empty() {
             return vec![]; // no carrying hash to key it by (e.g. a sequencer-RPC block body)
         }
+        // A raw inscription has no L2 block timestamp, so give it a real, sortable one: its
+        // observation time (seen_unix, else now). Crucially it's stored in the SAME
+        // MILLISECOND scale as block timestamps, because the global feed is a recency-ordered
+        // window (inv(timestamp)) — a `timestamp: 0` (or a seconds-scale value) would sort
+        // below every block and fall off the window, hiding raw txs from the home feed.
+        let seen = if seen_unix > 0 { seen_unix } else { now_unix() };
         return vec![TxRecord {
             hash: d.raw_tx_hash.clone(),
             kind: "raw".to_string(),
             channel: channel.to_string(),
             channel_short: short(channel),
             slot,
-            seen_unix,
+            timestamp: seen.saturating_mul(1000),
+            seen_unix: seen,
             raw_payload: d.raw_payload.clone(),
             ..Default::default()
         }];
@@ -3444,7 +3451,9 @@ async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<
         .filter(|t| subt.as_deref().is_none_or(|st| t.subtype == st))
         .filter(|t| match &types {
             Some(ts) => {
-                let rt = if t.kind == "deploy" {
+                let rt = if t.kind == "raw" {
+                    "raw"
+                } else if t.kind == "deploy" {
                     "deploy"
                 } else if t.kind == "private" {
                     if t.subtype == "shield" || t.subtype == "deshield" { t.subtype.as_str() } else { "authenticated_transfer" }
@@ -4386,11 +4395,11 @@ function typeBadge(t){ const ty=txType(t); return `<span class="badge b-ty-${tyC
 const FLT={vis:'all',types:new Set(),sort:'newest'};
 const TYPE_CHIPS=[['authenticated_transfer','Transfer'],['token','Token'],['clock','Clock'],
   ['shield','Shield'],['deshield','Deshield'],['amm','AMM'],['ata','ATA'],['pinata','Pinata'],
-  ['program','Program'],['deploy','Deploy']];
+  ['program','Program'],['deploy','Deploy'],['raw','Inscription']];
 function filterBar(){
   return `<div class="filtbar">
     <span class="fgrp"><span class="flbl">Visibility</span>
-      <select id="f_vis" class="fsel"><option value="all">All</option><option value="public">Public</option><option value="private">Private</option></select></span>
+      <select id="f_vis" class="fsel"><option value="all">All</option><option value="public">Public</option><option value="private">Private</option><option value="raw">Raw</option></select></span>
     <span class="fgrp"><span class="flbl">Type</span>
       <span class="fdrop">
         <button type="button" class="fsel fdbtn" id="f_types_btn">All types</button>
@@ -4425,6 +4434,7 @@ function typeKey(t){ const ty=txType(t); return /^[0-9a-f]{40,}$/i.test(ty)?'pro
 function filterMatches(t){
   if(FLT.vis==='public' && txVis(t)!=='public') return false;
   if(FLT.vis==='private' && txVis(t)!=='private') return false;
+  if(FLT.vis==='raw' && txVis(t)!=='raw') return false;
   if(FLT.types.size && !FLT.types.has(typeKey(t))) return false;
   return true;
 }

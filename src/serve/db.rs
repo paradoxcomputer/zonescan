@@ -43,6 +43,8 @@ const DEPLOY_ELF: TableDefinition<&str, &[u8]> = TableDefinition::new("deploy_el
 const TOKEN_DEF: TableDefinition<&str, &str> = TableDefinition::new("token_def");
 const HOLDING_DEF: TableDefinition<&str, &str> = TableDefinition::new("holding_def");
 const TOKEN_MAP_VERSION: u64 = 1;
+// Bumped when raw-inscription txs need re-timestamping for the recency-ordered global feed.
+const RAW_TS_VERSION: u64 = 1;
 
 /// Cap how many index entries a filtered/account scan will walk, so a rare
 /// free-text match can't turn into an unbounded scan.
@@ -256,6 +258,11 @@ impl Db {
         if let Err(e) = db.ensure_time_index() {
             eprintln!("warning: could not build time-ordered feed index: {e:#}");
         }
+        match db.migrate_raw_timestamps() {
+            Ok(n) if n > 0 => eprintln!("raw-inscription feed: re-timestamped {n} record(s) so they order by recency (were hidden at timestamp 0)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: raw-timestamp migration failed: {e:#}"),
+        }
         match db.backfill_token_mappings() {
             Ok(n) if n > 0 => eprintln!("token-name index: learned {n} token definition(s) from stored txs"),
             Ok(_) => {}
@@ -412,6 +419,66 @@ impl Db {
         }
         w.commit()?;
         Ok(())
+    }
+
+    /// One-time migration for stores written before raw txs carried a sortable timestamp.
+    /// Such raw-inscription records were persisted with `timestamp == 0`, which sinks them
+    /// below every block in the recency-ordered global feed (`inv(timestamp)`), so they
+    /// vanish from the home page. Give each a real millisecond timestamp (its observation
+    /// time, else now) and re-key its time-feed index entry from `inv(0)` to the new value.
+    /// Guarded by a meta version, so it runs once. Returns how many records were fixed.
+    pub fn migrate_raw_timestamps(&self) -> Result<usize> {
+        {
+            let r = self.db.begin_read()?;
+            if let Ok(m) = r.open_table(META) {
+                if m.get("raw_ts_version")?.map(|v| v.value()) == Some(RAW_TS_VERSION) {
+                    return Ok(0);
+                }
+            }
+        }
+        // Collect the stale records first (read), then rewrite (write) - a redb table can't
+        // be mutated mid-iteration.
+        let stale: Vec<TxRecord> = {
+            let r = self.db.begin_read()?;
+            let mut v = Vec::new();
+            if let Ok(txs) = r.open_table(TXS) {
+                for item in txs.iter()? {
+                    let (_k, body) = item?;
+                    let rec: TxRecord = de(body.value())?;
+                    if rec.kind == "raw" && rec.timestamp == 0 {
+                        v.push(rec);
+                    }
+                }
+            }
+            v
+        };
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let w = self.db.begin_write()?;
+        {
+            let mut txs = w.open_table(TXS)?;
+            let mut feed_time = w.open_table(IDX_FEED_TIME)?;
+            for mut rec in stale.iter().cloned() {
+                let h = rec.hash.clone();
+                // drop the stale inv(0)+inv(block_id)+hash time-index key
+                let mut old = inv(0).to_vec();
+                old.extend_from_slice(&inv(rec.block_id));
+                old.extend_from_slice(h.as_bytes());
+                feed_time.remove(old.as_slice())?;
+                // observation time: seconds in seen_unix, millis in timestamp (block scale)
+                let seen = if rec.seen_unix > 0 { rec.seen_unix } else { now };
+                rec.seen_unix = seen;
+                rec.timestamp = seen.saturating_mul(1000);
+                txs.insert(h.as_str(), ser(&rec)?.as_slice())?;
+                let mut tk = inv(rec.timestamp).to_vec();
+                tk.extend_from_slice(&inv(rec.block_id));
+                tk.extend_from_slice(h.as_bytes());
+                feed_time.insert(tk.as_slice(), h.as_str())?;
+            }
+            let mut m = w.open_table(META)?;
+            m.insert("raw_ts_version", RAW_TS_VERSION)?;
+        }
+        w.commit()?;
+        Ok(stale.len())
     }
 
     /// Total number of stored transactions.
@@ -1317,6 +1384,48 @@ mod tests {
         assert_eq!(db.get_meta_u64("backfill:floor:node"), Some(4200));
         db.set_meta_u64("backfill:floor:node", 800).unwrap();
         assert_eq!(db.get_meta_u64("backfill:floor:node"), Some(800));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A raw inscription persisted (old format) at timestamp 0 sinks to the bottom of the
+    // recency-ordered global feed; the migration lifts it to a real millisecond timestamp so
+    // it surfaces on the home page. Also confirms idempotency.
+    #[test]
+    fn raw_ts_migration_lifts_zero_timestamp_into_feed() {
+        let path = std::env::temp_dir().join(format!("zs-rawts-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap(); // migration auto-runs (nothing stale), sets the guard
+
+        let mut blk = rec("blk", "8888", 5, Some("token"));
+        blk.timestamp = 1_700_000_000_000; // a real block, milliseconds
+        let raw = TxRecord {
+            hash: "raw1".into(),
+            kind: "raw".into(),
+            channel: "guest".into(),
+            channel_short: "guest".into(),
+            slot: Some(187085),
+            raw_payload: vec![1, 2, 3],
+            timestamp: 0, // the old, buried format
+            seen_unix: 0,
+            ..Default::default()
+        };
+        db.commit(&[blk, raw], &[], &[], &[]).unwrap();
+
+        // before the fix: ts 0 sorts the raw tx to the very bottom of the global feed.
+        let before = db.feed(&FeedOpts { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(before.last().unwrap().hash, "raw1", "raw buried at timestamp 0");
+
+        // force a re-run (open() already set the guard) and migrate.
+        db.set_meta_u64("raw_ts_version", 0).unwrap();
+        assert_eq!(db.migrate_raw_timestamps().unwrap(), 1, "one raw record fixed");
+
+        let after = db.feed(&FeedOpts { limit: 10, ..Default::default() }).unwrap();
+        let raw_after = after.iter().find(|r| r.hash == "raw1").unwrap();
+        assert!(raw_after.timestamp > 0, "raw now carries a real timestamp");
+        assert_eq!(after.first().unwrap().hash, "raw1", "sorts by recency (observation) now");
+        // idempotent: the guard blocks a second pass.
+        assert_eq!(db.migrate_raw_timestamps().unwrap(), 0);
 
         let _ = std::fs::remove_file(&path);
     }
