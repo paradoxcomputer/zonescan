@@ -577,6 +577,25 @@ struct SeqTrack {
     tip_change_unix: u64,
     /// detected LEZ build ("rc3"/"rc4"), from a recognized built-in program id.
     version: Option<String>,
+    // --- L1 channel-tip metadata (`/channel/:id`), for the pending-activity panel ---
+    /// L1 slot of the channel's settlement tip (`tip_slot`) - the frontier of on-L1
+    /// activity, which may sit above `lib` (finalizing, not yet decodable) for L1-only
+    /// channels. `#[serde(default)]`: added after 7a83cf4, absent in old summaries.
+    #[serde(default)]
+    l1_tip_slot: Option<u64>,
+    /// The tip sequencer's starting L1 slot (`tip_sequencer_starting_slot`) - the low
+    /// bound of the current activity range shown in the pending panel.
+    #[serde(default)]
+    l1_tip_start_slot: Option<u64>,
+    /// Accredited signer keys on the L1 channel (hex), from `accredited_keys`.
+    #[serde(default)]
+    l1_accredited_keys: Vec<String>,
+    /// Signing threshold to inscribe (`configuration_threshold`).
+    #[serde(default)]
+    l1_config_threshold: Option<u64>,
+    /// Threshold to withdraw the channel balance (`withdraw_threshold`).
+    #[serde(default)]
+    l1_withdraw_threshold: Option<u64>,
 }
 
 impl SeqTrack {
@@ -813,6 +832,22 @@ fn raise_finality(e: &mut SeqTrack, block_id: u64, finalized: bool) {
     }
 }
 
+/// Whether a channel has recent on-L1 inscriptions we can't decode yet (settled but not
+/// finalized, and the node serves no queryable copy until finality) - the pending-activity
+/// signal. Only for L1-only channels (`seq_tip` None => no sequencer RPC): an RPC-indexed
+/// channel like 8888 shows every block (as "on L1 · finalizing"), so nothing is hidden.
+/// True when its L1 settlement tip is above finality (`tip_slot > lib_slot`), or it has an
+/// active tip (`tip_slot > start_slot`) but we've indexed nothing.
+fn has_pending_activity(t: &SeqTrack, lib_slot: Option<u64>) -> bool {
+    t.seq_tip.is_none()
+        && t.l1_tip_slot.is_some_and(|tip| {
+            let above_lib = lib_slot.is_some_and(|lib| tip > lib);
+            let unindexed_but_active =
+                t.inscriptions_seen == 0 && t.l1_tip_start_slot.is_some_and(|st| tip > st);
+            above_lib || unindexed_but_active
+        })
+}
+
 #[derive(Clone)]
 struct AppState {
     inner: Arc<Mutex<ServerState>>,
@@ -901,6 +936,28 @@ struct SeqSnap {
     /// detected LEZ build ("rc3"/"rc4"), or None if not yet recognized.
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
+    // --- L1 channel-tip metadata + pending-activity flag (`/channel/:id`) ---
+    /// L1 slot of the channel's settlement tip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    l1_tip_slot: Option<u64>,
+    /// The tip sequencer's starting L1 slot (low bound of the current activity range).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    l1_tip_start_slot: Option<u64>,
+    /// Channel settlement tip hash (`tip_message`), hex.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    tip_message: String,
+    /// Accredited signer keys (hex) that may inscribe to this channel.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    accredited_keys: Vec<String>,
+    /// Signing threshold to inscribe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_threshold: Option<u64>,
+    /// Threshold to withdraw the channel balance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    withdraw_threshold: Option<u64>,
+    /// True when the channel has recent on-L1 inscriptions we can't decode yet (settled
+    /// above `lib`, no queryable copy until finality); drives the pending-activity panel.
+    pending_activity: bool,
 }
 
 fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
@@ -927,6 +984,7 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
                     _ => false,
                 }
             };
+            let pending_activity = has_pending_activity(t, s.l1.lib_slot);
             SeqSnap {
                 channel: ch.clone(),
                 channel_short: short(ch),
@@ -949,6 +1007,13 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
                 seq_tip: t.seq_tip,
                 tip_change_unix: t.tip_change_unix,
                 version: t.version.clone(),
+                l1_tip_slot: t.l1_tip_slot,
+                l1_tip_start_slot: t.l1_tip_start_slot,
+                tip_message: t.last_tip.clone(),
+                accredited_keys: t.l1_accredited_keys.clone(),
+                config_threshold: t.l1_config_threshold,
+                withdraw_threshold: t.l1_withdraw_threshold,
+                pending_activity,
             }
         })
         .collect();
@@ -2049,17 +2114,29 @@ async fn refresh_channels(client: &Client, base: &str, app: &AppState) {
                 other => other.to_string(),
             });
             // v0.2.0 renamed `keys` -> `accredited_keys` and `tip` -> `tip_message`.
-            let signers = v
+            let keys: Vec<String> = v
                 .get("accredited_keys")
                 .or_else(|| v.get("keys"))
                 .and_then(Value::as_array)
-                .map_or(0, Vec::len);
+                .map(|a| a.iter().map(jhex).collect())
+                .unwrap_or_default();
+            let signers = keys.len();
             let tip = channel_tip(&v);
+            // channel-tip metadata for the pending-activity panel
+            let tip_slot = jget_u64(&v, "tip_slot");
+            let tip_start_slot = jget_u64(&v, "tip_sequencer_starting_slot");
+            let config_threshold = jget_u64(&v, "configuration_threshold");
+            let withdraw_threshold = jget_u64(&v, "withdraw_threshold");
             let now = now_unix();
             let mut s = app.inner.lock().unwrap();
             if let Some(t) = s.seqs.get_mut(&ch) {
                 t.l1_balance = balance;
                 t.l1_signers = signers;
+                t.l1_accredited_keys = keys;
+                t.l1_tip_slot = tip_slot;
+                t.l1_tip_start_slot = tip_start_slot;
+                t.l1_config_threshold = config_threshold;
+                t.l1_withdraw_threshold = withdraw_threshold;
                 // tip changed (or first sighting) => the sequencer settled a block
                 if !tip.is_empty() && (t.last_tip.is_empty() || t.last_tip != tip) {
                     t.last_tip = tip;
@@ -4508,7 +4585,7 @@ function txRows(list){
       <td>${accs}</td></tr>`;
   }).join('');
 }
-const txHead='<thead><tr><th>Txn Hash</th><th>Visibility</th><th>Type</th><th>Block</th><th>Age</th><th>Sequencer</th><th>Accounts</th></tr></thead>';
+const txHead='<thead><tr><th>Txn Hash</th><th>Visibility</th><th>Type</th><th>Block</th><th>Age</th><th>Zone</th><th>Accounts</th></tr></thead>';
 const crumb=(parts)=>`<div style="font-size:13px;color:var(--soft);padding:14px 0 10px">${parts.map((p,i)=>(i?' <span style="color:var(--soft)">/</span> ':'')+(p.href?`<a href="${p.href}">${esc(p.t)}</a>`:`<span style="color:var(--fg)">${esc(p.t)}</span>`)).join('')}</div>`;
 
 // ---- reusable infinite-scroll tx feed (appends into #rows; updates #count) ----
@@ -4641,11 +4718,37 @@ function renderSeqs(){
       <span class="dot ${s.alive?'on':'off'}"></span>
       <div class="sm"><div class="a">${esc(zoneTitle(s))}${consBadge(s)}</div>
         <div class="zmeta"><span class="zf"><span class="zk">Channel ID</span> <span class="chex">${esc(s.channel_short)}</span></span><span class="zf"><span class="zk">Sequencer version</span> ${verValue(s)}</span></div>
-        <div class="b">L2 #${num(s.latest_block_id)} · L1 bal ${s.l1_balance!=null?num(s.l1_balance):'-'} · ${s.l1_signers||0} key(s)${tipNote(s)}</div></div>
+        <div class="b">L2 #${num(s.latest_block_id)} · L1 bal ${s.l1_balance!=null?num(s.l1_balance):'-'} · ${s.l1_signers||0} key(s)${tipNote(s)}${s.pending_activity?' · <span class="fbadge safe" style="font-size:9px;padding:0 5px" title="on-L1 inscriptions awaiting finality">pending activity</span>':''}</div></div>
       <span class="st ${s.alive?'alive':'idle'}">${s.alive?'ALIVE':'IDLE'}</span></a>`).join('')
       + (seqs.length>cur.seqShown?`<div class="empty" style="padding:12px">scroll for ${seqs.length-cur.seqShown} more…</div>`:'')
     : `<div class="empty">${state&&state.discovering?'scanning the L1 for sequencers…':'no sequencers found'}</div>`;
   el.onscroll=()=>{ if(el.scrollTop+el.clientHeight>=el.scrollHeight-100 && cur.seqShown<seqs.length){ cur.seqShown+=60; renderSeqs(); } };
+}
+
+// Panel for a channel with on-L1 inscriptions that aren't finalized yet - the node
+// can't serve their contents (finalized-only reader, forward-only stream, no by-hash /
+// mempool fetch), so we surface everything /channel/:id DOES tell us, flagged finalizing.
+function pendingActivityPanel(s){
+  if(!s||!s.pending_activity) return '';
+  const lib=(state&&state.l1&&state.l1.lib_slot)||0;
+  const tip=s.l1_tip_slot||0, start=s.l1_tip_start_slot||0;
+  const gap=tip>lib?tip-lib:0;
+  const eta=gap>0?`${num(gap)} slot${gap===1?'':'s'} to finalize (~${Math.max(1,Math.round(gap/60))} min)`:'finalizing now';
+  const keys=s.accredited_keys||[];
+  const insc=keys.length?keys.map(k=>`<code title="${esc(k)}">${esc(sh(k,10,6))}</code>`).join(', '):'<span class="mut">-</span>';
+  const thr=s.config_threshold!=null?` <span class="mut" style="font-size:11px">· ${num(s.config_threshold)} of ${keys.length||'?'} to inscribe</span>`:'';
+  const tiph=s.tip_message?`<code title="${esc(s.tip_message)}">${esc(sh(s.tip_message,10,6))}</code>`:'<span class="mut">-</span>';
+  return `<div class="panel" style="margin-bottom:16px">
+    <div class="phead">Pending activity <span class="fbadge safe" title="settled on the L1, awaiting finality">on L1 · finalizing</span></div>
+    <div class="kv" style="padding:16px">
+      <div class="k">Activity (L1 slots)</div><div class="v">${num(start)} → ${num(tip)}</div>
+      <div class="k">Finality</div><div class="v">${esc(eta)} <span class="mut" style="font-size:11px">(tip slot ${num(tip)} vs last-final ${num(lib)})</span></div>
+      <div class="k">Inscriber</div><div class="v">${insc}${thr}</div>
+      <div class="k">Tip hash</div><div class="v">${tiph}</div>
+      <div class="k">Channel balance</div><div class="v">${s.l1_balance!=null?num(s.l1_balance):'-'}</div>
+    </div>
+    <div class="mut" style="padding:0 18px 16px;font-size:12px;line-height:1.55">These inscriptions are settled on the L1 but not yet finalized; the node serves no queryable copy until finality, so their contents decode once finalized. New inscriptions appear live.</div>
+  </div>`;
 }
 
 async function renderZone(seq){
@@ -4668,6 +4771,7 @@ async function renderZone(seq){
       <div class="k">Inscriptions seen</div><div class="v">${num(s.inscriptions_seen)}</div>
     </div>
   </div>
+  ${pendingActivityPanel(s)}
   <div class="panel"><div class="phead">Transactions <span class="count" id="count"></span>
     ${state&&state.skip_clock?'<span class="mut" style="margin-left:12px;font-weight:400;font-size:12px" title="clock txs tick every block and are not stored">clock ticks not indexed</span>':''}</div>
     ${filterBar()}
@@ -5111,6 +5215,36 @@ mod tests {
             hash_ok: ok,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn pending_activity_flags_l1_only_channel_above_lib() {
+        // L1-only channel (no seq_tip) whose settlement tip is above finality => pending.
+        let mut t = SeqTrack { seq_tip: None, l1_tip_slot: Some(187085), ..Default::default() };
+        assert!(has_pending_activity(&t, Some(186706)), "tip>lib on an L1-only channel");
+
+        // unindexed but active: nothing indexed yet, tip moved past its start slot.
+        let u = SeqTrack {
+            seq_tip: None,
+            l1_tip_slot: Some(187085),
+            l1_tip_start_slot: Some(187036),
+            inscriptions_seen: 0,
+            ..Default::default()
+        };
+        assert!(has_pending_activity(&u, Some(999999)), "active tip, nothing indexed");
+
+        // RPC-indexed channel (seq_tip set, e.g. 8888) is never flagged - its blocks show.
+        t.seq_tip = Some(1099);
+        assert!(!has_pending_activity(&t, Some(186706)), "RPC channel content is shown");
+
+        // L1-only channel fully caught up (tip <= lib, some indexed) => not pending.
+        let done = SeqTrack {
+            seq_tip: None,
+            l1_tip_slot: Some(186000),
+            inscriptions_seen: 12,
+            ..Default::default()
+        };
+        assert!(!has_pending_activity(&done, Some(186706)), "tip<=lib, indexed => quiet");
     }
 
     #[test]
