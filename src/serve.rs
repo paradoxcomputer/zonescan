@@ -32,9 +32,10 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::{
-    build_client, channel_alias, channel_tip, collect_inscriptions, decode_inscription, find_u64,
-    get_json, info_l1_version, info_mode, info_u64, jget_u64, jhex, resolve_channel, scan_channels,
-    short, Decoded, EndpointResult, ScanRec, TxMix, MAX_PLAUSIBLE_BLOCK_ID,
+    build_client, channel_alias, channel_tip, collect_inscriptions, decode_inscription,
+    decode_inscription_with, find_u64, get_json, info_l1_version, info_mode, info_u64, jget_u64,
+    jhex, resolve_channel, scan_channels, short, Decoded, EndpointResult, ScanRec, TxMix,
+    MAX_PLAUSIBLE_BLOCK_ID,
 };
 
 mod db;
@@ -600,8 +601,9 @@ struct SeqTrack {
     /// channel - so its tx table has content and needs no "activity" explainer panel.
     #[serde(default)]
     user_tx_seen: bool,
-    /// True once an inscription failed to decode as an rc5 block (implausible block_id):
-    /// an unrecognized block format we can detect but not render.
+    /// True once an inscription didn't decode as an rc5 block (implausible block_id): a raw
+    /// text/data inscription, not a sequencer block. Its content IS rendered (as raw-inscription
+    /// rows); this flag only drives the channel-level "raw" activity summary.
     #[serde(default)]
     saw_undecodable: bool,
 }
@@ -684,9 +686,10 @@ fn is_zero(n: &usize) -> bool {
 }
 
 /// One transaction in the rolling feed: a decoded tx plus its on-chain context.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct TxRecord {
     hash: String,
+    /// public | private | deploy | raw (a non-block "raw inscription" - see `raw_payload`).
     kind: String,
     /// privacy-preserving operation subtype: shield / deshield / private-send.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -713,6 +716,12 @@ struct TxRecord {
     /// ProgramDeployment: size of the deployed guest ELF (bytes), downloadable at /api/elf/:hash.
     #[serde(default, skip_serializing_if = "is_zero")]
     bytecode_len: usize,
+    /// For a "raw" inscription tx (`kind == "raw"`): the raw `payload.inscription` bytes. Kept
+    /// so the tx-detail can render the content (UTF-8 text when printable, else a hex dump).
+    /// Persisted, but stripped from list rows and re-rendered as `raw_text`/`raw_hex` on the
+    /// detail (see `enrich_tx` / `enrich_tx_detail`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    raw_payload: Vec<u8>,
     block_id: u64,
     channel: String,
     channel_short: String,
@@ -723,6 +732,25 @@ struct TxRecord {
 
 /// Build feed records from a decoded inscription + its context.
 fn records_from(channel: &str, slot: Option<u64>, d: &Decoded, seen_unix: u64) -> Vec<TxRecord> {
+    // A raw (non-block) inscription doesn't decode to an rc5 sequencer block. Rather than drop
+    // it, surface it as ONE "raw" tx keyed by its `mantle_tx.hash` (its on-L1 inscription id),
+    // carrying the raw payload bytes so the tx-detail can show the actual content. It has no
+    // decodable txs, so we never touch `d.txs` here.
+    if d.undecodable {
+        if d.raw_tx_hash.is_empty() {
+            return vec![]; // no carrying hash to key it by (e.g. a sequencer-RPC block body)
+        }
+        return vec![TxRecord {
+            hash: d.raw_tx_hash.clone(),
+            kind: "raw".to_string(),
+            channel: channel.to_string(),
+            channel_short: short(channel),
+            slot,
+            seen_unix,
+            raw_payload: d.raw_payload.clone(),
+            ..Default::default()
+        }];
+    }
     let skip_clock = SKIP_CLOCK.load(Ordering::Relaxed);
     d.txs
         .iter()
@@ -746,6 +774,7 @@ fn records_from(channel: &str, slot: Option<u64>, d: &Decoded, seen_unix: u64) -
             instruction_data: t.instruction_data.clone(),
             deploy_program: t.deploy_program.clone(),
             bytecode_len: t.deploy_bytecode.len(),
+            raw_payload: Vec::new(), // decodable block txs carry no raw inscription payload
             block_id: d.block_id,
             channel: channel.to_string(),
             channel_short: short(channel),
@@ -808,7 +837,7 @@ fn ingest(s: &mut ServerState, channel: &str, slot: Option<u64>, d: &Decoded, no
             e.latest_slot = e.latest_slot.max(sl);
         }
         // Classify the channel's content (drives the activity panel, idempotent):
-        // - an undecodable block => unrecognized format (can detect, can't render).
+        // - a non-block (raw) inscription => raw text/data, rendered as its own row.
         // - any non-clock tx => real user activity (the tx table has content).
         if d.undecodable {
             e.saw_undecodable = true;
@@ -874,8 +903,9 @@ fn has_pending_activity(t: &SeqTrack, lib_slot: Option<u64>) -> bool {
 /// page can show an HONEST explainer instead of a blank/misleading page. Three cases:
 /// - `"finalizing"`: recent inscriptions above finality (`tip_slot > lib`) we can't read
 ///   yet - could be clock heartbeats OR user txs, unknown until final. Neutral wording.
-/// - `"undecodable"`: finalized inscriptions whose block bodies don't decode (unrecognized
-///   / non-rc5 format) - detected but not rendered.
+/// - `"raw"`: finalized inscriptions that aren't sequencer blocks but raw text/data
+///   inscriptions. Their content IS shown (each is now a raw-inscription tx row with its own
+///   detail page); the panel is just a summary pointing at those rows.
 /// - `"clock-only"`: finalized inscriptions that decode cleanly but carry only the clock
 ///   heartbeat (no user tx) - an idle channel, not a decode failure.
 /// Returns `None` when the channel renders user txs (table has content) or has nothing.
@@ -888,7 +918,9 @@ fn activity_state(t: &SeqTrack, lib_slot: Option<u64>) -> Option<&'static str> {
         return None;
     }
     if t.saw_undecodable {
-        return Some("undecodable"); // decode failed => unrecognized block format
+        // not a sequencer block but a raw text/data inscription - its content is now rendered
+        // as raw-inscription rows; this panel is only a summary of them.
+        return Some("raw");
     }
     if t.inscriptions_seen > 0 {
         return Some("clock-only"); // decoded fine, but every tx was a clock heartbeat
@@ -1004,8 +1036,8 @@ struct SeqSnap {
     #[serde(skip_serializing_if = "Option::is_none")]
     withdraw_threshold: Option<u64>,
     /// Honest explainer state when the channel shows no user-tx rows despite activity:
-    /// "finalizing" (recent, above finality), "undecodable" (unrecognized block format),
-    /// or "clock-only" (idle heartbeats). None => normal (user txs render, or nothing).
+    /// "finalizing" (recent, above finality), "raw" (non-block raw inscriptions, now shown as
+    /// their own rows), or "clock-only" (idle heartbeats). None => normal (user txs render).
     #[serde(skip_serializing_if = "Option::is_none")]
     activity_state: Option<&'static str>,
 }
@@ -1513,11 +1545,12 @@ async fn discover_compatible(app: &AppState, total_cap: usize) -> Result<Vec<Str
             for b in &blocks {
                 let mut ins = Vec::new();
                 collect_inscriptions(b, &mut ins);
-                for (cid, raw) in ins {
+                for ri in ins {
+                    let cid = ri.channel;
                     if already.contains(&cid) || by_chan.contains_key(&cid) {
                         continue; // already tracked, or already sampled this channel
                     }
-                    if let Some(d) = decode_inscription(&raw) {
+                    if let Some(d) = decode_inscription(&ri.value) {
                         by_chan.insert(cid, vec![d]);
                     }
                 }
@@ -1782,13 +1815,14 @@ async fn backfill_walk(
                     .or_else(|| find_u64(b, "slot"));
                 let mut found = Vec::new();
                 collect_inscriptions(b, &mut found);
-                for (cid, ins) in found {
+                for ri in found {
+                    let cid = ri.channel;
                     if let Some(f) = focus {
                         if !f.contains(&cid) {
                             continue;
                         }
                     }
-                    if let Some(d) = decode_inscription(&ins) {
+                    if let Some(d) = decode_inscription_with(&ri.value, ri.tx_hash.as_deref()) {
                         decoded.push((cid, slot, d));
                     }
                 }
@@ -2704,13 +2738,14 @@ async fn handle_event(
             // freshly streamed tip block (slot > lib) stays Safe until finality catches up.
             let lib = s.l1.lib_slot;
             let l1_final = matches!((slot, lib), (Some(sl), Some(l)) if sl <= l);
-            for (ch, ins) in found {
+            for ri in found {
+                let ch = ri.channel;
                 if let Some(f) = focus {
                     if !f.contains(&ch) {
                         continue;
                     }
                 }
-                if let Some(d) = decode_inscription(&ins) {
+                if let Some(d) = decode_inscription_with(&ri.value, ri.tx_hash.as_deref()) {
                     ingest(&mut s, &ch, slot, &d, now);
                     let e = s.seqs.entry(ch.clone()).or_default();
                     if !d.undecodable {
@@ -3246,8 +3281,27 @@ struct TxQuery {
 /// Attach the resolved token `amount` + `token` ticker to a tx's JSON for token / ATA /
 /// native transfers (e.g. `"amount":"250","token":"GOLD"`), so the feed + tx page can
 /// render "GOLD 250" without a per-row lookup on the client.
+/// Render a raw inscription's payload bytes for the tx-detail: `(Some(text), hex)` when the
+/// bytes are printable UTF-8 (so the guest's rows read e.g. "dweb-via-paradox #2 …"), else
+/// `(None, hex)` so the UI falls back to a hex dump.
+fn raw_payload_repr(bytes: &[u8]) -> (Option<String>, String) {
+    let hex = hex::encode(bytes);
+    let text = std::str::from_utf8(bytes)
+        .ok()
+        .filter(|s| {
+            !s.is_empty() && s.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        })
+        .map(str::to_string);
+    (text, hex)
+}
+
 fn enrich_tx(app: &AppState, rec: &TxRecord) -> Value {
     let mut v = serde_json::to_value(rec).unwrap_or(Value::Null);
+    // The raw payload can be sizeable; list rows don't need it (they only badge "raw"). It's
+    // re-surfaced as raw_text/raw_hex on the tx-detail (enrich_tx_detail).
+    if let Value::Object(o) = &mut v {
+        o.remove("raw_payload");
+    }
     if let (Value::Object(o), Some(db)) = (&mut v, app.db.as_ref()) {
         let (amount, token) = db.token_op(rec);
         if let Some(a) = amount {
@@ -3284,6 +3338,15 @@ fn enrich_tx_detail(app: &AppState, rec: &TxRecord) -> Value {
     if let Value::Object(o) = &mut v {
         if !ta.is_empty() {
             o.insert("token_accounts".into(), json!(ta));
+        }
+        // For a raw inscription: surface the actual content (UTF-8 text and/or a hex dump).
+        if rec.kind == "raw" && !rec.raw_payload.is_empty() {
+            let (text, hex) = raw_payload_repr(&rec.raw_payload);
+            o.insert("raw_len".into(), json!(rec.raw_payload.len()));
+            o.insert("raw_hex".into(), json!(hex));
+            if let Some(t) = text {
+                o.insert("raw_text".into(), json!(t));
+            }
         }
     }
     v
@@ -4181,7 +4244,14 @@ const DASH_HTML: &str = r#"<!doctype html>
   .b-ty-amm{background:#fae8ff;color:#86198f;border-color:#f5d0fe}
   .b-ty-pinata,.b-ty-pinata_token{background:#ffe4e6;color:#9f1239;border-color:#fecdd3}
   .b-ty-deploy{background:#ffedd5;color:#c2410c;border-color:#fdba74}
+  .b-ty-raw{background:#fef9c3;color:#854d0e;border-color:#fde68a}
   .b-ty-other{background:#f1f1f3;color:#52525b;border-color:#e0e0e4}
+  /* raw (non-block) inscription: a distinct visibility chip + monospaced content blocks */
+  .b-vis-raw{background:#fffbeb;color:#854d0e;border-color:#fde68a}
+  .rawtext,.rawhex{font-family:var(--mono);font-size:12.5px;line-height:1.5;white-space:pre-wrap;
+    word-break:break-word;background:var(--panel2,#f4f4f5);border:1px solid var(--line2);border-radius:7px;
+    padding:12px 14px;margin:0;max-height:360px;overflow:auto}
+  .rawhex{white-space:pre;word-break:normal}
   /* LEZ build badge */
   .vbadge{display:inline-block;font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;
     margin-left:6px;vertical-align:middle;letter-spacing:.3px;text-transform:uppercase}
@@ -4291,20 +4361,23 @@ function progName(p){ return (p&&PROGS[p])||p; }
 function txKind(t){ return (t.kind==='public' && progName(t.program)==='token') ? 'token' : t.kind; }
 function cap(s){ s=s||''; return s.charAt(0).toUpperCase()+s.slice(1); }
 // Visibility = public vs private (the cryptographic kind); Type = the operation.
-function txVis(t){ return t.kind==='private'?'private':'public'; }
+function txVis(t){ return t.kind==='raw'?'raw':(t.kind==='private'?'private':'public'); }
 function txType(t){
+  if(t.kind==='raw') return 'raw';
   if(t.kind==='deploy') return 'deploy';
   if(t.kind==='private'){ const s=t.subtype; return (s==='shield'||s==='deshield')?s:'authenticated_transfer'; }
   return progName(t.program)||'public';
 }
 const TYPE_LABEL={clock:'Clock',token:'Token',authenticated_transfer:'Transfer',ata:'ATA',amm:'AMM',
   pinata:'Pinata',pinata_token:'Pinata Token',deploy:'Deploy',shield:'Shield',deshield:'Deshield',
-  'private-send':'Transfer',public:'Public',private:'Private'};
+  'private-send':'Transfer',public:'Public',private:'Private',raw:'Inscription'};
 // known op -> label; an unresolved program id (raw hex) is just "Program" (the id
 // itself belongs in the Program field / tooltip, not the Type column).
 function typeLabel(ty){ if(TYPE_LABEL[ty]) return TYPE_LABEL[ty]; return /^[0-9a-f]{40,}$/i.test(ty)?'Program':cap(ty); }
 function tyClass(ty){ return TYPE_LABEL[ty]?ty.replace(/-/g,'_'):'other'; }
-function visBadge(t){ const v=txVis(t); return `<span class="badge b-vis-${v}">${v==='private'?'Private':'Public'}</span>`; }
+function visBadge(t){ const v=txVis(t);
+  if(v==='raw') return `<span class="badge b-vis-raw" title="a raw text/data inscription - not a sequencer block">Raw</span>`;
+  return `<span class="badge b-vis-${v}">${v==='private'?'Private':'Public'}</span>`; }
 function typeBadge(t){ const ty=txType(t); return `<span class="badge b-ty-${tyClass(ty)}" title="${esc(ty)}">${esc(typeLabel(ty))}</span>`; }
 // map a filter key to query params (kind / subtype / program_name)
 // ---- shared transactions filter: Visibility + multi-select Type + Sort ----
@@ -4603,6 +4676,14 @@ function grp(s){ return s==null?'':String(s).replace(/\B(?=(\d{3})+(?!\d))/g,','
 function seqFinal(ch){ const q=((state&&state.sequencers)||[]).find(x=>x.channel===ch); return q?(q.finalized_block_id||0):0; }
 function seqSafe(ch){ const q=((state&&state.sequencers)||[]).find(x=>x.channel===ch); return q?Math.max(q.safe_block_id||0,q.finalized_block_id||0):0; }
 function finalityBadge(t){
+  // A raw inscription has no L2 block_id; its finality is its L1 slot vs the last-final slot
+  // (it lives directly on the L1). Below lib => final; a freshly-streamed tip => finalizing.
+  if(t.kind==='raw'){
+    const lib=(state&&state.l1&&state.l1.lib_slot)||0, sl=t.slot||0;
+    if(!sl) return '';
+    if(lib && sl<=lib) return `<span class="fbadge fin" title="final - the inscription's L1 slot ${num(sl)} is at/below the last-final slot ${num(lib)}">final</span>`;
+    return `<span class="fbadge safe" title="inscribed on the L1 (slot ${num(sl)}), finalizing until past the last-final slot ${num(lib)}">on L1 · finalizing</span>`;
+  }
   const fin=seqFinal(t.channel), safe=seqSafe(t.channel);
   if(!fin && !safe) return ''; // unknown (light build / no finality info yet)
   if(t.block_id<=fin)
@@ -4618,6 +4699,7 @@ function txAction(t){
   const w=t.instruction_data||[], a=t.accounts||[], name=progName(t.program), tok=t.token, amt=t.amount;
   const amtS=amt!=null?grp(amt):'';
   const ft=(a[0]?' from '+accShort(a[0]):'')+(a[1]?' to '+accShort(a[1]):'');
+  if(t.kind==='raw') return 'Raw inscription'+(t.slot?' · L1 slot '+num(t.slot):'');
   if(t.kind==='deploy') return 'Deploy program'+(t.deploy_program?' '+esc(progShort(t.deploy_program)):'');
   if(t.kind==='private'){ const s=t.subtype; if(s==='shield') return 'Shield (private deposit)'; if(s==='deshield') return 'Deshield (private withdraw)'; return 'Private transfer'; }
   if(name==='ata'){ const v=w[0]>>>0;
@@ -4641,22 +4723,25 @@ function txAction(t){
   return `${esc(cap(pn||'program'))}${w.length?' · variant '+(w[0]>>>0):''}`;
 }
 function txRows(list){
-  if(!list||!list.length) return '<tr><td colspan="7" class="empty">no transactions</td></tr>';
+  if(!list||!list.length) return '<tr><td colspan="8" class="empty">no transactions</td></tr>';
   return list.map(t=>{
     const z=t.channel;
     const a0=t.accounts&&t.accounts[0];
     const accs=a0?`<a class="lnk" href="/zone/${u(z)}/wallet/${u(a0)}">${esc(sh(a0,6,4))}</a>`+(t.accounts.length>1?` <span class="mut">+${t.accounts.length-1}</span>`:''):'<span class="mut">-</span>';
+    // a raw inscription has no L2 block; locate it by its L1 slot instead of a block height.
+    const blockCell=t.kind==='raw'?`<span class="mut nowrap" title="L1 slot">L1 ${t.slot?num(t.slot):'—'}</span>`:`#${num(t.block_id)}`;
     return `<tr>
       <td><a class="lnk" href="/zone/${u(z)}/tx/${u(t.hash)}">${esc(sh(t.hash))}</a></td>
       <td>${visBadge(t)}</td>
-      <td>${typeBadge(t)} ${finalityBadge(t)}</td>
-      <td class="mono">#${num(t.block_id)}</td>
+      <td>${typeBadge(t)}</td>
+      <td>${finalityBadge(t)||'<span class="mut">-</span>'}</td>
+      <td class="mono">${blockCell}</td>
       <td class="mut nowrap">${ageOf(t)}</td>
       <td><a class="lnk" href="/zone/${u(z)}">${chanLabel(z, t.channel_short)}</a></td>
       <td>${accs}</td></tr>`;
   }).join('');
 }
-const txHead='<thead><tr><th>Txn Hash</th><th>Visibility</th><th>Type</th><th>Block</th><th>Age</th><th>Zone</th><th>Accounts</th></tr></thead>';
+const txHead='<thead><tr><th>Txn Hash</th><th>Visibility</th><th>Type</th><th>Status</th><th>Block</th><th>Age</th><th>Zone</th><th>Accounts</th></tr></thead>';
 const crumb=(parts)=>`<div style="font-size:13px;color:var(--soft);padding:14px 0 10px">${parts.map((p,i)=>(i?' <span style="color:var(--soft)">/</span> ':'')+(p.href?`<a href="${p.href}">${esc(p.t)}</a>`:`<span style="color:var(--fg)">${esc(p.t)}</span>`)).join('')}</div>`;
 
 // ---- reusable infinite-scroll tx feed (appends into #rows; updates #count) ----
@@ -4671,7 +4756,7 @@ function cursorParams(p,cursor){ if(cursor){ if(cursor.ts!=null) p.set('before_t
 // buildUrl(cursor) -> the fetch URL for the next page (cursor=null for the first).
 function txFeed(buildUrl){
   cur.feed={buildUrl, cursor:null, done:false, loading:false, count:0, first:true, seen:new Set()};
-  const tb=$('rows'); if(tb) tb.innerHTML='<tr><td colspan="7" class="empty">loading…</td></tr>';
+  const tb=$('rows'); if(tb) tb.innerHTML='<tr><td colspan="8" class="empty">loading…</td></tr>';
   attachFeedScroll();
   feedMore();
 }
@@ -4679,7 +4764,7 @@ async function feedMore(){
   const f=cur.feed; if(!f||f.loading||f.done) return; f.loading=true;
   // show a loading row at the bottom while the next page is in flight (not on first load)
   const tb0=$('rows');
-  if(tb0&&!f.first) tb0.insertAdjacentHTML('beforeend','<tr class="loadrow" id="loadrow"><td colspan="7">loading<span class="dot"></span><span class="dot"></span><span class="dot"></span></td></tr>');
+  if(tb0&&!f.first) tb0.insertAdjacentHTML('beforeend','<tr class="loadrow" id="loadrow"><td colspan="8">loading<span class="dot"></span><span class="dot"></span><span class="dot"></span></td></tr>');
   try{
     const resp=await (await fetch(f.buildUrl(f.cursor))).json();
     const list=Array.isArray(resp)?resp:(resp.txs||[]); // /api/txs returns an array; account/token an object
@@ -4689,7 +4774,7 @@ async function feedMore(){
     if(list.length){ tb.insertAdjacentHTML('beforeend', txRows(list)); f.count+=list.length;
       list.forEach(t=>f.seen&&f.seen.add(t.hash));
       const last=list[list.length-1]; f.cursor={ts:last.timestamp, block:last.block_id, hash:last.hash}; }
-    if(!f.count) tb.innerHTML=`<tr><td colspan="7" class="empty">${state&&state.discovering?'⏳ scanning recent L1 blocks…':'no transactions'}</td></tr>`;
+    if(!f.count) tb.innerHTML=`<tr><td colspan="8" class="empty">${state&&state.discovering?'⏳ scanning recent L1 blocks…':'no transactions'}</td></tr>`;
     if(list.length<PAGE) f.done=true;
     const cnt=$('count'); if(cnt) cnt.textContent='';
   }catch(e){ const lr=$('loadrow'); if(lr) lr.remove(); }
@@ -4769,7 +4854,7 @@ function renderHome(){
         ${state&&state.skip_clock?'<span class="mut" style="font-size:12px;white-space:nowrap" title="clock txs tick every block and are not stored">clock ticks not indexed</span>':''}
         <span class="count" id="count"></span></span></div>
       ${filterBar()}
-      <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows"><tr><td colspan="7" class="empty">loading…</td></tr></tbody></table></div>
+      <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows"><tr><td colspan="8" class="empty">loading…</td></tr></tbody></table></div>
     </div>
   </div>`;
   wireFilter(()=>txFeed(homeFeedUrl));
@@ -4796,8 +4881,8 @@ function renderSeqs(){
   el.onscroll=()=>{ if(el.scrollTop+el.clientHeight>=el.scrollHeight-100 && cur.seqShown<seqs.length){ cur.seqShown+=60; renderSeqs(); } };
 }
 
-// The L2 tip to display: a real height, else an em dash for a channel with activity but
-// no decodable tip (undecodable format), else block zero (a genuine genesis-only channel).
+// The L2 tip to display: a real height, else an em dash for a channel with activity but no
+// L2 block height (e.g. only raw inscriptions), else block zero (a genesis-only channel).
 function l2Tip(s){ return (s&&s.latest_block_id>0)?'#'+num(s.latest_block_id):(s&&s.activity_state?'—':'#0'); }
 
 // Small zones-list chip mirroring the activity_state (honest, never implies user txs).
@@ -4805,7 +4890,7 @@ function activityChip(s){
   const st=s&&s.activity_state; if(!st) return '';
   const m={finalizing:['safe','finalizing','on-L1 inscriptions awaiting finality'],
            'clock-only':['pend','clock-only','idle — clock heartbeats only'],
-           undecodable:['pend','format?','unrecognized block format (non-rc5)']}[st];
+           raw:['safe','raw','raw text/data inscriptions (not sequencer blocks) — shown as rows']}[st];
   if(!m) return '';
   return ` · <span class="fbadge ${m[0]}" style="font-size:9px;padding:0 5px" title="${esc(m[2])}">${esc(m[1])}</span>`;
 }
@@ -4813,7 +4898,7 @@ function activityChip(s){
 // Honest explainer panel for a channel that shows NO user-tx rows but has activity. Three
 // server-classified states (activity_state), each worded so we never imply user txs that
 // aren't there: "finalizing" (recent, not-yet-final — contents unknown), "clock-only"
-// (idle heartbeats), "undecodable" (unrecognized non-rc5 block format).
+// (idle heartbeats), "raw" (non-block raw inscriptions, now also shown as their own rows).
 function activityPanel(s){
   const st=s&&s.activity_state; if(!st) return '';
   const lib=(state&&state.l1&&state.l1.lib_slot)||0;
@@ -4836,9 +4921,9 @@ function activityPanel(s){
     headline=`clock-only · ${nS}heartbeat inscription${n===1?'':'s'} · no user txs`;
     note='This channel has settled only clock heartbeats in the scanned window — no user transactions. Clock ticks are hidden from the feed.';
   } else {
-    badge='<span class="fbadge" style="background:#fef3c7;color:#92400e" title="unrecognized block format">format not recognized</span>';
-    headline=`${nS}inscription${n===1?'':'s'} detected · contents not decoded`;
-    note='These inscriptions are settled on the L1 but their block format is not recognized (unrecognized block format — non-rc5 sequencer), so their contents cannot be decoded. New inscriptions appear live.';
+    badge='<span class="fbadge safe" title="raw text/data inscriptions - not sequencer blocks">raw inscriptions</span>';
+    headline=`${nS}raw inscription${n===1?'':'s'} · not a sequencer block`;
+    note='This channel settles raw text/data inscriptions rather than sequencer blocks. Each is listed below as its own inscription row — open one to read its content (decoded UTF-8 text, or a hex dump). New inscriptions appear live.';
   }
   return `<div class="panel" style="margin-bottom:16px">
     <div class="phead">Channel activity ${badge}</div>
@@ -4878,11 +4963,27 @@ async function renderZone(seq){
   <div class="panel"><div class="phead">Transactions <span class="count" id="count"></span>
     ${state&&state.skip_clock?'<span class="mut" style="margin-left:12px;font-weight:400;font-size:12px" title="clock txs tick every block and are not stored">clock ticks not indexed</span>':''}</div>
     ${filterBar()}
-    <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows"><tr><td colspan="7" class="empty">loading…</td></tr></tbody></table></div></div>`;
+    <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows"><tr><td colspan="8" class="empty">loading…</td></tr></tbody></table></div></div>`;
   cur.feedUrl=(cursor)=>{ const p=new URLSearchParams(); p.set('channel',seq); p.set('limit',PAGE);
     filterParams(p); return '/api/txs?'+cursorParams(p,cursor); };
   wireFilter(()=>txFeed(cur.feedUrl));
   txFeed(cur.feedUrl);
+}
+
+// group a hex string into space-separated byte pairs, 32 bytes per line, for a readable dump.
+function fmtHex(h){ h=(h||'').replace(/[^0-9a-fA-F]/g,''); const bytes=h.match(/.{1,2}/g)||[]; let out='';
+  for(let i=0;i<bytes.length;i+=32){ out+=bytes.slice(i,i+32).join(' ')+'\n'; } return out.replace(/\n$/,''); }
+// tx-detail content block for a raw inscription: its bytes as decoded UTF-8 text (when
+// printable) or a hex dump. No fabricated decoded fields - just the on-chain content.
+function rawPayloadPanel(t){
+  const hasText=t.raw_text!=null && t.raw_text!=='';
+  const body=hasText?`<pre class="rawtext">${esc(t.raw_text)}</pre>`
+                    :`<pre class="rawhex">${esc(fmtHex(t.raw_hex||''))}</pre>`;
+  return `<div class="panel" style="margin-top:16px"><div class="phead">Raw inscription payload <span class="mut" style="font-weight:400;font-size:12px">${t.raw_len?num(t.raw_len)+' bytes · ':''}${hasText?'UTF-8 text':'binary (hex)'}</span></div>
+    <div style="padding:14px 18px 18px">
+      <div class="mut" style="font-size:12px;margin-bottom:9px;line-height:1.5">A raw text/data inscription — not a sequencer block. The bytes below are its on-chain content, shown ${hasText?'as decoded UTF-8 text':'as a hex dump'}.</div>
+      ${body}
+    </div></div>`;
 }
 
 async function renderTx(seq,hash){
@@ -4905,16 +5006,18 @@ async function renderTx(seq,hash){
     <div class="k">Visibility</div><div class="v">${cap(txVis(t))}</div>
     <div class="k">Type</div><div class="v">${esc(typeLabel(txType(t)))}</div>
     ${t.program?`<div class="k">Program</div><div class="v"><a class="lnk" href="/zone/${u(z)}/program/${u(t.program)}" title="${esc(t.program)}">${esc(progShort(t.program))}</a></div>`:''}
-    <div class="k">Sequencer</div><div class="v"><a class="lnk" href="/zone/${u(z)}">${esc(z)}</a></div>
-    <div class="k">L2 Block</div><div class="v">#${num(t.block_id)}${t.slot?'  ·  L1 slot '+num(t.slot):''}</div>
-    <div class="k">Accounts (${(t.accounts||[]).length})</div><div class="v">${accLinks(t.accounts)}</div>
+    <div class="k">${t.kind==='raw'?'Channel':'Sequencer'}</div><div class="v"><a class="lnk" href="/zone/${u(z)}">${esc(z)}</a></div>
+    ${t.kind==='raw'
+      ?`<div class="k">L1 slot</div><div class="v">${t.slot?num(t.slot):'—'}</div>`
+      :`<div class="k">L2 Block</div><div class="v">#${num(t.block_id)}${t.slot?'  ·  L1 slot '+num(t.slot):''}</div>
+    <div class="k">Accounts (${(t.accounts||[]).length})</div><div class="v">${accLinks(t.accounts)}</div>`}
     ${t.instruction_data&&t.instruction_data.length?`<div class="k">Instruction</div><div class="v" id="instrval">${instrText(t,null)}</div>`:''}
     ${t.deploy_program?`<div class="k">Deploys program</div><div class="v"><a class="lnk" href="/zone/${u(z)}/program/${u(t.deploy_program)}" title="${esc(t.deploy_program)}">${esc(progShort(t.deploy_program))}</a></div>`:''}
     ${t.bytecode_len?`<div class="k">Guest ELF</div><div class="v">${num(t.bytecode_len)} bytes · <a class="lnk" href="/api/elf/${u(t.hash)}" download>download .elf</a></div>`:''}
     ${t.nullifiers&&t.nullifiers.length?`<div class="k">Nullifiers (${t.nullifiers.length})</div><div class="v">${li(t.nullifiers)}</div>`:''}
     ${t.commitments&&t.commitments.length?`<div class="k">Commitments (${t.commitments.length})</div><div class="v">${li(t.commitments)}</div>`:''}
     ${t.encrypted_outputs!=null?`<div class="k">Encrypted outputs</div><div class="v">${t.encrypted_outputs} (private, opaque)</div>`:''}
-   </div></div>`;
+   </div></div>${t.kind==='raw'?rawPayloadPanel(t):''}`;
   // token-standard transfer: resolve which token (name) via the holding account, then refine
   if(progName(t.program)==='token' && t.instruction_data && t.instruction_data.length>=5 && t.instruction_data[0]===0 && t.accounts && t.accounts[0]){
     try{ const tok=await (await fetch('/api/token_of?account='+u(t.accounts[0])+'&channel='+u(z))).json();
@@ -5283,6 +5386,67 @@ load();
 mod tests {
     use super::*;
 
+    // End-to-end for the guest `f8aab825…`: its 3 raw TEXT inscriptions must each become a
+    // "raw" tx row keyed by the mantle_tx.hash (NOT a garbage block_id), be listed on the
+    // channel (zone) feed, and be retrievable with their decoded content on the detail path.
+    #[test]
+    fn raw_inscriptions_become_rows_and_detail() {
+        let channel = "f8aab825aabbccddeeff00112233445566778899aabbccddeeff001122334455";
+        // (inscription id = mantle_tx.hash, L1 slot, ASCII content) — mirrors the real guest.
+        let items = [
+            ("f27e21db0000000000000000000000000000000000000000000000000000abcd", 187036u64, "dweb-via-paradox #1 17820"),
+            ("58e3fc830000000000000000000000000000000000000000000000000000abcd", 187065, "dweb-via-paradox #2 17829"),
+            ("1aa35a070000000000000000000000000000000000000000000000000000abcd", 187085, "dweb-via-paradox #3 17841"),
+        ];
+
+        let mut recs: Vec<TxRecord> = Vec::new();
+        for (id, slot, text) in items {
+            let block = serde_json::json!({
+                "header": {"id": "abcd", "slot": slot},
+                "transactions": [{"mantle_tx": {"hash": id, "ops": [
+                    {"opcode": 17, "payload": {"channel_id": channel, "inscription": hex::encode(text.as_bytes())}}
+                ]}}]
+            });
+            let mut found = Vec::new();
+            collect_inscriptions(&block, &mut found);
+            assert_eq!(found.len(), 1);
+            let d = decode_inscription_with(&found[0].value, found[0].tx_hash.as_deref()).unwrap();
+            assert!(d.undecodable, "raw text is not a decodable rc5 block");
+            let out = records_from(channel, Some(slot), &d, 0);
+            assert_eq!(out.len(), 1, "one raw tx per inscription");
+            let r = &out[0];
+            assert_eq!(r.hash, id, "keyed by the mantle_tx.hash, not a synthetic id");
+            assert_eq!(r.kind, "raw");
+            assert_eq!(r.block_id, 0, "no synthetic/garbage L2 block id");
+            assert_eq!(r.slot, Some(slot));
+            assert_eq!(r.raw_payload, text.as_bytes());
+            recs.push(r.clone());
+        }
+
+        // persist + read back via the exact paths the zone page (channel feed) and the
+        // tx-detail (get_tx) use.
+        let path = std::env::temp_dir().join(format!("zs-raw-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = db::Db::open(&path).unwrap();
+        db.commit(&recs, &[], &[], &[]).unwrap();
+
+        // zone page: all 3 rows list under the channel feed.
+        let feed = db
+            .feed(&db::FeedOpts { channel: Some(channel), limit: 50, ..Default::default() })
+            .unwrap();
+        assert_eq!(feed.len(), 3, "guest zone page lists 3 raw-inscription rows");
+        assert!(feed.iter().all(|r| r.kind == "raw"));
+
+        // tx-detail: each hash resolves and its content decodes to the guest's text.
+        for (id, _slot, text) in items {
+            let got = db.get_tx(id).unwrap().expect("raw tx retrievable by hash");
+            let (rendered, hex) = raw_payload_repr(&got.raw_payload);
+            assert_eq!(rendered.as_deref(), Some(text), "content shown as UTF-8 text");
+            assert_eq!(hex, hex::encode(text.as_bytes()), "hex dump available too");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn rc5_live_zone_program_ids_recognized() {
         // Program ids key on the canonical LITTLE-ENDIAN byte form (== the decoder's
@@ -5351,12 +5515,12 @@ mod tests {
     }
 
     #[test]
-    fn activity_state_distinguishes_finalizing_clock_and_undecodable() {
+    fn activity_state_distinguishes_finalizing_clock_and_raw() {
         // finalizing: L1-only channel whose settlement tip is above finality.
         let fin = SeqTrack { seq_tip: None, l1_tip_slot: Some(200), ..Default::default() };
         assert_eq!(activity_state(&fin, Some(100)), Some("finalizing"));
 
-        // undecodable (guest f8aab825): finalized, an inscription failed to decode, no user tx.
+        // raw (guest f8aab825): finalized non-block raw inscriptions, no decodable user tx.
         let und = SeqTrack {
             seq_tip: None,
             l1_tip_slot: Some(50),
@@ -5364,7 +5528,7 @@ mod tests {
             saw_undecodable: true,
             ..Default::default()
         };
-        assert_eq!(activity_state(&und, Some(100)), Some("undecodable"));
+        assert_eq!(activity_state(&und, Some(100)), Some("raw"));
 
         // clock-only (82010101): finalized, decodes cleanly, only clock heartbeats.
         let clk = SeqTrack {

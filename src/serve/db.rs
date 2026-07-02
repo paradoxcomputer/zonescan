@@ -89,6 +89,9 @@ fn de<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 /// authenticated_transfer (public *and* private sends collapse here) / program name /
 /// "public". Used by the multi-select Type filter.
 fn rec_type(rec: &TxRecord) -> &str {
+    if rec.kind == "raw" {
+        return "raw"; // a non-block raw inscription (not public/private)
+    }
     if rec.kind == "deploy" {
         return "deploy";
     }
@@ -1096,6 +1099,7 @@ mod tests {
             instruction_data: if private { vec![] } else { vec![0, 42, 0, 0, 0] },
             deploy_program: String::new(),
             bytecode_len: 0,
+            raw_payload: Vec::new(),
             block_id: blk,
             channel: ch.into(),
             channel_short: "ch".into(),
@@ -1159,6 +1163,7 @@ mod tests {
             instruction_data: vec![],
             deploy_program: String::new(),
             bytecode_len: 0,
+            raw_payload: Vec::new(),
             block_id: blk,
             channel: "ch".into(),
             channel_short: "ch".into(),
@@ -1180,6 +1185,7 @@ mod tests {
             instruction_data: vec![200, 0, 0, 0],
             deploy_program: String::new(),
             bytecode_len: 0,
+            raw_payload: Vec::new(),
             block_id: 5,
             channel: "ch".into(),
             channel_short: "ch".into(),
@@ -1212,6 +1218,7 @@ mod tests {
             instruction_data: instr,
             deploy_program: String::new(),
             bytecode_len: 0,
+            raw_payload: Vec::new(),
             block_id: blk,
             channel: "ch".into(),
             channel_short: "ch".into(),

@@ -499,13 +499,14 @@ pub async fn scan_channels(
                 let slot = b.get("header").and_then(|h| jget_u64(h, "slot")).or_else(|| find_u64(b, "slot"));
                 let mut found = Vec::new();
                 collect_inscriptions(b, &mut found);
-                for (cid, ins) in found {
+                for ri in found {
+                    let cid = ri.channel;
                     if let Some(f) = filter {
                         if !f.contains(&cid) {
                             continue;
                         }
                     }
-                    if let Some(d) = decode_inscription(&ins) {
+                    if let Some(d) = decode_inscription_with(&ri.value, ri.tx_hash.as_deref()) {
                         inscriptions += 1;
                         recs.push(ScanRec {
                             channel: cid.clone(),
@@ -680,6 +681,15 @@ pub struct Decoded {
     /// must count it but NOT let its `block_id` corrupt per-channel tip/finality state.
     #[serde(default)]
     pub undecodable: bool,
+    /// For a NON-block ("raw") inscription (undecodable as an rc5 block): the `mantle_tx.hash`
+    /// that carried it on the L1 - its inscription id. Empty for decodable blocks. A transient
+    /// carrier into `records_from`, so it is NOT serialized (populated by `decode_inscription_with`).
+    #[serde(skip)]
+    pub raw_tx_hash: String,
+    /// For a raw inscription: the raw `payload.inscription` bytes, surfaced on the tx-detail as
+    /// UTF-8 text (when printable) or a hex dump. Also transient; not serialized here.
+    #[serde(skip)]
+    pub raw_payload: Vec<u8>,
 }
 
 /// A plausible L2 `block_id` is small (sequencers count up from genesis). Anything at or
@@ -687,7 +697,7 @@ pub struct Decoded {
 pub const MAX_PLAUSIBLE_BLOCK_ID: u64 = 1_000_000_000_000;
 
 /// Raw bytes of an inscription value (array-of-numbers or hex string).
-fn inscription_bytes(ins: &Value) -> Option<Vec<u8>> {
+pub fn inscription_bytes(ins: &Value) -> Option<Vec<u8>> {
     match ins {
         Value::Array(a) => a
             .iter()
@@ -732,7 +742,22 @@ pub fn decode_inscription(ins: &Value) -> Option<Decoded> {
         bedrock_final,
         bedrock_safe,
         undecodable,
+        raw_tx_hash: String::new(),
+        raw_payload: Vec::new(),
     })
+}
+
+/// Decode an inscription and, when it does NOT decode as an rc5 block, attach the carrying
+/// `mantle_tx.hash` (its on-L1 inscription id) and the raw payload bytes. Lets callers surface
+/// a non-block inscription as a first-class "raw inscription" tx keyed by that hash - with its
+/// actual content - instead of dropping it. A decodable block is returned unchanged.
+pub fn decode_inscription_with(ins: &Value, tx_hash: Option<&str>) -> Option<Decoded> {
+    let mut d = decode_inscription(ins)?;
+    if d.undecodable {
+        d.raw_tx_hash = tx_hash.unwrap_or_default().to_string();
+        d.raw_payload = inscription_bytes(ins).unwrap_or_default();
+    }
+    Some(d)
 }
 
 /// Returns `(tx_mix, txs, Some((header_hash_hex, prev_hash_hex, hash_matches_recompute)),
@@ -919,20 +944,44 @@ pub fn builtin_program_ids() -> Vec<(String, String)> {
     Vec::new()
 }
 
-/// Recursively collect `(channel_id_hex, inscription_value)` pairs.
-pub fn collect_inscriptions(v: &Value, out: &mut Vec<(String, Value)>) {
+/// One inscription found inside an L1 block: the channel it targets, the raw inscription
+/// value, and the `mantle_tx.hash` that carried it (its on-L1 id) when the enclosing
+/// transaction states one. The hash is what a NON-block ("raw") inscription is keyed by.
+#[derive(Clone)]
+pub struct RawInscription {
+    pub channel: String,
+    pub tx_hash: Option<String>,
+    pub value: Value,
+}
+
+/// Recursively collect every inscription (`channel_id` + `inscription`) in an L1 block,
+/// carrying the `mantle_tx.hash` of the enclosing transaction. The hash lives on the
+/// `mantle_tx` object (a sibling of its `ops`), so it is threaded down to the ops/payload
+/// where the `channel_id`/`inscription` pair is found.
+pub fn collect_inscriptions(v: &Value, out: &mut Vec<RawInscription>) {
+    collect_inscriptions_ctx(v, None, out);
+}
+
+fn collect_inscriptions_ctx(v: &Value, tx_hash: Option<&str>, out: &mut Vec<RawInscription>) {
     match v {
         Value::Object(o) => {
+            // A `mantle_tx` carries `hash` (the inscription id) alongside its `ops`; adopt it
+            // for everything nested below (the payload objects that hold the inscription).
+            let hash = o.get("hash").and_then(Value::as_str).or(tx_hash);
             if let (Some(cid), Some(ins)) = (o.get("channel_id"), o.get("inscription")) {
-                out.push((jhex(cid), ins.clone()));
+                out.push(RawInscription {
+                    channel: jhex(cid),
+                    tx_hash: hash.map(str::to_string),
+                    value: ins.clone(),
+                });
             }
             for child in o.values() {
-                collect_inscriptions(child, out);
+                collect_inscriptions_ctx(child, hash, out);
             }
         }
         Value::Array(a) => {
             for child in a {
-                collect_inscriptions(child, out);
+                collect_inscriptions_ctx(child, tx_hash, out);
             }
         }
         _ => {}
@@ -1275,8 +1324,8 @@ mod tests {
         let mut out = Vec::new();
         collect_inscriptions(&block, &mut out);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, "0101");
-        assert_eq!(decode_inscription(&out[0].1).unwrap().block_id, 48);
+        assert_eq!(out[0].channel, "0101");
+        assert_eq!(decode_inscription(&out[0].value).unwrap().block_id, 48);
     }
 
     #[test]
@@ -1304,10 +1353,46 @@ mod tests {
         let mut out = Vec::new();
         collect_inscriptions(&block, &mut out);
         assert_eq!(out.len(), 1, "one inscription collected from the v0.2 shape");
-        assert_eq!(out[0].0, channel);
-        let d = decode_inscription(&out[0].1).expect("v0.2 hex-string inscription decodes");
+        assert_eq!(out[0].channel, channel);
+        // the carrying mantle_tx.hash is captured (the inscription id a raw op is keyed by)
+        assert_eq!(out[0].tx_hash.as_deref(), Some("ff"));
+        let d = decode_inscription(&out[0].value).expect("v0.2 hex-string inscription decodes");
         assert_eq!(d.block_id, 42);
         assert_eq!(d.tx_count, 3);
+    }
+
+    // The guest `f8aab825…` shape: a raw TEXT inscription (not a sequencer block). It must be
+    // collected with its carrying mantle_tx.hash, flagged `undecodable` (its leading bytes are
+    // not a plausible block_id), and `decode_inscription_with` must attach the hash + raw bytes
+    // so it can be surfaced as a first-class raw-inscription tx keyed by that hash.
+    #[test]
+    fn raw_text_inscription_carries_hash_and_payload() {
+        let text = "dweb-via-paradox #2 17829";
+        let ins_hex = hex::encode(text.as_bytes());
+        let inscription_id = "1aa35a0714d5b526000000000000000000000000000000000000000000000000";
+        let channel = "f8aab825aabbccddeeff00112233445566778899aabbccddeeff001122334455";
+        let block = json!({
+            "header": {"id": "abcd", "slot": 187085},
+            "transactions": [{"mantle_tx": {"hash": inscription_id, "ops": [
+                {"opcode": 17, "payload": {"channel_id": channel, "inscription": ins_hex}}
+            ]}}]
+        });
+        let mut out = Vec::new();
+        collect_inscriptions(&block, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].channel, channel);
+        assert_eq!(out[0].tx_hash.as_deref(), Some(inscription_id));
+
+        let d = decode_inscription_with(&out[0].value, out[0].tx_hash.as_deref())
+            .expect("raw inscription still yields a Decoded");
+        assert!(d.undecodable, "text is not a decodable rc5 block");
+        assert_eq!(d.raw_tx_hash, inscription_id, "keyed by the mantle_tx.hash");
+        assert_eq!(d.raw_payload, text.as_bytes(), "raw payload bytes preserved");
+        assert_eq!(
+            String::from_utf8(d.raw_payload.clone()).unwrap(),
+            text,
+            "payload decodes back to the guest's ASCII content"
+        );
     }
 
     // rc5 dropped the trailing `bedrock_parent_id` ([u8;32]) from Block; its header +
