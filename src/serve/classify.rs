@@ -362,6 +362,12 @@ pub struct Guess {
     pub margin: f64,
     /// How many of the program's txs fed the fingerprint.
     pub samples: u32,
+    /// `true` for the generic `≈ transfer` fallback: the instruction is unambiguously a
+    /// value-transfer SHAPE (`[variant, u128 amount]`) but no specific program cleared the
+    /// thresholds - so the label describes the OPERATION, not a program identity. Rendered
+    /// with its own tooltip ("value-transfer shape; exact program unresolved").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub generic: bool,
 }
 
 // --- thresholds -------------------------------------------------------------
@@ -452,6 +458,57 @@ pub fn classify(samples: &[Sample], references: &[Profile]) -> Option<Guess> {
         score: (best_score * 1000.0).round() / 1000.0,
         margin: (margin * 1000.0).round() / 1000.0,
         samples: n_samples,
+        generic: false,
+    })
+}
+
+// --- generic `≈ transfer` fallback ------------------------------------------
+//
+// When no SPECIFIC program clears the thresholds (e.g. token vs authenticated_transfer are
+// both `[variant, u128]` - an honest tie), the instruction may still be unambiguously a value
+// transfer. Detect that SHAPE and decode the amount, so the row reads `≈ transfer` with a real
+// amount instead of blank/unknown. Strict precedence (enforced by the callers): verified name >
+// confident specific guess > this generic fallback > plain unknown.
+
+/// Detect the value-transfer shape on ONE public invocation and decode its amount:
+/// `[variant(small u32), u128 amount]` = exactly 5 words, a leading small discriminant, a
+/// plausible u128 at words 1-4 (low word set, HIGH WORDS ZERO - via the classifier's standard
+/// `has_u128_at` probe), and a small account count. Returns the little-endian u128 amount
+/// (which fits u64 since the high words are zero), or None when the shape doesn't fit -
+/// no generic transfer, no amount.
+pub fn transfer_amount(s: &Sample) -> Option<u128> {
+    if s.kind != Kind::Public {
+        return None;
+    }
+    if !(1..=4).contains(&s.accts) {
+        return None;
+    }
+    let w = &s.words;
+    if w.len() != 5 || w[0] > 15 || !has_u128_at(w, 1) {
+        return None;
+    }
+    Some((w[1] as u128) | ((w[2] as u128) << 32))
+}
+
+/// The generic `≈ transfer` guess for a program: every public invocation must fit the
+/// value-transfer shape (`transfer_amount`). Callers must only invoke this AFTER `classify`
+/// returned None, so a confident specific guess (or a verified name) is never overridden.
+pub fn generic_transfer(samples: &[Sample]) -> Option<Guess> {
+    let pubs: Vec<&Sample> = samples.iter().filter(|s| s.kind == Kind::Public).collect();
+    if pubs.is_empty() || !pubs.iter().all(|s| transfer_amount(s).is_some()) {
+        return None;
+    }
+    let n = pubs.len() as u32;
+    // Shape-only evidence: deliberately modest, grows a little with sample count. Below the
+    // UI's 0.6 "lo" threshold so it always renders in the dimmed guess style.
+    let confidence = 0.40 + 0.10 * ((n as f64 / 4.0).clamp(0.0, 1.0));
+    Some(Guess {
+        name: "transfer".into(),
+        confidence: (confidence * 1000.0).round() / 1000.0,
+        score: 0.0,
+        margin: 0.0,
+        samples: n,
+        generic: true,
     })
 }
 
@@ -848,5 +905,61 @@ mod tests {
         assert!(classify(&[], &refs()).is_none());
         let s = vec![Sample::new(Kind::Public, 2, u128w(1))];
         assert!(classify(&s, &[]).is_none());
+    }
+
+    /// The ed01f2f4 case: `[0, 1410065408, 2, 0, 0]` = variant 0 + u128 amount over words 1-4
+    /// = 10,000,000,000. The shape is a value transfer even when no specific program wins.
+    #[test]
+    fn generic_transfer_detects_variant_u128_and_decodes_amount() {
+        let s = Sample::new(Kind::Public, 2, vec![0, 1_410_065_408, 2, 0, 0]);
+        assert_eq!(transfer_amount(&s), Some(10_000_000_000u128));
+        // sibling with amount 1
+        let s1 = Sample::new(Kind::Public, 2, vec![0, 1, 0, 0, 0]);
+        assert_eq!(transfer_amount(&s1), Some(1));
+        // the per-program generic guess: all public samples fit the shape
+        let g = generic_transfer(&[s, s1]).expect("generic transfer should apply");
+        assert_eq!(g.name, "transfer");
+        assert!(g.generic, "must be flagged generic");
+        assert!(g.confidence < 0.6, "shape-only evidence stays modest: {g:?}");
+    }
+
+    #[test]
+    fn generic_transfer_rejects_non_transfer_shapes() {
+        // wrong length (not [variant, u128])
+        assert!(transfer_amount(&Sample::new(Kind::Public, 2, vec![0, 5, 0])).is_none());
+        // high u128 words set => implausible amount
+        assert!(transfer_amount(&Sample::new(Kind::Public, 2, vec![0, 1, 2, 3, 4])).is_none());
+        // leading word too big to be a discriminant
+        assert!(transfer_amount(&Sample::new(Kind::Public, 2, vec![999, 1, 0, 0, 0])).is_none());
+        // zero amount (low word unset)
+        assert!(transfer_amount(&Sample::new(Kind::Public, 2, vec![0, 0, 0, 0, 0])).is_none());
+        // too many accounts
+        assert!(transfer_amount(&Sample::new(Kind::Public, 9, vec![0, 5, 0, 0, 0])).is_none());
+        // non-public kinds never fingerprint as a transfer
+        assert!(transfer_amount(&Sample::new(Kind::Private, 2, vec![0, 5, 0, 0, 0])).is_none());
+        // a program with ONE non-fitting public sample gets no generic guess
+        let mixed = vec![
+            Sample::new(Kind::Public, 2, vec![0, 5, 0, 0, 0]),
+            Sample::new(Kind::Public, 6, vec![7, 9, 11, 3, 3, 3, 3, 3]),
+        ];
+        assert!(generic_transfer(&mixed).is_none(), "mixed shapes stay unknown");
+        // and no samples at all => None
+        assert!(generic_transfer(&[]).is_none());
+    }
+
+    /// Strict precedence: a shape that classifies to a confident SPECIFIC guess (2-account
+    /// `[0, u128]` => token) also fits the generic-transfer shape - but callers try `classify`
+    /// first, so the specific guess wins and generic is only the fallback.
+    #[test]
+    fn specific_guess_takes_precedence_over_generic() {
+        let mut w = vec![0u32];
+        w.extend(u128w(250));
+        let s = vec![Sample::new(Kind::Public, 2, w); 4];
+        // the same samples fit BOTH paths...
+        assert!(generic_transfer(&s).is_some());
+        // ...but classify resolves a specific name, which callers use first.
+        let g = classify(&s, &refs()).expect("specific guess should win");
+        assert_eq!(g.name, "token");
+        assert!(!g.generic);
     }
 }

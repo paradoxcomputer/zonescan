@@ -3167,7 +3167,9 @@ async fn refresh_guesses(app: &AppState) {
         if names.contains_key(id) || !is_raw_program_id(id) {
             continue;
         }
-        if let Some(g) = classify::classify(ss, &refs) {
+        // Strict precedence: confident specific guess first; only when NO specific program
+        // wins, fall back to the generic `≈ transfer` shape detection (never overrides).
+        if let Some(g) = classify::classify(ss, &refs).or_else(|| classify::generic_transfer(ss)) {
             out.insert(id.clone(), g);
         }
     }
@@ -3425,6 +3427,19 @@ fn enrich_tx(app: &AppState, rec: &TxRecord) -> Value {
     if let Value::Object(o) = &mut v {
         if let Some(p) = rec.program.as_deref().filter(|p| is_raw_program_id(p)) {
             if let Some(g) = program_guess(app, p) {
+                // Generic `≈ transfer`: the amount is decodable from the shape even though the
+                // program (and token) stay unresolved - surface the raw integer (token stays
+                // absent). Per-tx re-check: only when THIS instruction fits `[variant, u128]`.
+                if g.generic && rec.kind == "public" && !o.contains_key("amount") {
+                    let s = classify::Sample::new(
+                        classify::Kind::from_str(&rec.kind),
+                        rec.accounts.len() as u16,
+                        rec.instruction_data.clone(),
+                    );
+                    if let Some(amt) = classify::transfer_amount(&s) {
+                        o.insert("amount".into(), json!(amt.to_string()));
+                    }
+                }
                 o.insert("program_guess".into(), json!(g));
             }
         }
@@ -3960,7 +3975,8 @@ async fn api_program(
             let names = program_name_map(&app);
             let sample_pairs: Vec<(String, Vec<classify::Sample>)> = vec![(id.clone(), ss.clone())];
             let refs = build_reference_profiles(&sample_pairs, &names);
-            classify::classify(&ss, &refs)
+            // specific guess first; generic `≈ transfer` only as the fallback.
+            classify::classify(&ss, &refs).or_else(|| classify::generic_transfer(&ss))
         })
     };
 
@@ -4600,14 +4616,20 @@ function progShort(p){ if(p&&PROGS[p]) return PROGS[p]; return (p && /^[0-9a-f]{
 function isRawId(p){ return !!(p && /^[0-9a-f]{40,}$/i.test(p) && !PROGS[p]); }
 // best-guess for a program: the per-row hint (from the tx) or the global GUESS map.
 function guessFor(p,row){ if(p&&PROGS[p]) return null; return (row&&row.program_guess)||GUESS[p]||null; }
+// tooltip for a guess. `generic` = the value-transfer SHAPE fallback (describes the operation,
+// not a program identity); specific guesses carry the fingerprint confidence.
+function guessTip(g){ const n=g.samples?` · ${g.samples} tx${g.samples===1?'':'s'}`:'';
+  if(g.generic) return `value-transfer shape; exact program unresolved — best-guess, unverified`+n;
+  return `best-guess from tx fingerprint — unverified · ${Math.round((g.confidence||0)*100)}% confidence`+n; }
 // render a best-guess as `≈ name` - italic/muted, tooltip, NEVER styled like a verified name.
-function guessHtml(g){ const pc=Math.round((g.confidence||0)*100);
-  const tip=`best-guess from tx fingerprint — unverified · ${pc}% confidence`+(g.samples?` · ${g.samples} tx${g.samples===1?'':'s'}`:'');
+function guessHtml(g){
   const lo=(g.confidence||0)<0.6?' lo':'';
-  return `<span class="pguess${lo}" title="${esc(tip)}"><span class="amp">≈</span> ${esc(g.name)}</span>`; }
+  return `<span class="pguess${lo}" title="${esc(guessTip(g))}"><span class="amp">≈</span> ${esc(g.name)}</span>`; }
 function progCell(t){ if(!t.program) return '-';
+  // A GENERIC guess labels the operation, not the program, so the Program cell keeps the raw
+  // short id (the Type column carries the `≈ transfer`); a specific guess names the program.
   const g=guessFor(t.program,t);
-  const inner=g?guessHtml(g):esc(progShort(t.program));
+  const inner=(g&&!g.generic)?guessHtml(g):esc(progShort(t.program));
   return `<a class="lnk nowrap" href="/zone/${u(t.channel)}/program/${u(t.program)}" title="${esc(t.program)}">${inner}</a>`; }
 // risc0 serializes u128 as 4 little-endian u32 words
 function u128le(w,off){ let v=0n; for(let i=0;i<4;i++){ v += BigInt((w[off+i]||0)>>>0) << BigInt(32*i); } return v; }
@@ -4705,6 +4727,13 @@ function instrText(t,tok){
   // the exact path). We recognize the common shapes; everything carries a "tentative" tag.
   const raw=`<span class="mono" style="font-size:11px;word-break:break-all">[${w.slice(0,20).join(', ')}${w.length>20?', …':''}]</span>`;
   const tag='<span class="htag" title="best-effort guess - no instruction schema is registered for this program; add one to decode exactly">tentative</span>';
+  // (a0) generic value-transfer shape on a program with the `≈ transfer` guess:
+  // [variant(small), u128 amount] with the high words zero => decode the amount.
+  const gg=guessFor(t.program,t);
+  if(gg&&gg.generic&&w.length===5&&(w[0]>>>0)<=15&&!(w[3]||w[4])&&(w[1]||w[2])){
+    const amt=u64le(w,1); // high u128 words are zero, so the amount fits a u64
+    return `${tag}<b>Transfer</b> <b>${amt.toString()}</b> <span class="mut" style="font-size:11px">· value-transfer shape · variant ${w[0]>>>0} · token/program unresolved</span>`+ft();
+  }
   // (a) a length-prefixed printable-ASCII string (e.g. a deployed demo’s text input)
   const str=asAsciiInstr(w);
   if(str) return `${tag}<b>&ldquo;${esc(str)}&rdquo;</b> <span class="mut" style="font-size:11px">· string · ${w.length} words</span>`;
@@ -4893,15 +4922,18 @@ function txAction(t){
   if(name==='pinata') return `Claim native LEZ${a[0]?' to '+accShort(a[0]):''}`;
   if(name==='faucet') return `Faucet dispense ${tok?esc(tok)+' ':''}${a[0]?'to '+accShort(a[0]):''}`.replace(/ +$/,'');
   if(name==='clock') return 'Clock tick';
+  // generic `≈ transfer` fallback: the amount is decoded from the [variant, u128] shape even
+  // though the exact program (and token) stay unresolved.
+  const gg=guessFor(t.program,t);
+  if(gg&&gg.generic&&amt!=null) return `Transfer ${amtS} <span class="mut">(token unresolved)</span>${ft}`;
   const pn=(name&&!/^[0-9a-f]{40,}$/i.test(name))?name.replace(/_/g,' '):progShort(t.program);
   return `${esc(cap(pn||'program'))}${w.length?' · variant '+(w[0]>>>0):''}`;
 }
+// Tx tables show 7 columns (no Accounts - it crowded the rows; accounts stay on tx-detail).
 function txRows(list){
-  if(!list||!list.length) return '<tr><td colspan="8" class="empty">no transactions</td></tr>';
+  if(!list||!list.length) return '<tr><td colspan="7" class="empty">no transactions</td></tr>';
   return list.map(t=>{
     const z=t.channel;
-    const a0=t.accounts&&t.accounts[0];
-    const accs=a0?`<a class="lnk" href="/zone/${u(z)}/wallet/${u(a0)}">${esc(sh(a0,6,4))}</a>`+(t.accounts.length>1?` <span class="mut">+${t.accounts.length-1}</span>`:''):'<span class="mut">-</span>';
     // a raw inscription has no L2 block; locate it by its L1 slot instead of a block height.
     const blockCell=t.kind==='raw'?`<span class="mut nowrap" title="L1 slot">L1 ${t.slot?num(t.slot):'—'}</span>`:`#${num(t.block_id)}`;
     return `<tr>
@@ -4911,11 +4943,10 @@ function txRows(list){
       <td>${finalityBadge(t)||'<span class="mut">-</span>'}</td>
       <td class="mono">${blockCell}</td>
       <td class="mut nowrap">${ageOf(t)}</td>
-      <td><a class="lnk" href="/zone/${u(z)}">${chanLabel(z, t.channel_short)}</a></td>
-      <td>${accs}</td></tr>`;
+      <td><a class="lnk" href="/zone/${u(z)}">${chanLabel(z, t.channel_short)}</a></td></tr>`;
   }).join('');
 }
-const txHead='<thead><tr><th>Txn Hash</th><th>Visibility</th><th>Type</th><th>Status</th><th>Block</th><th>Age</th><th>Zone</th><th>Accounts</th></tr></thead>';
+const txHead='<thead><tr><th>Txn Hash</th><th>Visibility</th><th>Type</th><th>Status</th><th>Block</th><th>Age</th><th>Zone</th></tr></thead>';
 const crumb=(parts)=>`<div style="font-size:13px;color:var(--soft);padding:14px 0 10px">${parts.map((p,i)=>(i?' <span style="color:var(--soft)">/</span> ':'')+(p.href?`<a href="${p.href}">${esc(p.t)}</a>`:`<span style="color:var(--fg)">${esc(p.t)}</span>`)).join('')}</div>`;
 
 // ---- reusable infinite-scroll tx feed (appends into #rows; updates #count) ----
@@ -4930,7 +4961,7 @@ function cursorParams(p,cursor){ if(cursor){ if(cursor.ts!=null) p.set('before_t
 // buildUrl(cursor) -> the fetch URL for the next page (cursor=null for the first).
 function txFeed(buildUrl){
   cur.feed={buildUrl, cursor:null, done:false, loading:false, count:0, first:true, seen:new Set()};
-  const tb=$('rows'); if(tb) tb.innerHTML='<tr><td colspan="8" class="empty">loading…</td></tr>';
+  const tb=$('rows'); if(tb) tb.innerHTML='<tr><td colspan="7" class="empty">loading…</td></tr>';
   attachFeedScroll();
   feedMore();
 }
@@ -4938,7 +4969,7 @@ async function feedMore(){
   const f=cur.feed; if(!f||f.loading||f.done) return; f.loading=true;
   // show a loading row at the bottom while the next page is in flight (not on first load)
   const tb0=$('rows');
-  if(tb0&&!f.first) tb0.insertAdjacentHTML('beforeend','<tr class="loadrow" id="loadrow"><td colspan="8">loading<span class="dot"></span><span class="dot"></span><span class="dot"></span></td></tr>');
+  if(tb0&&!f.first) tb0.insertAdjacentHTML('beforeend','<tr class="loadrow" id="loadrow"><td colspan="7">loading<span class="dot"></span><span class="dot"></span><span class="dot"></span></td></tr>');
   try{
     const resp=await (await fetch(f.buildUrl(f.cursor))).json();
     const list=Array.isArray(resp)?resp:(resp.txs||[]); // /api/txs returns an array; account/token an object
@@ -4948,7 +4979,7 @@ async function feedMore(){
     if(list.length){ tb.insertAdjacentHTML('beforeend', txRows(list)); f.count+=list.length;
       list.forEach(t=>f.seen&&f.seen.add(t.hash));
       const last=list[list.length-1]; f.cursor={ts:last.timestamp, block:last.block_id, hash:last.hash}; }
-    if(!f.count) tb.innerHTML=`<tr><td colspan="8" class="empty">${state&&state.discovering?'⏳ scanning recent L1 blocks…':'no transactions'}</td></tr>`;
+    if(!f.count) tb.innerHTML=`<tr><td colspan="7" class="empty">${state&&state.discovering?'⏳ scanning recent L1 blocks…':'no transactions'}</td></tr>`;
     if(list.length<PAGE) f.done=true;
     const cnt=$('count'); if(cnt) cnt.textContent='';
   }catch(e){ const lr=$('loadrow'); if(lr) lr.remove(); }
@@ -5028,7 +5059,7 @@ function renderHome(){
         ${state&&state.skip_clock?'<span class="mut" style="font-size:12px;white-space:nowrap" title="clock txs tick every block and are not stored">clock ticks not indexed</span>':''}
         <span class="count" id="count"></span></span></div>
       ${filterBar()}
-      <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows"><tr><td colspan="8" class="empty">loading…</td></tr></tbody></table></div>
+      <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows"><tr><td colspan="7" class="empty">loading…</td></tr></tbody></table></div>
     </div>
   </div>`;
   wireFilter(()=>txFeed(homeFeedUrl));
@@ -5137,7 +5168,7 @@ async function renderZone(seq){
   <div class="panel"><div class="phead">Transactions <span class="count" id="count"></span>
     ${state&&state.skip_clock?'<span class="mut" style="margin-left:12px;font-weight:400;font-size:12px" title="clock txs tick every block and are not stored">clock ticks not indexed</span>':''}</div>
     ${filterBar()}
-    <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows"><tr><td colspan="8" class="empty">loading…</td></tr></tbody></table></div></div>`;
+    <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows"><tr><td colspan="7" class="empty">loading…</td></tr></tbody></table></div></div>`;
   cur.feedUrl=(cursor)=>{ const p=new URLSearchParams(); p.set('channel',seq); p.set('limit',PAGE);
     filterParams(p); return '/api/txs?'+cursorParams(p,cursor); };
   wireFilter(()=>txFeed(cur.feedUrl));
@@ -5179,7 +5210,7 @@ async function renderTx(seq,hash){
     <div class="k">Txn Hash</div><div class="v">${esc(t.hash)}</div>
     <div class="k">Visibility</div><div class="v">${cap(txVis(t))}</div>
     <div class="k">Type</div><div class="v">${(()=>{const g=(t.kind==='public')?guessFor(t.program,t):null;return g?guessHtml(g):esc(typeLabel(txType(t)));})()}</div>
-    ${t.program?`<div class="k">Program</div><div class="v"><a class="lnk" href="/zone/${u(z)}/program/${u(t.program)}" title="${esc(t.program)}">${(()=>{const g=guessFor(t.program,t);return g?guessHtml(g)+` <span class="mut mono" style="font-size:11px">${esc(sh(t.program,6,5))}</span>`:esc(progShort(t.program));})()}</a></div>`:''}
+    ${t.program?`<div class="k">Program</div><div class="v"><a class="lnk" href="/zone/${u(z)}/program/${u(t.program)}" title="${esc(t.program)}">${(()=>{const g=guessFor(t.program,t);return (g&&!g.generic)?guessHtml(g)+` <span class="mut mono" style="font-size:11px">${esc(sh(t.program,6,5))}</span>`:esc(progShort(t.program));})()}</a></div>`:''}
     <div class="k">${t.kind==='raw'?'Channel':'Sequencer'}</div><div class="v"><a class="lnk" href="/zone/${u(z)}">${esc(z)}</a></div>
     ${t.kind==='raw'
       ?`<div class="k">L1 slot</div><div class="v">${t.slot?num(t.slot):'—'}</div>`
@@ -5212,15 +5243,17 @@ async function renderTx(seq,hash){
 async function renderProgram(seq,prog){
   cur={kind:'program'};
   const g=guessFor(prog,null);
-  const nameCell=g?guessHtml(g):esc(progShort(prog));
-  const base=[{t:'Home',href:'/'},{t:'Zone '+sh(seq),href:'/zone/'+u(seq)},{t:'Program '+(g?('≈ '+g.name):progShort(prog))}];
+  // generic `≈ transfer` describes the operation, not the program's identity - the header
+  // keeps the short id and the Shape row below carries the `≈ transfer`.
+  const nameCell=(g&&!g.generic)?guessHtml(g):esc(progShort(prog));
+  const base=[{t:'Home',href:'/'},{t:'Zone '+sh(seq),href:'/zone/'+u(seq)},{t:'Program '+((g&&!g.generic)?('≈ '+g.name):progShort(prog))}];
   $('view').innerHTML=crumb(base)+
    `<div class="panel" style="margin-bottom:16px"><div class="phead">Program <span class="count">${nameCell}</span></div>
     <div class="ovw">
       <div><div class="k">Program</div><div class="v" style="font-size:15px;word-break:break-all">${nameCell}</div></div>
       <div><div class="k">Sequencer</div><div class="v" style="font-size:13px"><a class="lnk" href="/zone/${u(seq)}">${esc(sh(seq))}</a></div></div>
     </div>
-    ${g?`<div class="kv" style="padding:0 16px 4px"><div class="k">Name</div><div class="v"><span class="pguess">≈ ${esc(g.name)}</span> <span class="mut" style="font-size:12px">best-guess from tx fingerprint — unverified · ${Math.round((g.confidence||0)*100)}% confidence${g.samples?' · '+g.samples+' tx'+(g.samples===1?'':'s'):''}</span></div></div>`:''}
+    ${g?`<div class="kv" style="padding:0 16px 4px"><div class="k">${g.generic?'Shape':'Name'}</div><div class="v"><span class="pguess">≈ ${esc(g.name)}</span> <span class="mut" style="font-size:12px">${esc(guessTip(g))}</span></div></div>`:''}
     <div class="kv" style="padding:16px"><div class="k">Program id</div><div class="v">${esc(prog)}</div></div>
    </div>
    ${schemaPanel(seq,prog)}
@@ -5709,6 +5742,37 @@ mod tests {
             classify::classify(&a_samples, &refs).map(|g| g.name),
             Some("authenticated_transfer".to_string())
         );
+    }
+
+    /// The ed01f2f4 case: `[variant, u128]` is an honest tie between token and
+    /// authenticated_transfer on thin evidence, so `classify` stays unknown - but the shape is
+    /// unambiguously a value transfer, so the pipeline's fallback yields the generic
+    /// `≈ transfer` guess plus a decodable amount. A non-transfer unknown gets neither.
+    #[test]
+    fn generic_transfer_fallback_after_unconfident_classify() {
+        use classify::{Kind, Sample};
+        // real ed01f2f4 words: variant 0 + u128 over words 1-4 = 10,000,000,000; sibling = 1.
+        let ss = vec![
+            Sample::new(Kind::Public, 2, vec![0, 1_410_065_408, 2, 0, 0]),
+            Sample::new(Kind::Public, 2, vec![0, 1, 0, 0, 0]),
+        ];
+        let refs = build_reference_profiles(&[], &HashMap::new()); // source profiles only
+        assert!(classify::classify(&ss, &refs).is_none(), "honest tie must stay unknown");
+        // the pipeline chain (same as refresh_guesses / api_program): specific, else generic.
+        let g = classify::classify(&ss, &refs)
+            .or_else(|| classify::generic_transfer(&ss))
+            .expect("generic transfer should apply");
+        assert_eq!(g.name, "transfer");
+        assert!(g.generic, "must be flagged generic (own tooltip, no program-name claim)");
+        // the per-tx amount decode the UI/enrich_tx surfaces
+        assert_eq!(classify::transfer_amount(&ss[0]), Some(10_000_000_000));
+        assert_eq!(classify::transfer_amount(&ss[1]), Some(1));
+        // a non-transfer unknown (e.g. 96ad78fe: 2 accts / 52 words) gets NO generic guess
+        // and NO amount.
+        let other = vec![Sample::new(Kind::Public, 2, vec![7u32; 52])];
+        assert!(classify::classify(&other, &refs).is_none());
+        assert!(classify::generic_transfer(&other).is_none());
+        assert!(classify::transfer_amount(&other[0]).is_none());
     }
 
     fn blk(id: u64, hash: &str, prev: &str, ok: bool) -> Decoded {
