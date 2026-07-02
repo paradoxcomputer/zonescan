@@ -2200,6 +2200,14 @@ async fn ingest_seq_chunk(app: &AppState, channel: &str, chunk: &[(u64, Vec<u8>)
             if let Some(d) = decode_inscription(&ins) {
                 ingest(&mut s, channel, Some(*bid), &d, now);
                 let e = s.seqs.entry(channel.to_string()).or_default();
+                // Sequencer-RPC source: every block the sequencer serves has been (or is
+                // being) inscribed to the L1 - settlement is its whole job - so a
+                // non-finalized block here is "on L1, finalizing" (Safe), never grey
+                // "pending". The sequencer freezes/reports bedrock_status only as
+                // Pending/Finalized (never Safe; confirmed on the live rc5 node), so lift
+                // the Safe cursor to the ingested block id ourselves. `finalized_block_id`
+                // still advances only from a genuine bedrock Finalized status (via ingest).
+                raise_finality(e, d.block_id, false);
                 e.observe(&d, now);
                 e.verify(&d);
                 e.seq_tip = Some(e.latest_block_id);
