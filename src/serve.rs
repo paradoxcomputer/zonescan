@@ -2626,6 +2626,7 @@ async fn sequencer_loop(
                 .unwrap_or(0);
             (have + 1, "live")
         };
+        let had_new = next <= tip;
         while next <= tip {
             if app.generation.load(Ordering::SeqCst) != generation {
                 return;
@@ -2652,6 +2653,15 @@ async fn sequencer_loop(
                 let to = (fin + CHUNK).min(tip);
                 let chunk = seq_fetch_chunk(&client, &rpc_url, fin + 1, to).await;
                 ingest_seq_chunk(&app, &channel, &chunk).await;
+            }
+        }
+        // Resolve shield vs deshield now that this round's balances are in the store. The L1-stream
+        // ingest relabels, but the seq-RPC path (this loop) did NOT — so an RPC-tracked channel's
+        // private txs were stuck at the decode-time "shield" default forever. Only when new blocks
+        // landed (relabel is a full replay; no need to re-run on an idle poll).
+        if had_new {
+            if let Some(db) = app.db.clone() {
+                let _ = tokio::task::spawn_blocking(move || db.relabel_privacy()).await;
             }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
