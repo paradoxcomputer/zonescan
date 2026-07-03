@@ -3281,20 +3281,27 @@ async fn refresh_guesses(app: &AppState) {
     // line); `≈token`/`≈ata` non-generic guesses only. The op-structure checks inside
     // `token_mappings` (variant 1 + printable name + sane supply / ata Create shape) are a second
     // safety net against a mis-fingerprint learning garbage.
-    let token_ids: std::collections::HashSet<String> = out
-        .iter()
-        .filter(|(_, g)| g.name == "token" && !g.generic && g.confidence >= 0.6)
-        .map(|(id, _)| id.clone())
-        .collect();
-    let ata_ids: std::collections::HashSet<String> = out
-        .iter()
-        .filter(|(_, g)| g.name == "ata" && !g.generic && g.confidence >= 0.6)
-        .map(|(id, _)| id.clone())
-        .collect();
+    // Resolved program TYPES (id -> (name, confidence, verified)): verified registry names +
+    // classifier guesses. Published to the db so a raw image id resolves to its name EVERYWHERE
+    // - the feed Type filter (token/amm/ata/pinata/clock/…) and the offline token-name learner
+    // both key off it. Insert guesses first, then verified names so a verified name wins.
+    let mut info: std::collections::HashMap<String, (String, f64, bool)> =
+        std::collections::HashMap::new();
+    for (id, g) in &out {
+        info.insert(id.clone(), (g.name.clone(), g.confidence, false));
+    }
+    for (id, name) in &names {
+        info.insert(id.clone(), (name.clone(), 1.0, true));
+    }
+    let has_token_like =
+        out.values().any(|g| matches!(g.name.as_str(), "token" | "ata") && !g.generic);
+    db::set_program_kinds(info);
     *app.guesses.lock().unwrap() = out;
     *app.token_defs.lock().unwrap() = defs;
-    if !token_ids.is_empty() || !ata_ids.is_empty() {
-        db::set_program_kinds(token_ids, ata_ids);
+    // re-mine token names when a foreign token/ata program is now recognized (confidence bar in
+    // is_token_program guards against a low-confidence mislabel; the op-structure check is a
+    // second net).
+    if has_token_like {
         if let Some(db) = app.db.clone() {
             match tokio::task::spawn_blocking(move || db.relearn_tokens()).await {
                 Ok(Ok(n)) if n > 0 => println!("token-name index: learned {n} definition(s) incl. fingerprinted foreign token programs"),

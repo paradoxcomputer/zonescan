@@ -18,7 +18,7 @@
 //! and every index commit atomically. Methods are synchronous (redb commits
 //! fsync); callers run them via `spawn_blocking`.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -47,21 +47,32 @@ const TOKEN_MAP_VERSION: u64 = 1;
 // Bumped when raw-inscription txs need re-timestamping for the recency-ordered global feed.
 const RAW_TS_VERSION: u64 = 1;
 
-/// Program ids the classifier has fingerprinted as `token` / `ata` — foreign builds whose risc0
-/// image id isn't a known built-in, so they'd otherwise be invisible to the token-name learner.
-/// `(token_ids, ata_ids)`, refreshed by [`set_program_kinds`] after each guess pass. Consulted by
-/// `is_token_program`/`is_ata_program`, so every place that recognizes a token/ata op (offline
-/// learning, feed amount+name, tx-detail labels) picks up fingerprinted foreign programs at once.
-/// Process-global: there is exactly one store per process.
-static FINGERPRINTED: LazyLock<RwLock<(HashSet<String>, HashSet<String>)>> =
-    LazyLock::new(|| RwLock::new((HashSet::new(), HashSet::new())));
+/// Resolved TYPE for each program image id: `id -> (name, confidence, verified)`. `verified` = a
+/// registry / getProgramIds name (trusted, confidence 1.0); otherwise a classifier `≈` guess.
+/// Published by [`set_program_kinds`] after each guess pass. Consulted by `is_token_program` /
+/// `is_ata_program` (token learning + display) AND `rec_matches_type` (the feed's Type filter),
+/// so a raw-hex program id resolves to its name EVERYWHERE — fixing "filter by token/amm/ata/…
+/// shows nothing" (programs are stored by raw image id, so the bare `rec_type` is always
+/// "program"). Process-global: exactly one store per process.
+static PROGRAM_INFO: LazyLock<RwLock<HashMap<String, (String, f64, bool)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Publish the classifier's `≈token` / `≈ata` program ids so the token-name learner + display
-/// recognize foreign-build token/ata programs. Call after a guess refresh, then `relearn_tokens`.
-pub fn set_program_kinds(token_ids: HashSet<String>, ata_ids: HashSet<String>) {
-    if let Ok(mut g) = FINGERPRINTED.write() {
-        *g = (token_ids, ata_ids);
+/// Publish resolved program types (verified registry names + classifier guesses) so the db side
+/// resolves a raw image id to its name for type-filtering + token recognition. Call after a guess
+/// refresh, then `relearn_tokens`.
+pub fn set_program_kinds(info: HashMap<String, (String, f64, bool)>) {
+    if let Ok(mut g) = PROGRAM_INFO.write() {
+        *g = info;
     }
+}
+
+/// True when program id `p` resolves (verified, or a guess ≥ `min_conf`) to the name `want`.
+fn program_name_is(p: &str, want: &str, min_conf: f64) -> bool {
+    PROGRAM_INFO
+        .read()
+        .ok()
+        .and_then(|g| g.get(p).map(|(n, c, v)| n.as_str() == want && (*v || *c >= min_conf)))
+        .unwrap_or(false)
 }
 
 /// Cap how many index entries a filtered/account scan will walk, so a rare
@@ -128,6 +139,26 @@ fn rec_type(rec: &TxRecord) -> &str {
         Some(p) => p,
         None => "public",
     }
+}
+
+/// Does `rec` match the wanted feed Type `want`? Beyond the literal `rec_type`, a raw-hex program
+/// id also matches its RESOLVED name (verified registry name or classifier `≈` guess), so the UI's
+/// Type filter — which lists resolved / `≈` names — selects the right txs even though programs are
+/// stored by raw image id (for which `rec_type` alone is always "program").
+fn rec_matches_type(rec: &TxRecord, want: &str) -> bool {
+    if rec_type(rec) == want {
+        return true;
+    }
+    if let Some(p) = rec.program.as_deref() {
+        if p.len() >= 40 && p.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return PROGRAM_INFO
+                .read()
+                .ok()
+                .and_then(|g| g.get(p).map(|(n, _, _)| n.as_str() == want))
+                .unwrap_or(false);
+        }
+    }
+    false
 }
 
 /// The transferred amount (little-endian u128) for a public native or token Transfer,
@@ -223,13 +254,13 @@ fn is_token_program(p: &str) -> bool {
         "token"
             | "6d1ec77d426db847e2a37eb964b78d7870b89f17fc7f2537c0e50046bd8a8150" // rc3
             | "c4584a559312f876bbde4248b1daf95f6fc895a42171734d3ffd32940c0adf24" // rc5
-    ) || FINGERPRINTED.read().is_ok_and(|g| g.0.contains(p))
+    ) || program_name_is(p, "token", 0.6)
 }
 fn is_ata_program(p: &str) -> bool {
     matches!(
         p,
         "ata" | "e4870e1f7ef3df44a22bec5e00d03f7d6ad5fbca7a87a56b38be9d85e2b932a4" // rc5
-    ) || FINGERPRINTED.read().is_ok_and(|g| g.1.contains(p))
+    ) || program_name_is(p, "ata", 0.6)
 }
 
 /// Known token DEFINITION accounts (base58) -> ticker on the deployed zone, as a fallback
@@ -536,7 +567,7 @@ impl Db {
             }
         }
         if let Some(types) = o.types {
-            if !types.iter().any(|x| x == rec_type(rec)) {
+            if !types.iter().any(|x| rec_matches_type(rec, x)) {
                 return false;
             }
         }
@@ -1002,7 +1033,7 @@ impl Db {
                 }
             }
             if let Some(ts) = types {
-                if !ts.iter().any(|x| x == rec_type(rec)) {
+                if !ts.iter().any(|x| rec_matches_type(rec, x)) {
                     return false;
                 }
             }
@@ -1264,6 +1295,10 @@ impl Db {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the process-global PROGRAM_INFO (set_program_kinds) so the
+    /// default parallel test runner can't race them.
+    static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn token_mappings_learns_name_offline() {
         // MED0707 NewFungibleDefinition (variant 1, name len 7, supply 1_000_000)
@@ -1297,7 +1332,8 @@ mod tests {
     /// via `set_program_kinds` - so L1-read-only channels resolve token names with no RPC.
     #[test]
     fn fingerprinted_foreign_token_program_learns_offline() {
-        use std::collections::HashSet;
+        use std::collections::HashMap;
+        let _g = GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ftoken = "dcbbfebcd59399961ed9973b8307dc475fd4c5ca5779aacfe7588f7dbc3f4a71"; // foreign token
         let fata = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // foreign ata
         // NewFungibleDefinition (variant 1, name len 7 "MED0707", supply 1_000_000)
@@ -1311,16 +1347,16 @@ mod tests {
         assert_eq!(token_mappings(&t), (None, None));
         assert_eq!(token_mappings(&a), (None, None));
         // publish the classifier's verdict; now the same ops mine their mappings.
-        set_program_kinds(
-            HashSet::from([ftoken.to_string()]),
-            HashSet::from([fata.to_string()]),
-        );
+        set_program_kinds(HashMap::from([
+            (ftoken.to_string(), ("token".to_string(), 0.9, false)),
+            (fata.to_string(), ("ata".to_string(), 0.9, false)),
+        ]));
         assert_eq!(
             token_mappings(&t),
             (Some(("DEF".into(), "MED0707".into(), 1_000_000)), Some(("SUPPLY".into(), "DEF".into())))
         );
         assert_eq!(token_mappings(&a).1, Some(("ATA".into(), "DEF".into())));
-        set_program_kinds(HashSet::new(), HashSet::new()); // reset the process-global for other tests
+        set_program_kinds(HashMap::new()); // reset the process-global for other tests
     }
 
     /// BUG 2 fix: `finalized_block_for` = highest plausible block whose L1 slot <= lib, so the
@@ -1350,6 +1386,39 @@ mod tests {
         garbage.slot = Some(1);
         db.commit(&[raw, garbage], &[], &[], &[]).unwrap();
         assert_eq!(db.finalized_block_for("ch", 35).unwrap(), Some(3));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// BUG: the feed Type filter matched only rec_type, which is "program" for a raw-hex image id,
+    /// so filtering by a resolved/guessed name (token/amm/…) returned nothing (programs are stored
+    /// by raw id). rec_matches_type now also resolves the id via the published PROGRAM_INFO map.
+    #[test]
+    fn type_filter_matches_resolved_program_name() {
+        use std::collections::HashMap;
+        let _g = GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!("zs-typefilter-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let prog = "dcbbfebcd59399961ed9973b8307dc475fd4c5ca5779aacfe7588f7dbc3f4a71";
+        let mut t = rec("h1", "ch", 1, Some(prog));
+        t.instruction_data = vec![0, 1, 0, 0, 0];
+        t.accounts = vec!["A".into(), "B".into()];
+        db.commit(&[t], &[], &[], &[]).unwrap();
+        let by = |ty: &str| {
+            db.feed(&FeedOpts { types: Some(&[ty.to_string()]), limit: 10, ..Default::default() })
+                .unwrap()
+                .len()
+        };
+        // baseline: a raw-hex id is only the generic "program" type until we publish a name.
+        set_program_kinds(HashMap::new());
+        assert_eq!(by("token"), 0);
+        assert_eq!(by("program"), 1);
+        // publish the guess: "token" now selects it; "amm" doesn't; "program" still does.
+        set_program_kinds(HashMap::from([(prog.to_string(), ("token".to_string(), 0.83, false))]));
+        assert_eq!(by("token"), 1);
+        assert_eq!(by("amm"), 0);
+        assert_eq!(by("program"), 1);
+        set_program_kinds(HashMap::new()); // reset global for other tests
         let _ = std::fs::remove_file(&path);
     }
 
