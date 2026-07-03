@@ -75,6 +75,19 @@ fn program_name_is(p: &str, want: &str, min_conf: f64) -> bool {
         .unwrap_or(false)
 }
 
+/// The resolved name for a program id (verified registry name or a classifier guess), if any.
+fn program_name(p: &str) -> Option<String> {
+    PROGRAM_INFO.read().ok().and_then(|g| g.get(p).map(|(n, _, _)| n.clone()))
+}
+
+/// The faucet enum {GenesisTransferVault, GenesisTransferDirect} is reused byte-for-byte by the
+/// genesis-supply guests (faucet / genesis_supply / genesis_supply_bridge / …). Its variant-0
+/// (GenesisTransferVault) hides the native amount behind an 8-word ProgramId + an embedded base58
+/// recipient string, so no other decoder reaches it.
+fn is_faucet_family(p: &str) -> bool {
+    program_name(p).is_some_and(|n| n == "faucet" || n.starts_with("genesis_supply"))
+}
+
 /// Cap how many index entries a filtered/account scan will walk, so a rare
 /// free-text match can't turn into an unbounded scan.
 const SCAN_CAP: usize = 50_000;
@@ -212,10 +225,18 @@ fn token_display_amount(rec: &TxRecord) -> Option<String> {
     if let Some(a) = transfer_amount(rec) {
         return Some(a.to_string());
     }
-    if !is_token_program(rec.program.as_deref().unwrap_or("")) {
+    let prog = rec.program.as_deref().unwrap_or("");
+    let w = &rec.instruction_data;
+    // faucet-family GenesisTransferVault (variant 0): [disc, ProgramId(8w), base58 String, u128].
+    // The native genesis amount is the TRAILING u128 (final 4 words) — hidden behind the ProgramId
+    // + embedded recipient address, so the transfer/generic decoders never see it. Keyed to the
+    // verified faucet/genesis_supply* name so a look-alike shape can't produce a spurious amount.
+    if w.first().copied() == Some(0) && w.len() >= 14 && is_faucet_family(prog) {
+        return Some(u128_le_at(w, w.len() - 4).to_string());
+    }
+    if !is_token_program(prog) {
         return None;
     }
-    let w = &rec.instruction_data;
     match w.first().copied() {
         // Mint{amount} (5) / Burn{amount} (4): u128 right after the variant tag
         Some(4 | 5) if w.len() >= 5 => Some(u128_le_at(w, 1).to_string()),
@@ -1453,6 +1474,32 @@ mod tests {
             ("authenticated_transfer".to_string(), 0.94, false),
         )]));
         assert_eq!(transfer_amount(&t), Some(15_599_007));
+        set_program_kinds(HashMap::new());
+    }
+
+    /// Review fix: faucet-family GenesisTransferVault (variant 0) hides the native amount as the
+    /// TRAILING u128 behind an 8-word ProgramId + an embedded base58 recipient string, so nothing
+    /// decodes it. Keyed to the verified faucet/genesis_supply* name.
+    #[test]
+    fn faucet_genesis_vault_decodes_trailing_amount() {
+        use std::collections::HashMap;
+        let _g = GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fp = "961277217aa4b6f77ba8fcceb2795247570d8560737f7eb7674cd5278170190c";
+        // [0, ProgramId(8w), len=44 + 11-word string, u128 amount(4w)] = 25 words
+        let mut w = vec![0u32];
+        w.extend([10u32; 8]); // vault ProgramId
+        w.push(44); // base58 recipient string length
+        w.extend([0x4141_4141u32; 11]); // 44-byte address string
+        w.extend([500_000u32, 0, 0, 0]); // trailing u128 amount
+        assert_eq!(w.len(), 25);
+        let mut t = rec("h1", "ch", 1, Some(fp));
+        t.instruction_data = w;
+        t.accounts = vec!["A".into(), "B".into()];
+        // not recognized until the faucet name is published
+        set_program_kinds(HashMap::new());
+        assert_eq!(token_display_amount(&t), None);
+        set_program_kinds(HashMap::from([(fp.to_string(), ("faucet".to_string(), 1.0, true))]));
+        assert_eq!(token_display_amount(&t), Some("500000".to_string()));
         set_program_kinds(HashMap::new());
     }
 
