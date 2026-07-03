@@ -208,8 +208,14 @@ fn transfer_amount(t: &TxRecord) -> Option<i128> {
         _ => return None,
     };
     match kind {
-        // native transfer + pinata faucet: instruction is the u128 amount
-        "native" if w.len() >= 4 => Some(u128_le(&w[0..4])),
+        // rc3/rc4 native transfer + pinata: the instruction IS a bare u128 (4 words, no
+        // discriminant), the amount at offset 0.
+        "native" if w.len() == 4 => Some(u128_le(&w[0..4])),
+        // rc5 wraps native in an ENUM: Transfer is variant 0 with the u128 at offset 1
+        // (`[0, u128]` = 5 words — the same shape as a token Transfer). A non-Transfer variant
+        // (e.g. the 1-word CreateAccount `[1]`) carries no amount. Without this, a rc5 transfer
+        // of 40 mis-reads `u128_le(w[0..4])` = 40<<32 = 171_798_691_840.
+        "native" if w.len() == 5 && w[0] == 0 => Some(u128_le(&w[1..5])),
         // token Transfer (variant 0): instruction is [0, u128 amount]
         "token" if w.len() >= 5 && w[0] == 0 => Some(u128_le(&w[1..5])),
         _ => None,
@@ -1501,6 +1507,26 @@ mod tests {
         set_program_kinds(HashMap::from([(fp.to_string(), ("faucet".to_string(), 1.0, true))]));
         assert_eq!(token_display_amount(&t), Some("500000".to_string()));
         set_program_kinds(HashMap::new());
+    }
+
+    /// Review fix: rc5 authenticated_transfer is an ENUM — variant 0 Transfer = `[0, u128]` (amount
+    /// at offset 1), NOT a bare u128 at offset 0 (which mis-read a transfer of 40 as 40<<32). A
+    /// 1-word variant (create-account) carries no amount. rc3/rc4 bare-u128 stays offset 0.
+    #[test]
+    fn rc5_native_enum_transfer_amount() {
+        let auth5 = "d9a19237236822b1f8100576ebd19a19f74178f99e284c983a4ac44acbd5b472"; // rc5
+        let mut t = rec("h1", "ch", 1, Some(auth5));
+        t.instruction_data = vec![0, 40, 0, 0, 0]; // variant 0 Transfer{40}
+        t.accounts = vec!["S".into(), "R".into()];
+        assert_eq!(transfer_amount(&t), Some(40)); // was 40<<32 = 171_798_691_840
+        t.instruction_data = vec![1]; // variant 1 = create/register account
+        t.accounts = vec!["A".into()];
+        assert_eq!(transfer_amount(&t), None);
+        // rc3/rc4 bare u128 (4 words) still reads the amount at offset 0
+        let auth3 = "a96e088942d7fc09afc7b1db5221558c67f772ac8130d04df1c086dc07ab8b7b"; // rc3
+        let mut u = rec("h2", "ch", 2, Some(auth3));
+        u.instruction_data = vec![20_429_163, 0, 0, 0];
+        assert_eq!(transfer_amount(&u), Some(20_429_163));
     }
 
     fn rec(hash: &str, ch: &str, blk: u64, program: Option<&str>) -> TxRecord {

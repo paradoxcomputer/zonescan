@@ -4860,11 +4860,18 @@ function instrText(t,tok){
     if(v===3) return `<b>InitializeAccount</b>`;
     return `<b>${esc(tn||('variant '+v))}</b> <span class="mono mut" style="font-size:11px;word-break:break-all">[${w.slice(1,17).join(', ')}${w.length>17?', …':''}]</span>`;
   }
-  // native LEZ (authenticated_transfer Instruction = u128 balance_to_move, 4 words)
-  if(name==='authenticated_transfer' && w.length>=4){
-    const amt=u128le(w,0);
-    if(amt===0n) return `<b>Register</b> - initialize native account`+(a[0]?` · ${acc(0)}`:'');
-    return `<b>Transfer</b> <b>${amt.toString()}</b> <b>LEZ</b> <span class="mut" style="font-size:11px">(native)</span>`+ft();
+  // native LEZ authenticated_transfer. rc3/rc4: a BARE u128 balance (4 words, amount@0, 0=register).
+  // rc5 wraps it in an ENUM: variant 0 = Transfer{u128} ([0, u128], amount@1); a 1-word variant 1
+  // = create/register a native account (no amount) — so [1] reads as "Register", not a bogus amount.
+  if(name==='authenticated_transfer'){
+    const v=w[0]>>>0;
+    if(w.length===5 && v===0) return `<b>Transfer</b> <b>${u128le(w,1).toString()}</b> <b>LEZ</b> <span class="mut" style="font-size:11px">(native)</span>`+ft();
+    if(w.length===1 && v===1) return `<b>Register</b> - create native account`+(a[0]?` · ${acc(0)}`:'');
+    if(w.length>=4){
+      const amt=u128le(w,0);
+      if(amt===0n) return `<b>Register</b> - initialize native account`+(a[0]?` · ${acc(0)}`:'');
+      return `<b>Transfer</b> <b>${amt.toString()}</b> <b>LEZ</b> <span class="mut" style="font-size:11px">(native)</span>`+ft();
+    }
   }
   // clock tick = u64 block timestamp (ms)
   if(name==='clock' && w.length>=2){
