@@ -5500,7 +5500,7 @@ function schemaPanel(seq,prog){
   const have = SCHEMAS[prog];
   if(have) return `<div class="panel" style="margin-bottom:16px"><div class="phead">Instruction schema</div>
     <div style="padding:16px"><div class="mut" style="font-size:12px;margin-bottom:8px">A schema is registered - instructions decode into typed fields.</div>
-    <pre class="mono" style="font-size:12px;background:var(--panel2,#f4f4f5);padding:10px;border-radius:6px;overflow:auto;margin:0">${esc(JSON.stringify(have,null,2))}</pre></div></div>`;
+    <pre class="mono" style="font-size:12px;background:var(--panel2,#f4f4f5);padding:10px;border-radius:6px;overflow:auto;margin:0;white-space:pre-wrap;word-break:break-all">${esc(JSON.stringify(have))}</pre></div></div>`;
   if(!isCustom) return '';
   return `<div class="panel" style="margin-bottom:16px"><div class="phead">Instruction schema (ABI) <span class="count">propose</span></div>
     <div style="padding:16px">
