@@ -251,11 +251,16 @@ fn token_mappings(rec: &TxRecord) -> (Option<(String, String, u128)>, Option<(St
     let w = &rec.instruction_data;
     let a = &rec.accounts;
     // token NewFungibleDefinition{name, total_supply} (variant 1); accounts [definition, supply]
-    if is_token_program(prog) && w.first().copied() == Some(1) && a.len() >= 2 {
+    // - but some builds carry only the [definition] account (no separate supply holding), so
+    // accept a single account too: still learn definition -> name (the supply map only when a
+    // second account is present). Without this a 1-account def program (e.g. foreign dcbbfebc)
+    // never has its token name learned, so its transfers can't resolve one.
+    if is_token_program(prog) && w.first().copied() == Some(1) && !a.is_empty() {
         let name = r0_string(w, 1);
         let supply = u128_le_at(w, 1 + r0_str_words(w, 1));
         if !name.is_empty() {
-            return (Some((a[0].clone(), name, supply)), Some((a[1].clone(), a[0].clone())));
+            let supply_map = (a.len() >= 2).then(|| (a[1].clone(), a[0].clone()));
+            return (Some((a[0].clone(), name, supply)), supply_map);
         }
     }
     // ata Create (variant 0); accounts [owner, definition, ata]
@@ -1276,6 +1281,15 @@ mod tests {
         a.instruction_data = vec![0u32];
         a.accounts = vec!["OWNER".into(), "DEF".into(), "ATA".into()];
         assert_eq!(token_mappings(&a).1, Some(("ATA".into(), "DEF".into())));
+        // 1-account NewFungibleDefinition (some builds carry only [definition], no supply):
+        // still learn definition -> name, with no supply map (the live dcbbfebc case).
+        let mut one = rec("h3", "ch", 1, Some("token"));
+        one.instruction_data = vec![1u32, 7, 809780557, 3616823, 1_000_000, 0, 0, 0];
+        one.accounts = vec!["DEFONLY".into()];
+        assert_eq!(
+            token_mappings(&one),
+            (Some(("DEFONLY".into(), "MED0707".into(), 1_000_000)), None)
+        );
     }
 
     /// BUG 1 fix: a FOREIGN-build token/ata program (image id unknown to the built-in match) is
