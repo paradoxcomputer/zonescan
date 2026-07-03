@@ -3428,6 +3428,23 @@ struct SchemaSubmit {
     /// validate only, don't store.
     #[serde(default)]
     dry: bool,
+    /// optional program-name alias to register ALONGSIDE the schema. Applied only when the schema
+    /// validates AND the program is currently unnamed (so an open submitter can't override a
+    /// built-in / registry name), first name wins.
+    #[serde(default)]
+    name: String,
+}
+
+/// Sanitize an open-submitted program-name alias: trim, drop control chars, cap the length.
+/// Rendering escapes HTML, so this only needs to bound length + strip control/formatting noise.
+fn sanitize_program_name(s: &str) -> String {
+    s.trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(32)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Open schema submission: anyone can propose an instruction schema for a program. It's
@@ -3472,21 +3489,41 @@ async fn api_schema_submit(
             .iter()
             .any(|s| s.id.trim().trim_start_matches("0x").to_ascii_lowercase() == id)
     };
+    // optional program-name alias: only for a genuinely UNNAMED program (don't let an open
+    // submitter override a built-in / registry name), and only tied to a VALID schema submission.
+    let alias = sanitize_program_name(&req.name);
+    let can_name = !alias.is_empty() && !program_name_map(&app).contains_key(&id);
     let mut stored = false;
-    if valid && !req.dry && !exists {
+    let mut named = false;
+    if valid && !req.dry {
+        let mut changed = false;
         {
             let mut c = app.config.lock().unwrap();
-            c.program_schemas.push(ProgSchema { id: id.clone(), instruction: req.instruction.clone() });
+            if !exists {
+                c.program_schemas.push(ProgSchema { id: id.clone(), instruction: req.instruction.clone() });
+                stored = true;
+                changed = true;
+            }
+            let has_alias = c
+                .program_names
+                .iter()
+                .any(|p| p.id.trim().trim_start_matches("0x").to_ascii_lowercase() == id);
+            if can_name && !has_alias {
+                c.program_names.push(ProgName { id: id.clone(), name: alias.clone() });
+                named = true;
+                changed = true;
+            }
         }
-        let snap = app.config.lock().unwrap().clone();
-        if let Err(e) = save_config(&app.config_path, &snap) {
-            eprintln!("schema submit: save failed: {e:#}");
+        if changed {
+            let snap = app.config.lock().unwrap().clone();
+            if let Err(e) = save_config(&app.config_path, &snap) {
+                eprintln!("schema submit: save failed: {e:#}");
+            }
         }
-        stored = true;
     }
     Json(json!({
         "ok": true, "valid": valid, "passed": passed, "tested": tested,
-        "stored": stored, "already_exists": exists,
+        "stored": stored, "named": named, "already_exists": exists,
     }))
 }
 
@@ -5468,6 +5505,7 @@ function schemaPanel(seq,prog){
   return `<div class="panel" style="margin-bottom:16px"><div class="phead">Instruction schema (ABI) <span class="count">propose</span></div>
     <div style="padding:16px">
       <div class="hint" style="margin-bottom:8px">No schema yet, so instructions show as raw words. Anyone can propose one - paste the program's <b>instruction type</b>. It's accepted only if it decodes this program's <b>real on-chain instructions exactly</b>. Examples: <code>{"struct":[{"name":"message","type":"bytes"}]}</code> · <code>{"enum":[{"name":"Greet","fields":[{"name":"msg","type":"string"}]}]}</code></div>
+      ${!PROGS[prog] ? `<input id="schemaname" type="text" maxlength="32" placeholder="program name alias (optional) — e.g. my_token" title="registered alongside the schema only if it validates and this program is still unnamed" style="width:100%;box-sizing:border-box;font-size:13px;padding:8px;border:1px solid var(--line2);border-radius:6px;margin-bottom:8px">` : ''}
       <textarea id="schemainput" rows="3" placeholder='{"struct":[{"name":"message","type":"bytes"}]}' style="width:100%;box-sizing:border-box;font-family:var(--mono);font-size:12px;padding:9px;border:1px solid var(--line2);border-radius:6px"></textarea>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="kbtn" onclick="previewSchema('${esc(seq)}','${esc(prog)}')">Preview</button>
@@ -5495,11 +5533,16 @@ async function submitSchema(seq,prog){
   const sc=getSchemaInput(), msg=$('schemamsg');
   if(sc===undefined){ msg.innerHTML='<span style="color:var(--red)">invalid JSON</span>'; return; }
   if(sc===null){ msg.innerHTML='<span class="mut">paste a schema first</span>'; return; }
+  const nameEl=$('schemaname'), name=nameEl?nameEl.value.trim():'';
   msg.textContent='validating…';
   try{
-    const r=await (await fetch('/api/schemas/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({channel:seq,program_id:prog,instruction:sc})})).json();
+    const r=await (await fetch('/api/schemas/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({channel:seq,program_id:prog,instruction:sc,name})})).json();
     if(!r.ok){ msg.innerHTML='<span style="color:var(--red)">'+esc(r.error||'error')+'</span>'; }
-    else if(r.stored){ msg.innerHTML='<span style="color:var(--green)">✓ accepted ('+r.passed+'/'+r.tested+' instructions) - reloading…</span>'; await loadSchemas(); setTimeout(()=>renderProgram(seq,prog),1100); }
+    else if(r.stored||r.named){
+      const bits=[]; if(r.stored) bits.push('schema accepted ('+r.passed+'/'+r.tested+')'); if(r.named) bits.push('named &ldquo;'+esc(name)+'&rdquo;');
+      msg.innerHTML='<span style="color:var(--green)">✓ '+bits.join(' · ')+' - reloading…</span>';
+      await loadSchemas(); if(r.named) await loadProgs(); setTimeout(()=>renderProgram(seq,prog),1100);
+    }
     else if(r.already_exists){ msg.innerHTML='<span class="mut">a schema is already registered for this program</span>'; }
     else { msg.innerHTML='<span style="color:var(--red)">✗ rejected - decodes only '+r.passed+'/'+r.tested+' instructions exactly</span>'; }
   }catch(e){ msg.textContent='error: '+e; }
