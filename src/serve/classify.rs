@@ -562,6 +562,24 @@ pub fn transfer_amount(s: &Sample) -> Option<u128> {
     Some((w[1] as u128) | ((w[2] as u128) << 32))
 }
 
+/// The bare-u128 native-transfer amount: EXACTLY 4 words, a 2-account instruction, the high two
+/// words zero (amount fits u64) and the low half nonzero. This is the authenticated_transfer native
+/// shape — a u128 amount with NO leading discriminant — which `transfer_amount` deliberately skips
+/// (it requires a leading variant byte `<= 15`, but here the leading word IS the amount). The
+/// high-words-zero requirement is what separates it from a pinata PoW SOLUTION (a WIDE 128-bit
+/// value), so a solution is never mislabeled as an amount. Guess-INDEPENDENT: it decodes even when
+/// the classifier hasn't named the foreign program (its `≈` guess drifts with the live sample set).
+pub fn native_bare_amount(s: &Sample) -> Option<u128> {
+    if s.kind != Kind::Public || s.accts != 2 {
+        return None;
+    }
+    let w = &s.words;
+    if w.len() != 4 || w[2] != 0 || w[3] != 0 || (w[0] == 0 && w[1] == 0) {
+        return None;
+    }
+    Some((w[0] as u128) | ((w[1] as u128) << 32))
+}
+
 /// The generic `≈ transfer` guess for a program: every public invocation must fit the
 /// value-transfer shape (`transfer_amount`). Callers must only invoke this AFTER `classify`
 /// returned None, so a confident specific guess (or a verified name) is never overridden.
@@ -1016,6 +1034,23 @@ mod tests {
         assert_eq!(g.name, "transfer");
         assert!(g.generic, "must be flagged generic");
         assert!(g.confidence < 0.6, "shape-only evidence stays modest: {g:?}");
+    }
+
+    #[test]
+    fn native_bare_amount_decodes_authenticated_transfer_shape() {
+        // [amount, 0, 0, 0], 2 accounts, high words zero => the bare-u128 transfer amount.
+        assert_eq!(native_bare_amount(&Sample::new(Kind::Public, 2, vec![11_094_836, 0, 0, 0])), Some(11_094_836));
+        // an amount that spills into the second word
+        assert_eq!(native_bare_amount(&Sample::new(Kind::Public, 2, vec![7, 3, 0, 0])), Some(7 | (3u128 << 32)));
+        // a WIDE pinata solution (high words set) is NOT an amount
+        assert_eq!(native_bare_amount(&Sample::new(Kind::Public, 2, vec![1, 2, 3, 4])), None);
+        // wrong length, wrong account count, all-zero => None
+        assert_eq!(native_bare_amount(&Sample::new(Kind::Public, 2, vec![5, 0, 0, 0, 0])), None);
+        assert_eq!(native_bare_amount(&Sample::new(Kind::Public, 3, vec![5, 0, 0, 0])), None);
+        assert_eq!(native_bare_amount(&Sample::new(Kind::Public, 1, vec![5, 0, 0, 0])), None);
+        assert_eq!(native_bare_amount(&Sample::new(Kind::Public, 2, vec![0, 0, 0, 0])), None);
+        // private txs never fingerprint as a bare transfer
+        assert_eq!(native_bare_amount(&Sample::new(Kind::Private, 2, vec![5, 0, 0, 0])), None);
     }
 
     #[test]

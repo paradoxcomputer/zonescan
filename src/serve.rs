@@ -3576,7 +3576,12 @@ fn enrich_tx(app: &AppState, rec: &TxRecord) -> Value {
                     rec.accounts.len() as u16,
                     rec.instruction_data.clone(),
                 );
-                if let Some(amt) = classify::transfer_amount(&s) {
+                // `[variant<=15, u128]` OR the bare-u128 native shape (authenticated_transfer:
+                // 4 words, no discriminant) — the latter decodes even when the program's `≈` guess
+                // has drifted out (guesses fluctuate with the live sample set).
+                if let Some(amt) =
+                    classify::transfer_amount(&s).or_else(|| classify::native_bare_amount(&s))
+                {
                     o.insert("amount".into(), json!(amt.to_string()));
                     let symbol = g.as_ref().and_then(|g| g.token.clone()).or_else(|| {
                         let defs = app.token_defs.lock().unwrap();
