@@ -181,6 +181,17 @@ fn transfer_amount(t: &TxRecord) -> Option<i128> {
         | "6d1ec77d426db847e2a37eb964b78d7870b89f17fc7f2537c0e50046bd8a8150" // rc3 token
         | "c4584a559312f876bbde4248b1daf95f6fc895a42171734d3ffd32940c0adf24" // rc5 token
             => "token",
+        // a FOREIGN build named only by the classifier guess (its raw image id isn't a known
+        // built-in): recognize it via the published PROGRAM_INFO map so its amount still decodes.
+        // authenticated_transfer is a BARE u128 (no discriminant) — which is exactly why the
+        // generic `[variant<=15, u128]` shape probe misses it: its leading word IS the amount.
+        p if program_name_is(p, "authenticated_transfer", 0.6)
+            || program_name_is(p, "pinata", 0.6)
+            || program_name_is(p, "pinata_token", 0.6) =>
+        {
+            "native"
+        }
+        p if is_token_program(p) => "token",
         _ => return None,
     };
     match kind {
@@ -1420,6 +1431,29 @@ mod tests {
         assert_eq!(by("program"), 1);
         set_program_kinds(HashMap::new()); // reset global for other tests
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review fix: a FOREIGN authenticated_transfer (BARE u128, no discriminant) named only by the
+    /// classifier guess must still decode its amount — the generic `[variant<=15, u128]` shape
+    /// probe can't, because its leading word IS the amount (usually > 15).
+    #[test]
+    fn foreign_authenticated_transfer_decodes_bare_u128_amount() {
+        use std::collections::HashMap;
+        let _g = GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fauth = "66f6a58d92c159c3c13ea54d1e37a68a814f0fd3b8fd44b7d35c0617ac4456f8";
+        let mut t = rec("h1", "ch", 1, Some(fauth));
+        t.instruction_data = vec![15599007, 0, 0, 0]; // bare u128, 4 words, no discriminant
+        t.accounts = vec!["SRC".into(), "DST".into()];
+        // unrecognized until the guess is published -> no amount.
+        set_program_kinds(HashMap::new());
+        assert_eq!(transfer_amount(&t), None);
+        // publish the ≈authenticated_transfer guess -> the bare u128 decodes.
+        set_program_kinds(HashMap::from([(
+            fauth.to_string(),
+            ("authenticated_transfer".to_string(), 0.94, false),
+        )]));
+        assert_eq!(transfer_amount(&t), Some(15_599_007));
+        set_program_kinds(HashMap::new());
     }
 
     fn rec(hash: &str, ch: &str, blk: u64, program: Option<&str>) -> TxRecord {
