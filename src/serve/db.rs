@@ -18,15 +18,16 @@
 //! and every index commit atomically. Methods are synchronous (redb commits
 //! fsync); callers run them via `spawn_blocking`.
 
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, RwLock};
 
 use anyhow::Result;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use super::{AcctBal, SeqTrack, TxRecord};
+use super::{AcctBal, SeqTrack, TxRecord, MAX_PLAUSIBLE_BLOCK_ID};
 
 const TXS: TableDefinition<&str, &[u8]> = TableDefinition::new("txs");
 const IDX_FEED: TableDefinition<&[u8], &str> = TableDefinition::new("idx_feed");
@@ -45,6 +46,23 @@ const HOLDING_DEF: TableDefinition<&str, &str> = TableDefinition::new("holding_d
 const TOKEN_MAP_VERSION: u64 = 1;
 // Bumped when raw-inscription txs need re-timestamping for the recency-ordered global feed.
 const RAW_TS_VERSION: u64 = 1;
+
+/// Program ids the classifier has fingerprinted as `token` / `ata` — foreign builds whose risc0
+/// image id isn't a known built-in, so they'd otherwise be invisible to the token-name learner.
+/// `(token_ids, ata_ids)`, refreshed by [`set_program_kinds`] after each guess pass. Consulted by
+/// `is_token_program`/`is_ata_program`, so every place that recognizes a token/ata op (offline
+/// learning, feed amount+name, tx-detail labels) picks up fingerprinted foreign programs at once.
+/// Process-global: there is exactly one store per process.
+static FINGERPRINTED: LazyLock<RwLock<(HashSet<String>, HashSet<String>)>> =
+    LazyLock::new(|| RwLock::new((HashSet::new(), HashSet::new())));
+
+/// Publish the classifier's `≈token` / `≈ata` program ids so the token-name learner + display
+/// recognize foreign-build token/ata programs. Call after a guess refresh, then `relearn_tokens`.
+pub fn set_program_kinds(token_ids: HashSet<String>, ata_ids: HashSet<String>) {
+    if let Ok(mut g) = FINGERPRINTED.write() {
+        *g = (token_ids, ata_ids);
+    }
+}
 
 /// Cap how many index entries a filtered/account scan will walk, so a rare
 /// free-text match can't turn into an unbounded scan.
@@ -205,13 +223,13 @@ fn is_token_program(p: &str) -> bool {
         "token"
             | "6d1ec77d426db847e2a37eb964b78d7870b89f17fc7f2537c0e50046bd8a8150" // rc3
             | "c4584a559312f876bbde4248b1daf95f6fc895a42171734d3ffd32940c0adf24" // rc5
-    )
+    ) || FINGERPRINTED.read().is_ok_and(|g| g.0.contains(p))
 }
 fn is_ata_program(p: &str) -> bool {
     matches!(
         p,
         "ata" | "e4870e1f7ef3df44a22bec5e00d03f7d6ad5fbca7a87a56b38be9d85e2b932a4" // rc5
-    )
+    ) || FINGERPRINTED.read().is_ok_and(|g| g.1.contains(p))
 }
 
 /// Known token DEFINITION accounts (base58) -> ticker on the deployed zone, as a fallback
@@ -550,6 +568,52 @@ impl Db {
         true
     }
 
+    /// The highest plausible sequencer block on `channel` whose L1 inscription slot is at or
+    /// below `lib` (the L1 last-irreversible slot) - i.e. the block id that should read "final".
+    /// Walks the channel index newest-first (block ids descending) and returns the first block
+    /// whose stored L1 slot <= lib; since block ids and L1 slots increase together, that first
+    /// match from the top IS the maximum finalized block. Skips raw inscriptions and undecodable
+    /// (garbage-id) rows. Bounded by the "finalizing" band above lib (the finality lag in blocks).
+    ///
+    /// This is the fix for the frozen-`finalized_block_id` bug: the ingest paths only mark a
+    /// block final if its slot was already <= lib when first observed, and live blocks always
+    /// arrive above lib - so nothing promoted them as lib advanced. Recomputing from the stored
+    /// per-block slots heals both the live case and any accumulated backlog.
+    pub fn finalized_block_for(&self, channel: &str, lib: u64) -> Result<Option<u64>> {
+        let r = self.db.begin_read()?;
+        let idx = match r.open_table(IDX_CHANNEL) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let txs = match r.open_table(TXS) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let mut prefix0 = channel.as_bytes().to_vec();
+        prefix0.push(0);
+        let mut hi = channel.as_bytes().to_vec();
+        hi.push(1);
+        let mut scanned = 0usize;
+        for item in idx.range(prefix0.as_slice()..hi.as_slice())? {
+            let (_, v) = item?;
+            let Some(g) = txs.get(v.value())? else { continue };
+            let rec: TxRecord = de(g.value())?;
+            // a raw inscription or an undecodable block carries a garbage block id / no real
+            // slot - never let it set the finalized frontier.
+            if rec.kind == "raw" || rec.block_id >= MAX_PLAUSIBLE_BLOCK_ID {
+                continue;
+            }
+            if rec.slot.is_some_and(|s| s <= lib) {
+                return Ok(Some(rec.block_id));
+            }
+            scanned += 1;
+            if scanned >= SCAN_CAP {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
     /// Resolve which token an account belongs to from the on-chain mappings learned at
     /// ingest (no sequencer RPC). `account` may be a definition or a holding/ATA. Returns
     /// (definition, name, supply).
@@ -630,17 +694,13 @@ impl Db {
         Ok(())
     }
 
-    /// One-time backfill: scan stored txs for token/ata ops and populate the token-name
-    /// maps, so tokens indexed before this feature resolve offline too. Gated by a version.
-    pub fn backfill_token_mappings(&self) -> Result<usize> {
-        {
-            let r = self.db.begin_read()?;
-            if let Ok(m) = r.open_table(META) {
-                if m.get("token_map_version")?.map(|v| v.value()) == Some(TOKEN_MAP_VERSION) {
-                    return Ok(0);
-                }
-            }
-        }
+    /// Re-scan every stored tx and (re)populate the offline token-name maps (`token_def` /
+    /// `holding_def`). UNGATED, so it re-runs whenever the fingerprint-recognized token/ata set
+    /// changes (see [`set_program_kinds`]) - that is what lets FOREIGN-build token programs, named
+    /// only by the classifier's `≈token`/`≈ata` guess, get their `NewFungibleDefinition` names +
+    /// ATA links learned, so transfers resolve their token name OFFLINE (e.g. on L1-read-only
+    /// channels with no sequencer RPC). Returns the definition count learned.
+    pub fn relearn_tokens(&self) -> Result<usize> {
         let mut defs: Vec<(String, String)> = Vec::new();
         let mut holds: Vec<(String, String)> = Vec::new();
         {
@@ -660,6 +720,9 @@ impl Db {
             }
         }
         let n = defs.len();
+        if defs.is_empty() && holds.is_empty() {
+            return Ok(0);
+        }
         let w = self.db.begin_write()?;
         {
             let mut tdef = w.open_table(TOKEN_DEF)?;
@@ -670,6 +733,26 @@ impl Db {
             for (h, d) in &holds {
                 hdef.insert(h.as_str(), d.as_str())?;
             }
+        }
+        w.commit()?;
+        Ok(n)
+    }
+
+    /// One-time backfill: populate the token-name maps from stored txs so tokens indexed before
+    /// this feature resolve offline too. Version-gated (runs once); ongoing + foreign-program
+    /// re-learning goes through [`Db::relearn_tokens`].
+    pub fn backfill_token_mappings(&self) -> Result<usize> {
+        {
+            let r = self.db.begin_read()?;
+            if let Ok(m) = r.open_table(META) {
+                if m.get("token_map_version")?.map(|v| v.value()) == Some(TOKEN_MAP_VERSION) {
+                    return Ok(0);
+                }
+            }
+        }
+        let n = self.relearn_tokens()?;
+        let w = self.db.begin_write()?;
+        {
             let mut m = w.open_table(META)?;
             m.insert("token_map_version", TOKEN_MAP_VERSION)?;
         }
@@ -1193,6 +1276,67 @@ mod tests {
         a.instruction_data = vec![0u32];
         a.accounts = vec!["OWNER".into(), "DEF".into(), "ATA".into()];
         assert_eq!(token_mappings(&a).1, Some(("ATA".into(), "DEF".into())));
+    }
+
+    /// BUG 1 fix: a FOREIGN-build token/ata program (image id unknown to the built-in match) is
+    /// mined for token mappings ONLY after the classifier's `≈token`/`≈ata` guess is published
+    /// via `set_program_kinds` - so L1-read-only channels resolve token names with no RPC.
+    #[test]
+    fn fingerprinted_foreign_token_program_learns_offline() {
+        use std::collections::HashSet;
+        let ftoken = "dcbbfebcd59399961ed9973b8307dc475fd4c5ca5779aacfe7588f7dbc3f4a71"; // foreign token
+        let fata = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // foreign ata
+        // NewFungibleDefinition (variant 1, name len 7 "MED0707", supply 1_000_000)
+        let mut t = rec("h1", "ch", 1, Some(ftoken));
+        t.instruction_data = vec![1u32, 7, 809780557, 3616823, 1_000_000, 0, 0, 0];
+        t.accounts = vec!["DEF".into(), "SUPPLY".into()];
+        let mut a = rec("h2", "ch", 1, Some(fata));
+        a.instruction_data = vec![0u32];
+        a.accounts = vec!["OWNER".into(), "DEF".into(), "ATA".into()];
+        // before publishing the fingerprint, foreign ids aren't recognized -> nothing learned.
+        assert_eq!(token_mappings(&t), (None, None));
+        assert_eq!(token_mappings(&a), (None, None));
+        // publish the classifier's verdict; now the same ops mine their mappings.
+        set_program_kinds(
+            HashSet::from([ftoken.to_string()]),
+            HashSet::from([fata.to_string()]),
+        );
+        assert_eq!(
+            token_mappings(&t),
+            (Some(("DEF".into(), "MED0707".into(), 1_000_000)), Some(("SUPPLY".into(), "DEF".into())))
+        );
+        assert_eq!(token_mappings(&a).1, Some(("ATA".into(), "DEF".into())));
+        set_program_kinds(HashSet::new(), HashSet::new()); // reset the process-global for other tests
+    }
+
+    /// BUG 2 fix: `finalized_block_for` = highest plausible block whose L1 slot <= lib, so the
+    /// reconciler can promote `finalized_block_id` as lib advances (raw/garbage rows ignored).
+    #[test]
+    fn finalized_block_for_promotes_up_to_lib() {
+        let path = std::env::temp_dir().join(format!("zs-finfor-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        // blocks 1..=5 on "ch", each inscribed at L1 slot blk*10 (via the `rec` helper).
+        let recs: Vec<TxRecord> = (1..=5)
+            .map(|b| rec(&format!("h{b}"), "ch", b, Some("authenticated_transfer")))
+            .collect();
+        db.commit(&recs, &[], &[], &[]).unwrap();
+        // lib between block 3 (slot 30) and block 4 (slot 40) -> highest final is block 3.
+        assert_eq!(db.finalized_block_for("ch", 35).unwrap(), Some(3));
+        // lib past the tip -> everything final; lib below the first slot -> nothing final.
+        assert_eq!(db.finalized_block_for("ch", 1000).unwrap(), Some(5));
+        assert_eq!(db.finalized_block_for("ch", 5).unwrap(), None);
+        // a raw inscription (high block id, low slot) + a garbage undecodable id must NOT be
+        // taken as the frontier even though they'd sort first with slot <= lib.
+        let mut raw = rec("hraw", "ch", 100, Some("p"));
+        raw.kind = "raw".into();
+        raw.slot = Some(1);
+        let mut garbage = rec("hgar", "ch", 6, Some("p"));
+        garbage.block_id = 5_000_000_000_000; // >= MAX_PLAUSIBLE_BLOCK_ID (1e12)
+        garbage.slot = Some(1);
+        db.commit(&[raw, garbage], &[], &[], &[]).unwrap();
+        assert_eq!(db.finalized_block_for("ch", 35).unwrap(), Some(3));
+        let _ = std::fs::remove_file(&path);
     }
 
     fn rec(hash: &str, ch: &str, blk: u64, program: Option<&str>) -> TxRecord {

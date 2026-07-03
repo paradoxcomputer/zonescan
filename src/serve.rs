@@ -1302,6 +1302,78 @@ pub async fn cmd_serve(
         });
     }
 
+    // Standing finality reconciler: as the L1 last-irreversible slot (`lib`) advances, promote
+    // each channel's `finalized_block_id` to the highest block whose L1 slot is now <= lib. The
+    // ingest paths only mark a block final if it was already <= lib when first observed, and
+    // live blocks always arrive above lib (settlement leads finality by the lag), so without
+    // this sweep `finalized_block_id` freezes at the startup seed and every later block stays
+    // stuck reading "on L1 · finalizing". Recomputing from the stored per-block slots heals both
+    // the live case and any accumulated backlog; it also repairs a garbage finalized id left by
+    // an old undecodable-inscription artifact (finalized far above latest).
+    if app.db.is_some() {
+        let a = app.clone();
+        tokio::spawn(async move {
+            let mut last_lib = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                let Some(db) = a.db.clone() else { continue };
+                let (lib, channels) = {
+                    let s = a.inner.lock().unwrap();
+                    (
+                        s.l1.lib_slot.unwrap_or(0),
+                        s.seqs.keys().cloned().collect::<Vec<String>>(),
+                    )
+                };
+                // nothing finalized yet, or no advance since the last sweep -> no work.
+                if lib == 0 || lib == last_lib {
+                    continue;
+                }
+                last_lib = lib;
+                let mut changed = false;
+                for ch in channels {
+                    let dbc = db.clone();
+                    let chc = ch.clone();
+                    let newf = match tokio::task::spawn_blocking(move || {
+                        dbc.finalized_block_for(&chc, lib)
+                    })
+                    .await
+                    {
+                        Ok(Ok(v)) => v,
+                        _ => None,
+                    };
+                    let persist = {
+                        let mut s = a.inner.lock().unwrap();
+                        s.seqs.get_mut(&ch).and_then(|e| {
+                            // a finalized id above the latest observed block is a garbage
+                            // artifact; treat it as unknown (0) so it can be re-derived.
+                            let base = if e.finalized_block_id > e.latest_block_id {
+                                0
+                            } else {
+                                e.finalized_block_id
+                            };
+                            let target = newf.map_or(base, |nf| base.max(nf));
+                            (target != e.finalized_block_id).then(|| {
+                                e.finalized_block_id = target;
+                                changed = true;
+                                (ch.clone(), e.clone())
+                            })
+                        })
+                    };
+                    if let Some((c, sum)) = persist {
+                        let dbc = db.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            dbc.commit(&[], &[(c, sum)], &[], &[])
+                        })
+                        .await;
+                    }
+                }
+                if changed {
+                    broadcast(&a);
+                }
+            }
+        });
+    }
+
     let router = Router::new()
         .route("/", get(index))
         .route("/admin", get(admin_page))
@@ -3203,8 +3275,33 @@ async fn refresh_guesses(app: &AppState) {
         }
         out.insert(id.clone(), g);
     }
+    // Publish the fingerprint-recognized token/ata program ids so the offline token-name learner
+    // recognizes FOREIGN-build token/ata programs (whose image id isn't a known built-in), then
+    // re-mine stored txs to populate the name maps. Confidence bar 0.6 (the UI's "confident"
+    // line); `≈token`/`≈ata` non-generic guesses only. The op-structure checks inside
+    // `token_mappings` (variant 1 + printable name + sane supply / ata Create shape) are a second
+    // safety net against a mis-fingerprint learning garbage.
+    let token_ids: std::collections::HashSet<String> = out
+        .iter()
+        .filter(|(_, g)| g.name == "token" && !g.generic && g.confidence >= 0.6)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let ata_ids: std::collections::HashSet<String> = out
+        .iter()
+        .filter(|(_, g)| g.name == "ata" && !g.generic && g.confidence >= 0.6)
+        .map(|(id, _)| id.clone())
+        .collect();
     *app.guesses.lock().unwrap() = out;
     *app.token_defs.lock().unwrap() = defs;
+    if !token_ids.is_empty() || !ata_ids.is_empty() {
+        db::set_program_kinds(token_ids, ata_ids);
+        if let Some(db) = app.db.clone() {
+            match tokio::task::spawn_blocking(move || db.relearn_tokens()).await {
+                Ok(Ok(n)) if n > 0 => println!("token-name index: learned {n} definition(s) incl. fingerprinted foreign token programs"),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// The best-guess name for one program id, if the classifier surfaced one above threshold.
