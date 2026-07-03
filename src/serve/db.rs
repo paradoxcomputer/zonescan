@@ -772,7 +772,9 @@ impl Db {
                         let (name, supply) =
                             self.resolve_token(&def).map(|(_, n, s)| (n, s)).unwrap_or_default();
                         out.push(Holding {
-                            balance: self.acct_bal(ata).and_then(|b| b.balance),
+                            // token balance is account STATE (parse_token_holding via RPC), not the
+                            // native `acct_bal`; the serve layer fills it in.
+                            balance: None,
                             account: ata.to_string(),
                             definition: def,
                             name,
@@ -790,7 +792,7 @@ impl Db {
             if let Some((definition, name, supply)) = self.resolve_token(account) {
                 if !name.is_empty() && definition != account {
                     out.push(Holding {
-                        balance: self.acct_bal(account).and_then(|b| b.balance),
+                        balance: None, // token balance filled from RPC by the serve layer
                         account: account.to_string(),
                         definition,
                         name,

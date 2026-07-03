@@ -3986,13 +3986,27 @@ async fn api_account(
     }
 
     // token holdings (owner→ATA index) — first page only; cheap O(#holdings) index reads, no scan.
-    let holdings: Vec<db::Holding> = match (after.is_none(), app.db.clone()) {
+    let mut holdings: Vec<db::Holding> = match (after.is_none(), app.db.clone()) {
         (true, Some(db)) => {
             let idc = id.clone();
             tokio::task::spawn_blocking(move || db.token_holdings(&idc)).await.unwrap_or_default()
         }
         _ => vec![],
     };
+    // token balances are account STATE (parse_token_holding via the sequencer RPC), not tx data.
+    // Fetch best-effort, O(#holdings) on the first page only; a channel with no RPC leaves them blank.
+    if !holdings.is_empty() {
+        let client = app.client.lock().unwrap().clone(); // drop the guard before awaiting
+        if let (Some(url), Some(client)) = (&rpc_url, client) {
+            for h in holdings.iter_mut() {
+                if let Some(d) = rpc_get_account_data(&client, url, &h.account).await {
+                    if let Some((_, amt, _)) = parse_token_holding(&d) {
+                        h.balance = Some(amt.to_string());
+                    }
+                }
+            }
+        }
+    }
 
     Json(json!({
         "id": id,
