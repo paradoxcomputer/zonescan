@@ -166,16 +166,16 @@ pub fn fungible_definition(s: &Sample) -> Option<(String, u128)> {
     }
     let (name, consumed) = r0_string_at(w, 1)?;
     let rest = &w[1 + consumed..];
-    // exactly a trailing u128 supply. Reject only the TOP word (bits 96-127): a real token supply
-    // fits well under 2^96 (e.g. 10^21 has bit-64 set — which the old `rest[2]==0` cap wrongly
-    // rejected, hiding the token's name entirely), while an all-big hash lights up the top word.
-    if rest.len() != 4 || rest[3] != 0 || (rest[0] == 0 && rest[1] == 0 && rest[2] == 0) {
+    // exactly a trailing u128 supply that fits u64 (high words zero) and is nonzero. NOTE: this
+    // deliberately does NOT accept supplies with bits 64+ set — relaxing it to 2^96 was tried and
+    // REGRESSED the classifier (it broadened `is_def`, inflated token runner-up scores, and
+    // dropped solid guesses like authenticated_transfer/token below the margin threshold). The
+    // rare >u64-supply foreign token (e.g. 19fd090b) is left unrecognized rather than destabilize
+    // the whole classifier.
+    if rest.len() != 4 || rest[2] != 0 || rest[3] != 0 || (rest[0] == 0 && rest[1] == 0) {
         return None;
     }
-    Some((
-        name,
-        (rest[0] as u128) | ((rest[1] as u128) << 32) | ((rest[2] as u128) << 64),
-    ))
+    Some((name, (rest[0] as u128) | ((rest[1] as u128) << 32)))
 }
 
 /// The structural features of a single sample, derived once for scoring.
@@ -1101,15 +1101,9 @@ mod tests {
         let mut w = RLNTOK_DEF.to_vec();
         w[2] = 0x0101_0101;
         assert!(fungible_definition(&Sample::new(Kind::Public, 2, w)).is_none());
-        // a LARGE but real supply (bits 64-95 set, e.g. ~10^21) is ACCEPTED — this is the
-        // 19fd090b case the old `rest[2]==0` cap wrongly rejected, hiding the token name.
+        // supply high words set (implausible) — rejected (keeps the classifier stable)
         let mut w = RLNTOK_DEF.to_vec();
-        w[6] = 54; // rest[2] (bits 64-95) set
-        let g = fungible_definition(&Sample::new(Kind::Public, 2, w)).expect("large supply ok");
-        assert_eq!(g.1, 100_000_000_000u128 | (54u128 << 64));
-        // supply TOP word (bits 96-127) set => implausibly huge / a hash, still rejected
-        let mut w = RLNTOK_DEF.to_vec();
-        w[7] = 9; // rest[3] set
+        w[6] = 9;
         assert!(fungible_definition(&Sample::new(Kind::Public, 2, w)).is_none());
         // truncated (missing supply words)
         assert!(fungible_definition(&Sample::new(Kind::Public, 2, RLNTOK_DEF[..6].to_vec()))
