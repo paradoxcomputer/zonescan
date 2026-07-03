@@ -484,6 +484,41 @@ fn profile_score(clusters: &[(Feat, u32)], profile: &Profile) -> f64 {
     }
 }
 
+/// Some shape ties between DIFFERENT program names are resolvable by CONTENT. Returns `Some(true)`
+/// when `winner` is the content-correct label over `loser` for these samples, `Some(false)` when
+/// `loser` is, `None` when content gives no signal. This stops a genuine shape tie — e.g. a small
+/// bare u128 matching BOTH authenticated_transfer and a learned small-solution pinata, or a
+/// `[0,u128]` program matching both token and the rc5 authenticated_transfer enum — from
+/// collapsing the margin and hiding an otherwise-clear guess.
+fn content_prefers(winner: &str, loser: &str, samples: &[Sample]) -> Option<bool> {
+    let is_pair = |a: &str, b: &str| (winner == a && loser == b) || (winner == b && loser == a);
+    // authenticated_transfer vs pinata: both are a bare u128. An auth_transfer amount is SMALL
+    // (high 2 words zero); a pinata PoW solution is WIDE (high words set).
+    if is_pair("authenticated_transfer", "pinata") {
+        let bares: Vec<&Sample> = samples
+            .iter()
+            .filter(|s| s.kind == Kind::Public && s.words.len() == 4)
+            .collect();
+        if !bares.is_empty() {
+            let wide = bares.iter().any(|s| s.words[2] != 0 || s.words[3] != 0);
+            let correct = if wide { "pinata" } else { "authenticated_transfer" };
+            return Some(winner == correct);
+        }
+    }
+    // token vs authenticated_transfer: both do `[0, u128]` transfers; only a TOKEN program also
+    // carries a NewFungibleDefinition (variant 1 + printable name + supply). With one => token;
+    // without any => the native transfer.
+    if is_pair("token", "authenticated_transfer") {
+        let correct = if samples.iter().any(|s| fungible_definition(s).is_some()) {
+            "token"
+        } else {
+            "authenticated_transfer"
+        };
+        return Some(winner == correct);
+    }
+    None
+}
+
 /// Classify an unrecognized program from its own txs against the reference profiles. Returns a
 /// `Guess` only when the best match clears the score/margin/confidence thresholds; otherwise
 /// `None` ("unknown program"). `references` should be `source_profiles()` plus any runtime
@@ -502,10 +537,29 @@ pub fn classify(samples: &[Sample], references: &[Profile]) -> Option<Guess> {
         .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let (best_score, best) = scored.first().map(|(s, p)| (*s, *p))?;
+    if scored.is_empty() {
+        return None;
+    }
+    // Effective best: the top-scored profile — unless CONTENT decisively favors a (near-)tied
+    // different-name competitor (a shape tie that content resolves the other way, e.g. a
+    // high-words-zero bare u128 is authenticated_transfer, not a learned small-solution pinata).
+    let mut bi = 0;
+    for (i, (score, p)) in scored.iter().enumerate() {
+        if p.name != scored[bi].1.name
+            && *score >= scored[bi].0 - 1e-6
+            && content_prefers(&p.name, &scored[bi].1.name, samples) == Some(true)
+        {
+            bi = i;
+            break;
+        }
+    }
+    let (best_score, best) = (scored[bi].0, scored[bi].1);
+    // Runner-up = the highest DIFFERENT-name competitor that content does NOT resolve in `best`'s
+    // favor, so a content-explained shape tie doesn't wrongly collapse the margin.
     let runner_up = scored
         .iter()
-        .find(|(_, p)| p.name != best.name)
+        .filter(|(_, p)| p.name != best.name)
+        .find(|(_, p)| content_prefers(&best.name, &p.name, samples) != Some(true))
         .map(|(s, _)| *s)
         .unwrap_or(0.0);
     let margin = (best_score - runner_up).max(0.0);
@@ -1011,6 +1065,53 @@ mod tests {
         let s = vec![Sample::new(Kind::Public, 2, u128w(sol)); 4];
         let g = classify(&s, &refs()).expect("should classify");
         assert_eq!(g.name, "pinata");
+    }
+
+    /// Content tie-break: a LEARNED small-solution pinata profile matches a bare u128 at ~1.0,
+    /// tying authenticated_transfer and (pre-fix) collapsing the margin to 0. High-words-zero
+    /// content says it's the native transfer, not a pinata solution.
+    #[test]
+    fn content_tiebreak_native_beats_learned_pinata() {
+        let mut refs = refs();
+        refs.push(learn_profile("pinata", &vec![Sample::new(Kind::Public, 2, u128w(500)); 8]).unwrap());
+        let s = vec![Sample::new(Kind::Public, 2, u128w(11_094_836)); 6];
+        let g = classify(&s, &refs).expect("small bare u128 must resolve despite the pinata tie");
+        assert_eq!(g.name, "authenticated_transfer");
+    }
+
+    /// Content tie-break: a `[0,u128]` + `[1]` program is shape-identical to the rc5
+    /// authenticated_transfer enum. With NO NewFungibleDefinition it's the native transfer; adding
+    /// a real def flips it to token.
+    #[test]
+    fn content_tiebreak_token_vs_native_enum() {
+        let mut refs = refs();
+        // learned rc5 authenticated_transfer enum: [0, u128] transfers + a [1] register.
+        let mut auth = Vec::new();
+        let mut t = vec![0u32];
+        t.extend(u128w(40));
+        for _ in 0..8 {
+            auth.push(Sample::new(Kind::Public, 2, t.clone()));
+        }
+        for _ in 0..3 {
+            auth.push(Sample::new(Kind::Public, 1, vec![1]));
+        }
+        refs.push(learn_profile("authenticated_transfer", &auth).unwrap());
+        // foreign program: SAME enum shape, no def -> native, not token.
+        let mut fs = Vec::new();
+        let mut tt = vec![0u32];
+        tt.extend(u128w(7));
+        for _ in 0..6 {
+            fs.push(Sample::new(Kind::Public, 2, tt.clone()));
+        }
+        for _ in 0..2 {
+            fs.push(Sample::new(Kind::Public, 1, vec![1]));
+        }
+        assert_eq!(classify(&fs, &refs).map(|g| g.name), Some("authenticated_transfer".into()));
+        // add a real NewFungibleDefinition (RLNTOK) -> now it's a token.
+        let mut def = vec![1u32, 6, 1_414_417_490, 19_279];
+        def.extend([1_215_752_192, 23, 0, 0]);
+        fs.push(Sample::new(Kind::Public, 2, def));
+        assert_eq!(classify(&fs, &refs).map(|g| g.name), Some("token".into()));
     }
 
     #[test]
