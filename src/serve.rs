@@ -3562,16 +3562,15 @@ fn enrich_tx(app: &AppState, rec: &TxRecord) -> Value {
     if let Value::Object(o) = &mut v {
         if let Some(p) = rec.program.as_deref().filter(|p| is_raw_program_id(p)) {
             let g = program_guess(app, p);
-            // Per-TX amount for an UNRESOLVED program whose own instruction fits the
-            // value-transfer shape `[variant, u128]` - independent of any program-level guess
-            // (sibling samples may be definitions; the shape sanity checks still apply). The
-            // token symbol attaches separately when attribution exists: the program-level
-            // `≈ token` name (single definition), else a definition-account match; otherwise
-            // amount only. Never for verified-named programs (their decode is exact).
-            if rec.kind == "public"
-                && !o.contains_key("amount")
-                && !program_name_map(app).contains_key(p)
-            {
+            // Per-TX amount for a program whose own instruction fits the value-transfer shape
+            // `[variant, u128]`, when no exact amount was decoded above. Covers both UNRESOLVED
+            // (`≈guess`) programs AND verified programs that lack an exact instruction decoder
+            // (e.g. `faucet`, `bridge`, `vault`, `time_locked_transfer`) — their `[1, amount]`
+            // ops would otherwise show no amount at all. token_op already fills token/native
+            // amounts (so `!o.contains_key("amount")` skips those), and the strict shape checks
+            // (5 words `[variant<=15, u128 high-zero]`, 1-4 accounts) keep non-transfer
+            // instructions (validity_window / amm / ata / clock) from decoding a spurious amount.
+            if rec.kind == "public" && !o.contains_key("amount") {
                 let s = classify::Sample::new(
                     classify::Kind::from_str(&rec.kind),
                     rec.accounts.len() as u16,
