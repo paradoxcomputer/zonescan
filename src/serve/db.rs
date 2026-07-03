@@ -43,6 +43,10 @@ const DEPLOY_ELF: TableDefinition<&str, &[u8]> = TableDefinition::new("deploy_el
 //   holding_def   holding/ATA account -> definition       (supply acct + ata Create ops)
 const TOKEN_DEF: TableDefinition<&str, &str> = TableDefinition::new("token_def");
 const HOLDING_DEF: TableDefinition<&str, &str> = TableDefinition::new("holding_def");
+// owner account -> its token-holding accounts (ATAs). Key = "owner\0ata", value = definition;
+// range-scan the "owner\0" prefix for all of an owner's holdings in O(#holdings). Built from ata
+// Create ops [owner, definition, ata] at ingest — no store scan on the account page.
+const OWNER_ATA: TableDefinition<&str, &str> = TableDefinition::new("owner_ata");
 const TOKEN_MAP_VERSION: u64 = 1;
 // Bumped when raw-inscription txs need re-timestamping for the recency-ordered global feed.
 const RAW_TS_VERSION: u64 = 1;
@@ -339,6 +343,29 @@ fn token_mappings(rec: &TxRecord) -> (Option<(String, String, u128)>, Option<(St
     (None, None)
 }
 
+/// From an ata Create (`[owner, definition, ata]`), the `(owner, ata, definition)` link — for the
+/// owner→holdings index. Kept separate from `token_mappings` so its other callers are unaffected.
+fn ata_owner_link(rec: &TxRecord) -> Option<(String, String, String)> {
+    let prog = rec.program.as_deref().unwrap_or("");
+    let w = &rec.instruction_data;
+    let a = &rec.accounts;
+    if is_ata_program(prog) && w.first().copied() == Some(0) && a.len() >= 3 {
+        return Some((a[0].clone(), a[2].clone(), a[1].clone())); // (owner, ata, definition)
+    }
+    None
+}
+
+/// One token holding: an ATA account, its token definition + resolved name/supply, and (if known)
+/// its balance. Balances come straight from the persisted `acct_bal` — no per-holding RPC.
+#[derive(serde::Serialize)]
+pub struct Holding {
+    pub account: String,
+    pub definition: String,
+    pub name: String,
+    pub supply: String,
+    pub balance: Option<String>,
+}
+
 impl Db {
     /// Open (or create) the database at `path`.
     pub fn open(path: &Path) -> Result<Db> {
@@ -382,6 +409,7 @@ impl Db {
             let mut acct = w.open_table(IDX_ACCOUNT)?;
             let mut tdef = w.open_table(TOKEN_DEF)?;
             let mut hdef = w.open_table(HOLDING_DEF)?;
+            let mut owner_ata = w.open_table(OWNER_ATA)?;
             for r in recs {
                 if r.hash.is_empty() {
                     continue;
@@ -394,6 +422,10 @@ impl Db {
                 }
                 if let Some((h, d)) = hold {
                     hdef.insert(h.as_str(), d.as_str())?;
+                }
+                // owner -> ATA holding link, from an ata Create (idempotent).
+                if let Some((owner, ata, def)) = ata_owner_link(r) {
+                    owner_ata.insert(format!("{owner}\0{ata}").as_str(), def.as_str())?;
                 }
                 // dedup - but if a re-scan now carries a field the stored record
                 // predates (instruction_data / deploy fields added after it was first
@@ -719,6 +751,57 @@ impl Db {
         }
     }
 
+    /// An account's token holdings: the ATAs it owns (via the owner→ATA index) plus, if the account
+    /// is itself an ATA, its own token. Each holding resolves its token name/supply + persisted
+    /// balance via O(1) map lookups — no store scan, no per-holding RPC. Capped so a pathological
+    /// owner can't blow up the response.
+    pub fn token_holdings(&self, account: &str) -> Vec<Holding> {
+        const CAP: usize = 200;
+        let mut out: Vec<Holding> = Vec::new();
+        let Ok(r) = self.db.begin_read() else {
+            return out;
+        };
+        // 1. account as OWNER -> each of its ATAs (range the "account\0" prefix).
+        if let Ok(t) = r.open_table(OWNER_ATA) {
+            let lo = format!("{account}\0");
+            let hi = format!("{account}\u{1}");
+            if let Ok(it) = t.range(lo.as_str()..hi.as_str()) {
+                for (k, v) in it.flatten() {
+                    if let Some(ata) = k.value().split('\0').nth(1) {
+                        let def = v.value().to_string();
+                        let (name, supply) =
+                            self.resolve_token(&def).map(|(_, n, s)| (n, s)).unwrap_or_default();
+                        out.push(Holding {
+                            balance: self.acct_bal(ata).and_then(|b| b.balance),
+                            account: ata.to_string(),
+                            definition: def,
+                            name,
+                            supply,
+                        });
+                        if out.len() >= CAP {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // 2. account IS an ATA -> its own token holding (if not already covered above).
+        if out.iter().all(|h| h.account != account) {
+            if let Some((definition, name, supply)) = self.resolve_token(account) {
+                if !name.is_empty() && definition != account {
+                    out.push(Holding {
+                        balance: self.acct_bal(account).and_then(|b| b.balance),
+                        account: account.to_string(),
+                        definition,
+                        name,
+                        supply,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// For a token / ATA / native transfer, the (amount, token_name) to render in the feed
     /// and tx page (e.g. "250", "GOLD"). Amount is decoded from `instruction_data`; the name
     /// is resolved from any account (a definition, or a holding -> definition) via the
@@ -777,6 +860,7 @@ impl Db {
     pub fn relearn_tokens(&self) -> Result<usize> {
         let mut defs: Vec<(String, String)> = Vec::new();
         let mut holds: Vec<(String, String)> = Vec::new();
+        let mut owners: Vec<(String, String)> = Vec::new(); // ("owner\0ata", definition)
         {
             let r = self.db.begin_read()?;
             if let Ok(txs) = r.open_table(TXS) {
@@ -790,22 +874,29 @@ impl Db {
                     if let Some((h, d)) = hold {
                         holds.push((h, d));
                     }
+                    if let Some((owner, ata, def)) = ata_owner_link(&rec) {
+                        owners.push((format!("{owner}\0{ata}"), def));
+                    }
                 }
             }
         }
         let n = defs.len();
-        if defs.is_empty() && holds.is_empty() {
+        if defs.is_empty() && holds.is_empty() && owners.is_empty() {
             return Ok(0);
         }
         let w = self.db.begin_write()?;
         {
             let mut tdef = w.open_table(TOKEN_DEF)?;
             let mut hdef = w.open_table(HOLDING_DEF)?;
+            let mut owner_ata = w.open_table(OWNER_ATA)?;
             for (d, v) in &defs {
                 tdef.insert(d.as_str(), v.as_str())?;
             }
             for (h, d) in &holds {
                 hdef.insert(h.as_str(), d.as_str())?;
+            }
+            for (k, d) in &owners {
+                owner_ata.insert(k.as_str(), d.as_str())?;
             }
         }
         w.commit()?;
@@ -1527,6 +1618,34 @@ mod tests {
         let mut u = rec("h2", "ch", 2, Some(auth3));
         u.instruction_data = vec![20_429_163, 0, 0, 0];
         assert_eq!(transfer_amount(&u), Some(20_429_163));
+    }
+
+    /// Token-holdings tab: an ATA Create `[owner, definition, ata]` indexes owner→ATA so the
+    /// owner's holdings resolve to their token name via O(1) lookups; the ATA account itself
+    /// resolves to a single holding.
+    #[test]
+    fn token_holdings_from_ata_creates() {
+        let path = std::env::temp_dir().join(format!("zs-holdings-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        db.learn_token("", "GOLDDEF", "GOLD", "1000000").unwrap(); // token_def[GOLDDEF]=GOLD
+        let mut c = rec("h1", "ch", 1, Some("ata")); // ata Create
+        c.instruction_data = vec![0u32];
+        c.accounts = vec!["WALLET".into(), "GOLDDEF".into(), "WALLET_GOLD_ATA".into()];
+        db.commit(&[c], &[], &[], &[]).unwrap();
+        // owner's holdings
+        let h = db.token_holdings("WALLET");
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].account, "WALLET_GOLD_ATA");
+        assert_eq!(h[0].name, "GOLD");
+        assert_eq!(h[0].definition, "GOLDDEF");
+        // the ATA itself resolves to its own single holding
+        let h2 = db.token_holdings("WALLET_GOLD_ATA");
+        assert_eq!(h2.len(), 1);
+        assert_eq!(h2[0].name, "GOLD");
+        // an unrelated account has no holdings
+        assert!(db.token_holdings("nobody").is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 
     fn rec(hash: &str, ch: &str, blk: u64, program: Option<&str>) -> TxRecord {

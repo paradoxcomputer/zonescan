@@ -3985,6 +3985,15 @@ async fn api_account(
         }
     }
 
+    // token holdings (owner→ATA index) — first page only; cheap O(#holdings) index reads, no scan.
+    let holdings: Vec<db::Holding> = match (after.is_none(), app.db.clone()) {
+        (true, Some(db)) => {
+            let idc = id.clone();
+            tokio::task::spawn_blocking(move || db.token_holdings(&idc)).await.unwrap_or_default()
+        }
+        _ => vec![],
+    };
+
     Json(json!({
         "id": id,
         "scope": scope,
@@ -3997,6 +4006,7 @@ async fn api_account(
         "tx_count": total,
         "txs": txs,
         "channels": channels,
+        "holdings": holdings,
     }))
 }
 
@@ -5610,6 +5620,13 @@ async function renderWallet(addr,seq){
     <div class="kv" style="padding:16px"><div class="k">Address</div><div class="v">${esc(a.id)}</div>
       ${seq?'':`<div class="k">Sequencers</div><div class="v" style="font-family:inherit">${chans}</div>`}</div>
    </div>
+   ${(a.holdings&&a.holdings.length)?`<div class="panel" style="margin-bottom:16px"><div class="phead">Token holdings <span class="count">${a.holdings.length}</span></div>
+    <div class="tscroll"><table class="ttbl"><thead><tr><th style="text-align:left">Token</th><th style="text-align:right">Balance</th><th style="text-align:left">Holding account (ATA)</th></tr></thead>
+    <tbody>${a.holdings.map(h=>`<tr>
+      <td>${h.name?`<a class="lnk" href="/zone/${u(seq||a.channel)}/token/${u(h.definition)}">${esc(h.name)}</a>`:`<span class="mut" title="${esc(h.definition)}">${esc(sh(h.definition,6,4))}</span>`}</td>
+      <td style="text-align:right">${h.balance!=null?`<b>${esc(h.balance)}</b>`:'<span class="mut">—</span>'}</td>
+      <td><a class="lnk" href="/zone/${u(seq||a.channel)}/wallet/${u(h.account)}">${esc(sh(h.account,6,4))}</a></td>
+    </tr>`).join('')}</tbody></table></div></div>`:''}
    <div class="panel"><div class="phead">Transactions <span class="count" id="count">${num(a.tx_count)}</span></div>
     ${filterBar()}
     <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows">${txRows(a.txs)}</tbody></table></div></div>`;
