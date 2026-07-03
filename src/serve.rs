@@ -1392,6 +1392,8 @@ pub async fn cmd_serve(
         .route("/api/schemas/submit", post(api_schema_submit))
         .route("/api/token_of", get(api_token_of))
         .route("/api/token/:id", get(api_token))
+        .route("/api/token/:id/holders", get(api_token_holders))
+        .route("/api/whatis/:id", get(api_whatis))
         .route("/api/elf/:hash", get(api_elf))
         .route("/api/rescan", get(api_rescan))
         .route("/api/relabel", get(api_relabel))
@@ -4024,6 +4026,74 @@ async fn api_account(
     }))
 }
 
+/// Classify a search query so the UI routes it: a token DEFINITION → the token page (with its home
+/// channel), otherwise an account. (Tx-hash + channel for the 64-hex case are handled client-side.)
+async fn api_whatis(State(app): State<AppState>, Path(id): Path<String>) -> Json<Value> {
+    let id = id.trim().to_string();
+    if let Some(db) = app.db.as_ref() {
+        if let Some((definition, name, _)) = db.resolve_token(&id) {
+            if definition == id && !name.is_empty() {
+                let channel = db.acct_bal(&id).map(|b| b.channel).filter(|c| !c.is_empty());
+                return Json(json!({"kind": "token", "channel": channel}));
+            }
+        }
+    }
+    Json(json!({"kind": "account"}))
+}
+
+#[derive(serde::Deserialize)]
+struct HoldersQuery {
+    channel: Option<String>,
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+/// A token's holders (paginated for infinite scroll): the ATAs holding it (def→holder index) +
+/// their balances from the sequencer RPC (O(limit) per page). `next` is the cursor for the next page.
+async fn api_token_holders(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<HoldersQuery>,
+) -> Json<Value> {
+    let limit = q.limit.unwrap_or(50).min(200);
+    let after = q.after.clone().filter(|s| !s.is_empty());
+    let mut holders: Vec<db::Holding> = match app.db.clone() {
+        Some(db) => {
+            let (idc, af) = (id.clone(), after.clone());
+            tokio::task::spawn_blocking(move || db.token_holders(&idc, af.as_deref(), limit))
+                .await
+                .unwrap_or_default()
+        }
+        None => vec![],
+    };
+    // token balances via the sequencer RPC (account state), O(#page).
+    let channel = q.channel.as_deref().and_then(|c| resolve_channel(c).ok());
+    let rpc_url = channel.and_then(|ch| {
+        let cfg = app.config.lock().unwrap();
+        cfg.sequencers
+            .iter()
+            .find(|sc| {
+                !sc.rpc_url.trim().is_empty()
+                    && resolve_channel(&sc.channel_id).ok().as_deref() == Some(ch.as_str())
+            })
+            .map(|sc| sc.rpc_url.trim().to_string())
+    });
+    if let Some(url) = &rpc_url {
+        let client = app.client.lock().unwrap().clone();
+        if let Some(client) = client {
+            for h in holders.iter_mut() {
+                if let Some(d) = rpc_get_account_data(&client, url, &h.account).await {
+                    if let Some((_, amt, _)) = parse_token_holding(&d) {
+                        h.balance = Some(amt.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let next = holders.last().map(|h| h.account.clone());
+    Json(json!({"holders": holders, "next": next}))
+}
+
 /// Download the deployed guest ELF for a ProgramDeployment tx (by tx hash).
 async fn api_elf(State(app): State<AppState>, Path(hash): Path<String>) -> Response {
     let bytes = match app.db.clone() {
@@ -4922,11 +4992,11 @@ function instrText(t,tok){
       let tk='token-standard';
       if(tok&&tok.resolved&&tok.definition){ const lbl=tok.name||sh(tok.definition,6,4);
         tk=`<a class="lnk" href="/zone/${u(t.channel)}/token/${u(tok.definition)}">${esc(lbl)}</a>`; }
-      return `<b>Transfer</b> <b>${u128le(w,1).toString()}</b> ${tk}`+ft();
+      return `<b>Transfer</b> <b>${grp(u128le(w,1).toString())}</b> ${tk}`+ft();
     }
     if(v===1){ // NewFungibleDefinition{name: String, total_supply: u128}
       const nm=r0str(w,1), sup=u128le(w,1+r0strWords(w,1));
-      return `<b>NewFungibleDefinition</b> - <b>${esc(nm)}</b> · supply ${sup.toString()}`;
+      return `<b>NewFungibleDefinition</b> - <b>${esc(nm)}</b> · supply ${grp(sup.toString())}`;
     }
     if(v===3) return `<b>InitializeAccount</b>`;
     return `<b>${esc(tn||('variant '+v))}</b> <span class="mono mut" style="font-size:11px;word-break:break-all">[${w.slice(1,17).join(', ')}${w.length>17?', …':''}]</span>`;
@@ -4936,12 +5006,12 @@ function instrText(t,tok){
   // = create/register a native account (no amount) — so [1] reads as "Register", not a bogus amount.
   if(name==='authenticated_transfer'){
     const v=w[0]>>>0;
-    if(w.length===5 && v===0) return `<b>Transfer</b> <b>${u128le(w,1).toString()}</b> <b>LEZ</b> <span class="mut" style="font-size:11px">(native)</span>`+ft();
+    if(w.length===5 && v===0) return `<b>Transfer</b> <b>${grp(u128le(w,1).toString())}</b> <b>LEZ</b> <span class="mut" style="font-size:11px">(native)</span>`+ft();
     if(w.length===1 && v===1) return `<b>Register</b> - create native account`+(a[0]?` · ${acc(0)}`:'');
     if(w.length>=4){
       const amt=u128le(w,0);
       if(amt===0n) return `<b>Register</b> - initialize native account`+(a[0]?` · ${acc(0)}`:'');
-      return `<b>Transfer</b> <b>${amt.toString()}</b> <b>LEZ</b> <span class="mut" style="font-size:11px">(native)</span>`+ft();
+      return `<b>Transfer</b> <b>${grp(amt.toString())}</b> <b>LEZ</b> <span class="mut" style="font-size:11px">(native)</span>`+ft();
     }
   }
   // clock tick = u64 block timestamp (ms)
@@ -4961,8 +5031,8 @@ function instrText(t,tok){
   if(name==='ata' && w.length>=1){
     const v=w[0]>>>0;
     if(v===0) return `<b>Create</b> - associated token account`+ft();
-    if(v===1 && w.length>=13) return `<b>Transfer</b> <b>${u128le(w,9).toString()}</b> <span class="mut">via ATA</span>`+ft();
-    if(v===2 && w.length>=13) return `<b>Burn</b> <b>${u128le(w,9).toString()}</b> <span class="mut">via ATA</span>`+ft();
+    if(v===1 && w.length>=13) return `<b>Transfer</b> <b>${grp(u128le(w,9).toString())}</b> <span class="mut">via ATA</span>`+ft();
+    if(v===2 && w.length>=13) return `<b>Burn</b> <b>${grp(u128le(w,9).toString())}</b> <span class="mut">via ATA</span>`+ft();
     return `<b>${['Create','Transfer','Burn'][v]||('variant '+v)}</b> <span class="mono mut" style="font-size:11px;word-break:break-all">[${w.slice(1,17).join(', ')}${w.length>17?', …':''}]</span>`;
   }
   // ---- no registered schema: a best-effort, clearly-TENTATIVE decode ----
@@ -5594,18 +5664,46 @@ async function renderToken(seq,tid){
     <div class="ovw">
       <div><div class="k">Name</div><div class="v">${esc(a.name||'-')}</div></div>
       <div><div class="k">Type</div><div class="v" style="font-size:15px">${esc(a.kind||'-')}</div></div>
-      <div><div class="k">Total supply</div><div class="v">${a.supply&&a.supply!=='0'?num(a.supply):'-'}</div></div>
+      <div><div class="k">Total supply</div><div class="v">${a.supply&&a.supply!=='0'?grp(a.supply):'-'}</div></div>
     </div>
     <div class="kv" style="padding:16px"><div class="k">Definition account</div><div class="v">${esc(tid)}</div>
       <div class="k">Sequencer</div><div class="v"><a class="lnk" href="/zone/${u(seq)}">${esc(sh(seq))}</a></div></div>
    </div>
+   <div class="panel" style="margin-bottom:16px"><div class="phead">Holders <span class="count" id="holdercount"></span></div>
+    <div class="tscroll" id="holdersscroll" style="max-height:440px;overflow-y:auto"><table class="ttbl"><thead><tr><th style="text-align:left">Holder account</th><th style="text-align:right">Balance</th></tr></thead><tbody id="holderrows"></tbody></table></div></div>
    <div class="panel"><div class="phead">Transactions <span class="count" id="count">${num(a.tx_count)}</span></div>
     ${filterBar()}
     <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows">${txRows(a.txs)}</tbody></table></div></div>`;
   const tokUrl=(cursor)=>{ const p=new URLSearchParams(); p.set('channel',seq); p.set('limit',PAGE);
     filterParams(p); return '/api/token/'+u(tid)+'?'+cursorParams(p,cursor); };
   attachScroll(tokUrl, a.txs||[]);
+  initHolders(seq,tid);
   wireFilter(()=>renderToken(seq,tid));
+}
+
+// Token-page Holders list — its own scrollable region (the tx feed uses window scroll), paginated
+// for infinite scroll via the def→holder index.
+var HOLD={next:null, loading:false, seq:null, tid:null};
+async function loadHolders(){
+  if(HOLD.loading || HOLD.next===false) return;
+  HOLD.loading=true;
+  const p=new URLSearchParams(); if(HOLD.seq) p.set('channel',HOLD.seq); p.set('limit','50'); if(HOLD.next) p.set('after',HOLD.next);
+  let r; try{ r=await (await fetch('/api/token/'+u(HOLD.tid)+'/holders?'+p.toString())).json(); }catch(e){ HOLD.loading=false; return; }
+  const el=$('holderrows'); if(!el){ HOLD.loading=false; return; }
+  const hs=r.holders||[];
+  el.insertAdjacentHTML('beforeend', hs.map(h=>`<tr>
+    <td><a class="lnk" href="/zone/${u(HOLD.seq||HOLD.tid)}/wallet/${u(h.account)}">${esc(sh(h.account,8,6))}</a></td>
+    <td style="text-align:right">${h.balance!=null?`<b>${grp(h.balance)}</b>`:'<span class="mut">—</span>'}</td></tr>`).join(''));
+  const cnt=$('holdercount'); if(cnt) cnt.textContent=el.children.length;
+  HOLD.next=(hs.length>=50 && r.next)?r.next:false;
+  HOLD.loading=false;
+  if(!el.children.length){ el.innerHTML='<tr><td colspan="2" class="mut" style="padding:12px 8px">no holders indexed yet</td></tr>'; }
+}
+function initHolders(seq,tid){
+  HOLD={next:null, loading:false, seq:seq, tid:tid};
+  loadHolders();
+  const sc=$('holdersscroll');
+  if(sc) sc.addEventListener('scroll', ()=>{ if(sc.scrollTop+sc.clientHeight >= sc.scrollHeight-100) loadHolders(); });
 }
 
 async function renderWallet(addr,seq){
@@ -5617,10 +5715,10 @@ async function renderWallet(addr,seq){
   if(!a){ $('view').innerHTML=crumb(base)+'<div class="panel"><div class="empty">account not found</div></div>'; return; }
   const muted=(t)=>`<span class="mut" style="font-size:14px;font-weight:400">${t}</span>`;
   const l2 = a.l2_balance!=null
-    ? esc(a.l2_balance)+' <span class="mut" style="font-size:11px;font-weight:400">sequencer RPC</span>'
+    ? grp(a.l2_balance)+' <span class="mut" style="font-size:11px;font-weight:400">sequencer RPC</span>'
     : muted(a.sequencer_rpc?'RPC unavailable':'no sequencer RPC');
   const l1 = a.l1_balance!=null
-    ? esc(a.l1_balance)+(a.l1_balance_block?` <span class="mut" style="font-size:11px;font-weight:400">@ #${num(a.l1_balance_block)}</span>`:'')
+    ? grp(a.l1_balance)+(a.l1_balance_block?` <span class="mut" style="font-size:11px;font-weight:400">@ #${num(a.l1_balance_block)}</span>`:'')
     : muted('not settled / private');
   const chans=(a.channels||[]).map(c=>`<a class="lnk" href="/zone/${u(c.channel)}/wallet/${u(addr)}">${chanLabel(c.channel, c.channel_short)}</a> <span class="mut">(${num(c.tx_count)} tx)</span>`).join(' &nbsp; ')||'<span class="mut">none</span>';
   $('view').innerHTML=crumb(base)+
@@ -5638,7 +5736,7 @@ async function renderWallet(addr,seq){
     <div class="tscroll"><table class="ttbl"><thead><tr><th style="text-align:left">Token</th><th style="text-align:right">Balance</th><th style="text-align:left">Holding account (ATA)</th></tr></thead>
     <tbody>${a.holdings.map(h=>`<tr>
       <td>${h.name?`<a class="lnk" href="/zone/${u(seq||a.channel)}/token/${u(h.definition)}">${esc(h.name)}</a>`:`<span class="mut" title="${esc(h.definition)}">${esc(sh(h.definition,6,4))}</span>`}</td>
-      <td style="text-align:right">${h.balance!=null?`<b>${esc(h.balance)}</b>`:'<span class="mut">—</span>'}</td>
+      <td style="text-align:right">${h.balance!=null?`<b>${grp(h.balance)}</b>`:'<span class="mut">—</span>'}</td>
       <td><a class="lnk" href="/zone/${u(seq||a.channel)}/wallet/${u(h.account)}">${esc(sh(h.account,6,4))}</a></td>
     </tr>`).join('')}</tbody></table></div></div>`:''}
    <div class="panel"><div class="phead">Transactions <span class="count" id="count">${num(a.tx_count)}</span></div>
@@ -5672,6 +5770,9 @@ async function doSearch(){
     try{ const r=await fetch('/api/tx/'+u(h)); if(r.ok){ const t=await r.json(); location.href='/zone/'+u(t.channel)+'/tx/'+u(h); return; } }catch(e){}
     location.href='/zone/'+u(h); return;       // treat as a channel id
   }
+  // non-hex id: a token DEFINITION -> the token page (its home channel), else an account.
+  try{ const r=await (await fetch('/api/whatis/'+u(v))).json();
+    if(r&&r.kind==='token'&&r.channel){ location.href='/zone/'+u(r.channel)+'/token/'+u(v); return; } }catch(e){}
   location.href='/wallet/'+u(v);               // otherwise an account
 }
 $('qbtn').addEventListener('click',doSearch);

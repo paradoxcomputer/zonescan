@@ -47,6 +47,9 @@ const HOLDING_DEF: TableDefinition<&str, &str> = TableDefinition::new("holding_d
 // range-scan the "owner\0" prefix for all of an owner's holdings in O(#holdings). Built from ata
 // Create ops [owner, definition, ata] at ingest — no store scan on the account page.
 const OWNER_ATA: TableDefinition<&str, &str> = TableDefinition::new("owner_ata");
+// token definition -> its holder ATAs. Key = "definition\0ata", value = owner; range-scan the
+// "definition\0" prefix (paginated) for the token's holders. Built from ata Create ops at ingest.
+const DEF_HOLDER: TableDefinition<&str, &str> = TableDefinition::new("def_holder");
 const TOKEN_MAP_VERSION: u64 = 1;
 // Bumped when raw-inscription txs need re-timestamping for the recency-ordered global feed.
 const RAW_TS_VERSION: u64 = 1;
@@ -410,6 +413,7 @@ impl Db {
             let mut tdef = w.open_table(TOKEN_DEF)?;
             let mut hdef = w.open_table(HOLDING_DEF)?;
             let mut owner_ata = w.open_table(OWNER_ATA)?;
+            let mut def_holder = w.open_table(DEF_HOLDER)?;
             for r in recs {
                 if r.hash.is_empty() {
                     continue;
@@ -423,9 +427,10 @@ impl Db {
                 if let Some((h, d)) = hold {
                     hdef.insert(h.as_str(), d.as_str())?;
                 }
-                // owner -> ATA holding link, from an ata Create (idempotent).
+                // owner->ATA + definition->holder links, from an ata Create (idempotent).
                 if let Some((owner, ata, def)) = ata_owner_link(r) {
                     owner_ata.insert(format!("{owner}\0{ata}").as_str(), def.as_str())?;
+                    def_holder.insert(format!("{def}\0{ata}").as_str(), owner.as_str())?;
                 }
                 // dedup - but if a re-scan now carries a field the stored record
                 // predates (instruction_data / deploy fields added after it was first
@@ -804,6 +809,48 @@ impl Db {
         out
     }
 
+    /// Holders of a token (paginated), via the definition→holder index. `after` = the last holder
+    /// ATA of the previous page (exclusive) for infinite scroll. Balances are filled by the serve
+    /// layer (RPC). O(limit) index reads — no store scan.
+    pub fn token_holders(&self, definition: &str, after: Option<&str>, limit: usize) -> Vec<Holding> {
+        use std::ops::Bound;
+        let mut out: Vec<Holding> = Vec::new();
+        let Ok(r) = self.db.begin_read() else {
+            return out;
+        };
+        let Ok(t) = r.open_table(DEF_HOLDER) else {
+            return out;
+        };
+        let (name, supply) =
+            self.resolve_token(definition).map(|(_, n, s)| (n, s)).unwrap_or_default();
+        let lo = after
+            .map(|a| format!("{definition}\0{a}"))
+            .unwrap_or_else(|| format!("{definition}\0"));
+        let hi = format!("{definition}\u{1}");
+        let lo_b = if after.is_some() {
+            Bound::Excluded(lo.as_str())
+        } else {
+            Bound::Included(lo.as_str())
+        };
+        if let Ok(it) = t.range::<&str>((lo_b, Bound::Excluded(hi.as_str()))) {
+            for (k, _) in it.flatten() {
+                if let Some(ata) = k.value().split('\0').nth(1) {
+                    out.push(Holding {
+                        balance: None,
+                        account: ata.to_string(),
+                        definition: definition.to_string(),
+                        name: name.clone(),
+                        supply: supply.clone(),
+                    });
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// For a token / ATA / native transfer, the (amount, token_name) to render in the feed
     /// and tx page (e.g. "250", "GOLD"). Amount is decoded from `instruction_data`; the name
     /// is resolved from any account (a definition, or a holding -> definition) via the
@@ -862,7 +909,7 @@ impl Db {
     pub fn relearn_tokens(&self) -> Result<usize> {
         let mut defs: Vec<(String, String)> = Vec::new();
         let mut holds: Vec<(String, String)> = Vec::new();
-        let mut owners: Vec<(String, String)> = Vec::new(); // ("owner\0ata", definition)
+        let mut atas: Vec<(String, String, String)> = Vec::new(); // (owner, ata, definition)
         {
             let r = self.db.begin_read()?;
             if let Ok(txs) = r.open_table(TXS) {
@@ -876,14 +923,14 @@ impl Db {
                     if let Some((h, d)) = hold {
                         holds.push((h, d));
                     }
-                    if let Some((owner, ata, def)) = ata_owner_link(&rec) {
-                        owners.push((format!("{owner}\0{ata}"), def));
+                    if let Some(link) = ata_owner_link(&rec) {
+                        atas.push(link);
                     }
                 }
             }
         }
         let n = defs.len();
-        if defs.is_empty() && holds.is_empty() && owners.is_empty() {
+        if defs.is_empty() && holds.is_empty() && atas.is_empty() {
             return Ok(0);
         }
         let w = self.db.begin_write()?;
@@ -891,14 +938,16 @@ impl Db {
             let mut tdef = w.open_table(TOKEN_DEF)?;
             let mut hdef = w.open_table(HOLDING_DEF)?;
             let mut owner_ata = w.open_table(OWNER_ATA)?;
+            let mut def_holder = w.open_table(DEF_HOLDER)?;
             for (d, v) in &defs {
                 tdef.insert(d.as_str(), v.as_str())?;
             }
             for (h, d) in &holds {
                 hdef.insert(h.as_str(), d.as_str())?;
             }
-            for (k, d) in &owners {
-                owner_ata.insert(k.as_str(), d.as_str())?;
+            for (owner, ata, def) in &atas {
+                owner_ata.insert(format!("{owner}\0{ata}").as_str(), def.as_str())?;
+                def_holder.insert(format!("{def}\0{ata}").as_str(), owner.as_str())?;
             }
         }
         w.commit()?;
@@ -1647,6 +1696,13 @@ mod tests {
         assert_eq!(h2[0].name, "GOLD");
         // an unrelated account has no holdings
         assert!(db.token_holdings("nobody").is_empty());
+        // holders of the token (def→holder index, paginated)
+        let holders = db.token_holders("GOLDDEF", None, 50);
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].account, "WALLET_GOLD_ATA");
+        assert_eq!(holders[0].name, "GOLD");
+        // cursor past the only holder -> empty page
+        assert!(db.token_holders("GOLDDEF", Some("WALLET_GOLD_ATA"), 50).is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
