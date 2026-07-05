@@ -30,7 +30,9 @@ use serde::Serialize;
 use super::{AcctBal, SeqTrack, TxRecord, MAX_PLAUSIBLE_BLOCK_ID};
 
 const TXS: TableDefinition<&str, &[u8]> = TableDefinition::new("txs");
-const IDX_FEED: TableDefinition<&[u8], &str> = TableDefinition::new("idx_feed");
+// NOTE: the block-ordered `idx_feed` table was removed — it was written on every tx but read
+// nowhere (the global feed uses the time-ordered IDX_FEED_TIME below). Any rows an older build
+// left on disk are harmless orphans.
 const IDX_FEED_TIME: TableDefinition<&[u8], &str> = TableDefinition::new("idx_feed_time");
 const IDX_CHANNEL: TableDefinition<&[u8], &str> = TableDefinition::new("idx_channel");
 const IDX_ACCOUNT: TableDefinition<&[u8], &str> = TableDefinition::new("idx_account");
@@ -308,16 +310,10 @@ fn is_ata_program(p: &str) -> bool {
     ) || program_name_is(p, "ata", 0.6)
 }
 
-/// Known token DEFINITION accounts (base58) -> ticker on the deployed zone, as a fallback
-/// when the on-chain `NewFungibleDefinition` op that names them wasn't ingested to learn it.
-const KNOWN_TOKENS: &[(&str, &str)] = &[
-    ("EvBnxwtWYAA5E3cWwxFAC8j6PDUECruhk4kEzaFPSmE8", "GOLD"),
-    ("EbPSjo2MEQuZjEveNSspeLCeqX1Z5e3GtHiY1M7DyytK", "SILV"),
-    ("5QWkMsv6cQX7AGj21g7j6kdDeebAmaK3wqeDbavsxUoU", "BRNZ"),
-];
-fn known_token(def: &str) -> Option<&'static str> {
-    KNOWN_TOKENS.iter().find(|(d, _)| *d == def).map(|(_, n)| *n)
-}
+// Token names are learned entirely from on-chain `NewFungibleDefinition` ops (TOKEN_DEF),
+// so there is no hardcoded ticker table: a per-zone hardcode goes stale on every chain reset
+// (the old ids were the dead 0101 GOLD/SILV/BRNZ definitions) and would mis-name accounts on
+// a zone whose real definitions differ.
 
 /// Token mappings a tx establishes:
 ///   (Some((definition, name, supply)) from a NewFungibleDefinition,
@@ -406,7 +402,6 @@ impl Db {
         let w = self.db.begin_write()?;
         {
             let mut txs = w.open_table(TXS)?;
-            let mut feed = w.open_table(IDX_FEED)?;
             let mut feed_time = w.open_table(IDX_FEED_TIME)?;
             let mut chan = w.open_table(IDX_CHANNEL)?;
             let mut acct = w.open_table(IDX_ACCOUNT)?;
@@ -466,11 +461,6 @@ impl Db {
                 let iv = inv(r.block_id);
                 let h = r.hash.as_bytes();
 
-                let mut fk = Vec::with_capacity(8 + h.len());
-                fk.extend_from_slice(&iv);
-                fk.extend_from_slice(h);
-                feed.insert(fk.as_slice(), r.hash.as_str())?;
-
                 // time-ordered global feed: inv(timestamp)+inv(block_id)+hash, so the
                 // newest-by-wall-clock tx leads regardless of per-channel block ids.
                 let it = inv(r.timestamp);
@@ -494,6 +484,31 @@ impl Db {
                     ak.extend_from_slice(&iv);
                     ak.extend_from_slice(h);
                     acct.insert(ak.as_slice(), r.hash.as_str())?;
+                }
+
+                // Token-activity index: a token Transfer touches only the two ATAs, never the
+                // token's definition account, so the token page (which lists account(definition))
+                // would miss it. Resolve each ATA -> its definition (learned in HOLDING_DEF from
+                // the ata Create) and index the tx under the definition too, reusing IDX_ACCOUNT so
+                // the token page needs no change. Both ATAs of a transfer resolve to the same
+                // definition -> one row (key includes the hash); skipped when the definition is
+                // already one of the tx's own accounts (the loop above indexed it).
+                if is_token_program(r.program.as_deref().unwrap_or("")) {
+                    let mut seen = std::collections::HashSet::new();
+                    for a in &r.accounts {
+                        let d = match hdef.get(a.as_str())? {
+                            Some(g) => g.value().to_string(),
+                            None => continue,
+                        };
+                        if seen.insert(d.clone()) && !r.accounts.iter().any(|x| *x == d) {
+                            let mut dk = Vec::with_capacity(d.len() + 9 + h.len());
+                            dk.extend_from_slice(d.as_bytes());
+                            dk.push(0);
+                            dk.extend_from_slice(&iv);
+                            dk.extend_from_slice(h);
+                            acct.insert(dk.as_slice(), r.hash.as_str())?;
+                        }
+                    }
                 }
             }
             if !summaries.is_empty() {
@@ -740,9 +755,6 @@ impl Db {
             let (name, supply) = unpack(g.value());
             return Some((account.to_string(), name, supply));
         }
-        if let Some(n) = known_token(account) {
-            return Some((account.to_string(), n.to_string(), String::new()));
-        }
         // account is a holding -> its definition -> name
         let hdef = r.open_table(HOLDING_DEF).ok()?;
         let definition = hdef.get(account).ok()??.value().to_string();
@@ -751,8 +763,8 @@ impl Db {
                 let (name, supply) = unpack(g.value());
                 Some((definition, name, supply))
             }
-            // learned holding->definition, but the name wasn't learned: known-token fallback
-            None => known_token(&definition).map(|n| (definition.clone(), n.to_string(), String::new())),
+            // learned holding->definition, but its name hasn't been learned yet
+            None => None,
         }
     }
 
@@ -854,15 +866,13 @@ impl Db {
     /// For a token / ATA / native transfer, the (amount, token_name) to render in the feed
     /// and tx page (e.g. "250", "GOLD"). Amount is decoded from `instruction_data`; the name
     /// is resolved from any account (a definition, or a holding -> definition) via the
-    /// learned maps + the known-token fallback. Either may be `None`.
+    /// on-chain-learned maps. Either may be `None`.
     pub fn token_op(&self, rec: &TxRecord) -> (Option<String>, Option<String>) {
         let prog = rec.program.as_deref().unwrap_or("");
         let amount = token_display_amount(rec);
         let name = if is_token_program(prog) || is_ata_program(prog) {
             rec.accounts.iter().find_map(|a| {
-                known_token(a).map(str::to_string).or_else(|| {
-                    self.resolve_token(a).map(|(_, n, _)| n).filter(|n| !n.is_empty())
-                })
+                self.resolve_token(a).map(|(_, n, _)| n).filter(|n| !n.is_empty())
             })
         } else {
             None
@@ -910,6 +920,8 @@ impl Db {
         let mut defs: Vec<(String, String)> = Vec::new();
         let mut holds: Vec<(String, String)> = Vec::new();
         let mut atas: Vec<(String, String, String)> = Vec::new(); // (owner, ata, definition)
+        // token ops (hash, block, accounts) to link into the token-activity index (see commit()).
+        let mut token_recs: Vec<(String, u64, Vec<String>)> = Vec::new();
         {
             let r = self.db.begin_read()?;
             if let Ok(txs) = r.open_table(TXS) {
@@ -926,6 +938,10 @@ impl Db {
                     if let Some(link) = ata_owner_link(&rec) {
                         atas.push(link);
                     }
+                    if is_token_program(rec.program.as_deref().unwrap_or("")) && !rec.hash.is_empty()
+                    {
+                        token_recs.push((rec.hash.clone(), rec.block_id, rec.accounts.clone()));
+                    }
                 }
             }
         }
@@ -933,6 +949,9 @@ impl Db {
         if defs.is_empty() && holds.is_empty() && atas.is_empty() {
             return Ok(0);
         }
+        // ata/holding -> definition, so token transfers can be linked to their definition.
+        let ata2def: std::collections::HashMap<&str, &str> =
+            holds.iter().map(|(h, d)| (h.as_str(), d.as_str())).collect();
         let w = self.db.begin_write()?;
         {
             let mut tdef = w.open_table(TOKEN_DEF)?;
@@ -948,6 +967,26 @@ impl Db {
             for (owner, ata, def) in &atas {
                 owner_ata.insert(format!("{owner}\0{ata}").as_str(), def.as_str())?;
                 def_holder.insert(format!("{def}\0{ata}").as_str(), owner.as_str())?;
+            }
+            // backfill the token-activity index (idempotent; mirrors the live path in commit()).
+            let mut acct = w.open_table(IDX_ACCOUNT)?;
+            for (hash, block, accounts) in &token_recs {
+                let iv = inv(*block);
+                let h = hash.as_bytes();
+                let mut seen = std::collections::HashSet::new();
+                for a in accounts {
+                    let Some(d) = ata2def.get(a.as_str()).copied() else {
+                        continue;
+                    };
+                    if seen.insert(d) && !accounts.iter().any(|x| x == d) {
+                        let mut dk = Vec::with_capacity(d.len() + 9 + h.len());
+                        dk.extend_from_slice(d.as_bytes());
+                        dk.push(0);
+                        dk.extend_from_slice(&iv);
+                        dk.extend_from_slice(h);
+                        acct.insert(dk.as_slice(), hash.as_str())?;
+                    }
+                }
             }
         }
         w.commit()?;
@@ -1706,6 +1745,40 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn token_transfer_indexed_under_definition() {
+        // A token Transfer touches only the two ATAs, never the definition account; the token
+        // page (which lists account(definition)) must still show it via the token-activity index.
+        let path = std::env::temp_dir().join(format!("zs-tokacct-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        db.learn_token("", "GOLDDEF", "GOLD", "1000000").unwrap();
+        // two ATA creates -> HOLDING_DEF learns A_ATA -> GOLDDEF and B_ATA -> GOLDDEF
+        let mut ca = rec("ca", "ch", 1, Some("ata"));
+        ca.instruction_data = vec![0u32];
+        ca.accounts = vec!["A".into(), "GOLDDEF".into(), "A_ATA".into()];
+        let mut cb = rec("cb", "ch", 2, Some("ata"));
+        cb.instruction_data = vec![0u32];
+        cb.accounts = vec!["B".into(), "GOLDDEF".into(), "B_ATA".into()];
+        db.commit(&[ca, cb], &[], &[], &[]).unwrap();
+        // a token Transfer between the two ATAs; the definition is NOT one of its accounts
+        let mut t = rec("t1", "ch", 3, Some("token"));
+        t.instruction_data = vec![0, 250, 0, 0, 0]; // Transfer(0){ amount = 250 }
+        t.accounts = vec!["A_ATA".into(), "B_ATA".into()];
+        db.commit(&[t], &[], &[], &[]).unwrap();
+        // the token page for GOLDDEF now includes the ATA<->ATA transfer (live commit path)
+        let (txs, _total, _ch) = db.account("GOLDDEF", None, None, None, None, false, 50).unwrap();
+        assert!(txs.iter().any(|r| r.hash == "t1"), "transfer must appear on the token page");
+        // relearn_tokens (the history/backfill path) is idempotent and keeps it present
+        db.relearn_tokens().unwrap();
+        let (txs2, _, _) = db.account("GOLDDEF", None, None, None, None, false, 50).unwrap();
+        assert_eq!(txs2.iter().filter(|r| r.hash == "t1").count(), 1, "no duplicate rows");
+        // the transfer never lands on an owner's own account page (it touched only the ATAs)
+        let (owner, _, _) = db.account("A", None, None, None, None, false, 50).unwrap();
+        assert!(owner.iter().all(|r| r.hash != "t1"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn rec(hash: &str, ch: &str, blk: u64, program: Option<&str>) -> TxRecord {
         let private = program.is_none();
         TxRecord {
@@ -1737,26 +1810,29 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let db = Db::open(&path).unwrap();
         let token = "c4584a559312f876bbde4248b1daf95f6fc895a42171734d3ffd32940c0adf24"; // rc5 token LE
-        // Transfer{amount:250} (variant 0) touching the GOLD definition account (known-token)
+        // Transfer{amount:250} (variant 0) touching a GOLD definition learned from the chain
+        db.learn_token("", "GOLDDEF", "GOLD", "0").unwrap();
         let mut t = rec("h1", "ch", 1, Some(token));
         t.instruction_data = vec![0, 250, 0, 0, 0];
-        t.accounts = vec!["EvBnxwtWYAA5E3cWwxFAC8j6PDUECruhk4kEzaFPSmE8".into()]; // GOLD def
+        t.accounts = vec!["GOLDDEF".into()];
         assert_eq!(db.token_op(&t), (Some("250".into()), Some("GOLD".into())));
-        // learned holding -> definition -> name (no known-token needed)
+        // learned holding -> definition -> name
         db.learn_token("HOLD1", "DEF1", "MED", "1000").unwrap();
         let mut u = rec("h2", "ch", 2, Some(token));
         u.instruction_data = vec![0, 7, 0, 0, 0];
         u.accounts = vec!["HOLD1".into()];
         assert_eq!(db.token_op(&u), (Some("7".into()), Some("MED".into())));
-        // NewFungibleDefinition{name:"BRNZ", total_supply:20000000} (variant 1) - amount is
-        // the supply, which sits AFTER the risc0 name string (the live-feed bug).
+        // NewFungibleDefinition{name:"BRNZ", total_supply:20000000} (variant 1) - amount is the
+        // supply, which sits AFTER the risc0 name string (the live-feed bug). Committing the op
+        // learns BRNZ from the chain, so the name resolves without any hardcoded ticker table.
         let mut d = rec("h4", "ch", 4, Some(token));
         d.instruction_data = vec![1, 4, 1515082306, 20000000, 0, 0, 0]; // [var, len, "BRNZ", supply..]
-        d.accounts = vec!["5QWkMsv6cQX7AGj21g7j6kdDeebAmaK3wqeDbavsxUoU".into()]; // BRNZ def
+        d.accounts = vec!["BRNZDEF".into()];
+        db.commit(std::slice::from_ref(&d), &[], &[], &[]).unwrap();
         assert_eq!(db.token_op(&d), (Some("20000000".into()), Some("BRNZ".into())));
         // account_token labels WHICH account produced the tag + its role
         assert_eq!(
-            db.account_token("EvBnxwtWYAA5E3cWwxFAC8j6PDUECruhk4kEzaFPSmE8"),
+            db.account_token("GOLDDEF"),
             Some(("GOLD".into(), "definition".into()))
         );
         assert_eq!(db.account_token("HOLD1"), Some(("MED".into(), "holding".into())));

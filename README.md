@@ -14,10 +14,14 @@ Downloads a prebuilt binary for your platform (or builds from source with Rust i
 
 ### Transaction decoding (optional)
 
-By default zonescan includes **full per-transaction decoding** (tx type / program / shield
-vs. deshield). Every release also ships a **light** prebuilt that omits it, useful because
-the full build is heavy (it pulls the logos-blockchain + risc0 stack). To install the light
-binary instead:
+By default zonescan includes **full per-transaction decoding**: it turns each program's
+risc0-serialized instruction into typed fields — tx type, program, token transfer amounts and
+learned token names, mints/burns, faucet claims, ATA creates, and shield vs. deshield. Programs
+are named by a **structural fingerprint classifier** that recognizes the built-ins even when a
+sequencer rebuild gives them different image ids, and operators can register an **ABI/schema**
+(and a program-name alias) for any program it doesn't yet know. Every release also ships a
+**light** prebuilt that omits decoding, useful because the full build is heavy (it pulls the
+logos-blockchain + risc0 stack). To install the light binary instead:
 
 ```sh
 ZONE_SCAN_DECODE=0 npm install -g @paradoxcomputer/zonescan
