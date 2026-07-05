@@ -36,6 +36,12 @@ const TXS: TableDefinition<&str, &[u8]> = TableDefinition::new("txs");
 const IDX_FEED_TIME: TableDefinition<&[u8], &str> = TableDefinition::new("idx_feed_time");
 const IDX_CHANNEL: TableDefinition<&[u8], &str> = TableDefinition::new("idx_channel");
 const IDX_ACCOUNT: TableDefinition<&[u8], &str> = TableDefinition::new("idx_account");
+// per-(channel,program) index: key = "channel\0program\0" + inv(block) + hash, value = hash.
+// Range-scan "channel\0program\0".."channel\0program\1" for O(limit) newest-first program txs
+// and an exact total, replacing db.program()'s up-to-SCAN_CAP walk of the whole channel index.
+// Keyed by the raw stored `program` string (name OR hex) so it stays consistent with the tx-row
+// links and the /api/txs program filter; the commit() relabel path keeps it in sync.
+const IDX_PROGRAM: TableDefinition<&[u8], &str> = TableDefinition::new("idx_program");
 const SEQ_SUMMARY: TableDefinition<&str, &[u8]> = TableDefinition::new("seq_summary");
 const ACCT_BAL: TableDefinition<&str, &[u8]> = TableDefinition::new("acct_bal");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
@@ -55,6 +61,8 @@ const DEF_HOLDER: TableDefinition<&str, &str> = TableDefinition::new("def_holder
 const TOKEN_MAP_VERSION: u64 = 1;
 // Bumped when raw-inscription txs need re-timestamping for the recency-ordered global feed.
 const RAW_TS_VERSION: u64 = 1;
+// Bumped to rebuild the per-(channel,program) index from stored txs (backfill_program_index).
+const PROG_IDX_VERSION: u64 = 1;
 
 /// Resolved TYPE for each program image id: `id -> (name, confidence, verified)`. `verified` = a
 /// registry / getProgramIds name (trusted, confidence 1.0); otherwise a classifier `≈` guess.
@@ -129,6 +137,18 @@ pub struct Db {
 
 fn inv(block_id: u64) -> [u8; 8] {
     (u64::MAX - block_id).to_be_bytes()
+}
+
+/// Composite key for IDX_PROGRAM: "channel\0program\0" + inv(block) + hash.
+fn prog_key(channel: &str, program: &str, iv: &[u8; 8], hash: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(channel.len() + program.len() + 10 + hash.len());
+    k.extend_from_slice(channel.as_bytes());
+    k.push(0);
+    k.extend_from_slice(program.as_bytes());
+    k.push(0);
+    k.extend_from_slice(iv);
+    k.extend_from_slice(hash);
+    k
 }
 
 // Values are stored as self-describing JSON: it round-trips serde
@@ -386,6 +406,11 @@ impl Db {
             Ok(_) => {}
             Err(e) => eprintln!("warning: token-name backfill failed: {e:#}"),
         }
+        match db.backfill_program_index() {
+            Ok(n) if n > 0 => eprintln!("per-program index: linked {n} tx(s) to their (channel, program)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: per-program index backfill failed: {e:#}"),
+        }
         Ok(db)
     }
 
@@ -405,6 +430,7 @@ impl Db {
             let mut feed_time = w.open_table(IDX_FEED_TIME)?;
             let mut chan = w.open_table(IDX_CHANNEL)?;
             let mut acct = w.open_table(IDX_ACCOUNT)?;
+            let mut prog = w.open_table(IDX_PROGRAM)?;
             let mut tdef = w.open_table(TOKEN_DEF)?;
             let mut hdef = w.open_table(HOLDING_DEF)?;
             let mut owner_ata = w.open_table(OWNER_ATA)?;
@@ -430,11 +456,13 @@ impl Db {
                 // dedup - but if a re-scan now carries a field the stored record
                 // predates (instruction_data / deploy fields added after it was first
                 // persisted), rewrite the body in place (indexes are hash-keyed).
-                let stored_needs_rewrite = match txs.get(r.hash.as_str())? {
-                    Some(g) => {
-                        let s: TxRecord = de(g.value())?;
-                        Some(
-                            (s.instruction_data.is_empty() && !r.instruction_data.is_empty())
+                // (needs_rewrite, old_program) — old_program kept so a relabel can re-key IDX_PROGRAM.
+                let stored_needs_rewrite: Option<(bool, Option<String>)> =
+                    match txs.get(r.hash.as_str())? {
+                        Some(g) => {
+                            let s: TxRecord = de(g.value())?;
+                            let needs = (s.instruction_data.is_empty()
+                                && !r.instruction_data.is_empty())
                                 || (s.deploy_program.is_empty() && !r.deploy_program.is_empty())
                                 || (s.bytecode_len == 0 && r.bytecode_len > 0)
                                 // re-label a program id a newer build now names (e.g. an
@@ -444,14 +472,28 @@ impl Db {
                                 // backfill the privacy op subtype onto older records
                                 || (!r.subtype.is_empty() && s.subtype != r.subtype)
                                 // backfill the public balance (enables shield/deshield relabel)
-                                || (s.pub_balance.is_none() && r.pub_balance.is_some()),
-                        )
-                    }
-                    None => None,
-                };
-                if let Some(needs) = stored_needs_rewrite {
+                                || (s.pub_balance.is_none() && r.pub_balance.is_some());
+                            Some((needs, s.program.clone()))
+                        }
+                        None => None,
+                    };
+                if let Some((needs, old_prog)) = stored_needs_rewrite {
                     if needs {
                         txs.insert(r.hash.as_str(), ser(r)?.as_slice())?;
+                        // keep IDX_PROGRAM consistent when the program label changed (block/hash
+                        // are stable): drop the stale old-program key, add the new one.
+                        let np = r.program.as_deref().filter(|p| !p.is_empty());
+                        if np != old_prog.as_deref() {
+                            let iv = inv(r.block_id);
+                            let h = r.hash.as_bytes();
+                            if let Some(op) = old_prog.as_deref().filter(|p| !p.is_empty()) {
+                                prog.remove(prog_key(&r.channel, op, &iv, h).as_slice())?;
+                            }
+                            if let Some(p) = np {
+                                prog.insert(prog_key(&r.channel, p, &iv, h).as_slice(),
+                                    r.hash.as_str())?;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -476,6 +518,11 @@ impl Db {
                 ck.extend_from_slice(&iv);
                 ck.extend_from_slice(h);
                 chan.insert(ck.as_slice(), r.hash.as_str())?;
+
+                // per-(channel,program) index for O(limit) program lookups + exact totals.
+                if let Some(p) = r.program.as_deref().filter(|p| !p.is_empty()) {
+                    prog.insert(prog_key(&r.channel, p, &iv, h).as_slice(), r.hash.as_str())?;
+                }
 
                 for a in &r.accounts {
                     let mut ak = Vec::with_capacity(a.len() + 9 + h.len());
@@ -1015,6 +1062,54 @@ impl Db {
         Ok(n)
     }
 
+    /// One-time backfill of the per-(channel,program) index from stored txs, so program lookups
+    /// on a store created before this index resolve in O(limit) too. Version-gated (runs once).
+    /// Idempotent: keys are (channel,program,block,hash), so re-inserting is a no-op.
+    pub fn backfill_program_index(&self) -> Result<usize> {
+        {
+            let r = self.db.begin_read()?;
+            if let Ok(m) = r.open_table(META) {
+                if m.get("prog_idx_version")?.map(|v| v.value()) == Some(PROG_IDX_VERSION) {
+                    return Ok(0);
+                }
+            }
+        }
+        // collect (channel, program, block, hash) in a read txn, then write (can't mutate a
+        // table mid-iteration; write the separate IDX_PROGRAM after the TXS scan completes).
+        let mut rows: Vec<(String, String, u64, String)> = Vec::new();
+        {
+            let r = self.db.begin_read()?;
+            if let Ok(txs) = r.open_table(TXS) {
+                for item in txs.iter()? {
+                    let (_, v) = item?;
+                    let rec: TxRecord = de(v.value())?;
+                    if rec.hash.is_empty() {
+                        continue;
+                    }
+                    if let Some(p) = rec.program.as_deref().filter(|p| !p.is_empty()) {
+                        rows.push((rec.channel, p.to_string(), rec.block_id, rec.hash));
+                    }
+                }
+            }
+        }
+        let n = rows.len();
+        let w = self.db.begin_write()?;
+        {
+            let mut prog = w.open_table(IDX_PROGRAM)?;
+            for (channel, program, block, hash) in &rows {
+                let iv = inv(*block);
+                prog.insert(
+                    prog_key(channel, program, &iv, hash.as_bytes()).as_slice(),
+                    hash.as_str(),
+                )?;
+            }
+            let mut m = w.open_table(META)?;
+            m.insert("prog_idx_version", PROG_IDX_VERSION)?;
+        }
+        w.commit()?;
+        Ok(n)
+    }
+
     /// Newest-first transaction feed: scoped to a channel, filtered by kind /
     /// free-text / program include+exclude, and paginated via the `after` cursor.
     pub fn feed(&self, o: &FeedOpts) -> Result<Vec<TxRecord>> {
@@ -1321,8 +1416,11 @@ impl Db {
         Ok((out, total, channels))
     }
 
-    /// Transactions whose program matches `label` within a channel (newest-first),
-    /// plus the total count of matches. Walks the per-channel index (capped).
+    /// Transactions whose program matches `label` within a channel (newest-first), plus the exact
+    /// total count of matches. Reads the per-(channel,program) index: O(limit) deserializes for the
+    /// page, and an exact total from key iteration alone (no per-tx deserialize, no SCAN_CAP) —
+    /// replacing the old walk of the whole channel index that both undercounted past 50k and paid
+    /// a TxRecord deserialize for every tx in the channel.
     pub fn program(
         &self,
         channel: &str,
@@ -1334,30 +1432,27 @@ impl Db {
             Ok(t) => t,
             Err(_) => return Ok((vec![], 0)),
         };
-        let idx = match r.open_table(IDX_CHANNEL) {
+        let idx = match r.open_table(IDX_PROGRAM) {
             Ok(t) => t,
             Err(_) => return Ok((vec![], 0)),
         };
+        // scope: "channel\0label\0" .. "channel\0label\1"
         let mut lo = channel.as_bytes().to_vec();
         lo.push(0);
+        lo.extend_from_slice(label.as_bytes());
+        lo.push(0);
         let mut hi = channel.as_bytes().to_vec();
+        hi.push(0);
+        hi.extend_from_slice(label.as_bytes());
         hi.push(1);
         let mut out = Vec::new();
         let mut total = 0usize;
-        let mut scanned = 0usize;
         for item in idx.range(lo.as_slice()..hi.as_slice())? {
-            if scanned >= SCAN_CAP {
-                break;
-            }
-            scanned += 1;
             let (_k, v) = item?;
-            if let Some(g) = txs.get(v.value())? {
-                let rec: TxRecord = de(g.value())?;
-                if rec.program.as_deref() == Some(label) {
-                    total += 1;
-                    if out.len() < limit {
-                        out.push(rec);
-                    }
+            total += 1;
+            if out.len() < limit {
+                if let Some(g) = txs.get(v.value())? {
+                    out.push(de(g.value())?);
                 }
             }
         }
@@ -1776,6 +1871,35 @@ mod tests {
         // the transfer never lands on an owner's own account page (it touched only the ATAs)
         let (owner, _, _) = db.account("A", None, None, None, None, false, 50).unwrap();
         assert!(owner.iter().all(|r| r.hash != "t1"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn program_index_query_count_and_relabel() {
+        let path = std::env::temp_dir().join(format!("zs-progidx-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let a = rec("pa", "ch", 1, Some("token"));
+        let b = rec("pb", "ch", 2, Some("token"));
+        let c = rec("pc", "ch", 3, Some("clock"));
+        db.commit(&[a, b, c], &[], &[], &[]).unwrap();
+        // exact total + O(limit) page, newest-first (block 2 before block 1)
+        let (txs, total) = db.program("ch", "token", 50).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(txs.len(), 2);
+        assert_eq!(txs[0].hash, "pb");
+        assert!(txs.iter().all(|t| t.program.as_deref() == Some("token")));
+        assert_eq!(db.program("ch", "clock", 50).unwrap().1, 1);
+        assert_eq!(db.program("ch", "nope", 50).unwrap().1, 0);
+        // a limit smaller than the total still reports the exact total
+        let (page, tot) = db.program("ch", "token", 1).unwrap();
+        assert_eq!((page.len(), tot), (1, 2));
+        // relabel: a rebuilt sequencer names a program a prior build stored as raw hex; the same
+        // hash re-commits with a new `program`, so the old key must move to the new one.
+        let c2 = rec("pc", "ch", 3, Some("clock_named"));
+        db.commit(&[c2], &[], &[], &[]).unwrap();
+        assert_eq!(db.program("ch", "clock", 50).unwrap().1, 0, "old key removed on relabel");
+        assert_eq!(db.program("ch", "clock_named", 50).unwrap().1, 1, "new key added on relabel");
         let _ = std::fs::remove_file(&path);
     }
 

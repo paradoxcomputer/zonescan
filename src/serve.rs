@@ -475,7 +475,14 @@ struct L1Track {
     /// Consecutive failed info polls; only flips `reachable` off after a few, so
     /// a single flaky-Tor timeout doesn't blink the dashboard to "unreachable".
     fail_streak: u32,
+    /// Bounded time-series of finality lag: (unix_secs, tip_slot - lib_slot), one sample per
+    /// info poll (~8s), capped at FINALITY_SERIES_CAP so it stays O(1) memory. Powers the
+    /// dashboard finality-lag sparkline; sampled only when both tip and lib slots are known.
+    finality_series: std::collections::VecDeque<(u64, u64)>,
 }
+
+/// How many finality-lag samples to retain (~8s each ⇒ ~180 = 24 min of history).
+const FINALITY_SERIES_CAP: usize = 180;
 
 /// Result of cross-checking a sequencer's settled chain against the L1 (and its
 /// RPC). All-zero counts with `checked > 0` means the chain verified clean.
@@ -999,6 +1006,9 @@ struct L1Snap {
     /// until the first successful `/cryptarchia/info` poll.
     #[serde(skip_serializing_if = "Option::is_none")]
     l1_version: Option<&'static str>,
+    /// Bounded finality-lag history as `[unix, lag]` pairs (oldest→newest) for the sparkline.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    finality_series: Vec<[u64; 2]>,
 }
 
 #[derive(Serialize)]
@@ -1150,6 +1160,7 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
             mode: s.l1.mode.clone(),
             synced: s.l1.mode.as_deref().map(|m| m == "online"),
             l1_version: s.l1.l1_version,
+            finality_series: s.l1.finality_series.iter().map(|&(t, l)| [t, l]).collect(),
         },
         sequencers,
     }
@@ -2277,6 +2288,13 @@ async fn refresh_info(client: &Client, base: &str, app: &AppState) {
                     s.l1.last_advance_unix = now;
                 }
                 s.l1.lib_slot = Some(l);
+            }
+            // sample finality lag for the sparkline (only when both slots are known).
+            if let (Some(tip), Some(lib)) = (s.l1.tip_slot, s.l1.lib_slot) {
+                s.l1.finality_series.push_back((now, tip.saturating_sub(lib)));
+                while s.l1.finality_series.len() > FINALITY_SERIES_CAP {
+                    s.l1.finality_series.pop_front();
+                }
             }
             s.l1.mode = info_mode(&v);
             s.l1.l1_version = Some(info_l1_version(&v));
@@ -5339,9 +5357,14 @@ function soloChannel(){ const s=state&&state.sequencers; return (s&&s.length===1
 function feedMatches(t){
   if(cur.kind==='zone'){ if(t.channel!==cur.seq) return false; }
   else if(cur.kind==='home'){ const solo=soloChannel(); if(solo && t.channel!==solo) return false; }
+  else if(cur.kind==='program'){ if(cur.seq && t.channel!==cur.seq) return false; if(t.program!==cur.prog) return false; }
+  else if(cur.kind==='wallet'){ if(cur.seq && t.channel!==cur.seq) return false; if(!(t.accounts||[]).includes(cur.addr)) return false; }
+  else if(cur.kind==='token'){ if(cur.seq && t.channel!==cur.seq) return false;
+    const a=t.accounts||[]; if(!(a.includes(cur.tid) || (cur.tname && t.token===cur.tname))) return false; }
   else return false;
-  if(!filterMatches(t)) return false;
-  // clock hidden unless the "clock" type chip is selected (clockOk checks FLT)
+  // the home/zone feeds honor the type-filter chips; detail pages have no chips.
+  if((cur.kind==='home'||cur.kind==='zone') && !filterMatches(t)) return false;
+  // clock hidden everywhere unless the "clock" type chip is selected (clockOk checks FLT)
   if(!clockOk(t)) return false;
   return true;
 }
@@ -5376,16 +5399,37 @@ function renderHeader(){
 // ---- views ----
 let cur={kind:'home'};
 
+// blocks/min throughput (cumulative avg over the observed window) — already in the snapshot.
+function bpmStr(s){ const v=s&&s.blocks_per_min;
+  return (v!=null&&isFinite(v))?(v>=10?num(Math.round(v)):v.toFixed(1))+' blk/min':''; }
+// tx-type mix (public / private / deploy) — only present with the decode build.
+function txMixStr(s){ const m=s&&s.tx_mix; if(!m) return ''; const p=[];
+  if(m.public) p.push(num(m.public)+' pub'); if(m.private) p.push(num(m.private)+' priv');
+  if(m.deploy) p.push(num(m.deploy)+' deploy'); return p.join(' · '); }
+// tiny inline-SVG sparkline of the finality-lag time series ([unix,lag] pairs).
+function sparkline(series,w,h){ series=series||[]; if(series.length<2) return '';
+  const ys=series.map(p=>p[1]); const mn=Math.min(...ys), mx=Math.max(...ys), rng=(mx-mn)||1, n=series.length;
+  const pts=series.map((p,i)=>((i/(n-1))*(w-2)+1).toFixed(1)+','+(h-1-((p[1]-mn)/rng)*(h-2)).toFixed(1)).join(' ');
+  const rising=ys[n-1]>ys[0];
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="display:block;margin-top:5px" aria-label="finality lag over time">`+
+    `<polyline points="${pts}" fill="none" stroke="${rising?'var(--red)':'var(--green)'}" stroke-width="1.5" stroke-linejoin="round"/></svg>`; }
+// patch the home stat cards in place on a live snapshot (avoids rebuilding the home tx feed).
+function updateHomeStats(){ if(!state) return; const l1=state.l1||{}, seqs=state.sequencers||[];
+  const set=(id,v)=>{ const el=$(id); if(el) el.textContent=v; };
+  set('stat_height',num(l1.height)); set('stat_finlag',num(l1.finality_lag));
+  set('stat_tipslot',num(l1.tip_slot)); set('stat_txtotal',num(state.tx_total)); set('stat_zones',num(seqs.length));
+  const sp=$('finspark'); if(sp) sp.innerHTML=sparkline(l1.finality_series,150,26); }
+
 function renderHome(){
   cur={kind:'home'};
   const l1=state?state.l1:{}, seqs=(state&&state.sequencers)||[];
   const alive=seqs.filter(s=>s.alive).length;
   $('view').innerHTML=`
   <div class="cards">
-    <div class="card"><div class="k">L1 Block Height</div><div class="v">${num(l1.height)}</div><div class="s">${l1.advancing===false?'not advancing':(l1.reachable?'advancing':'-')}</div></div>
-    <div class="card"><div class="k">Finality Lag</div><div class="v">${num(l1.finality_lag)}</div><div class="s">tip slot ${num(l1.tip_slot)}</div></div>
-    <div class="card"><div class="k">Transactions</div><div class="v">${num(state&&state.tx_total)}</div><div class="s">${state&&state.decode_feature?'decode on':'decode off'}</div></div>
-    <div class="card"><div class="k">Zones</div><div class="v">${num(seqs.length)}</div><div class="s">${alive} active</div></div>
+    <div class="card"><div class="k">L1 Block Height</div><div class="v" id="stat_height">${num(l1.height)}</div><div class="s">${l1.advancing===false?'not advancing':(l1.reachable?'advancing':'-')}</div></div>
+    <div class="card"><div class="k">Finality Lag</div><div class="v" id="stat_finlag">${num(l1.finality_lag)}</div><div class="s">tip slot <span id="stat_tipslot">${num(l1.tip_slot)}</span></div><div id="finspark">${sparkline(l1.finality_series,150,26)}</div></div>
+    <div class="card"><div class="k">Transactions</div><div class="v" id="stat_txtotal">${num(state&&state.tx_total)}</div><div class="s">${state&&state.decode_feature?'decode on':'decode off'}</div></div>
+    <div class="card"><div class="k">Zones</div><div class="v" id="stat_zones">${num(seqs.length)}</div><div class="s">${alive} active</div></div>
   </div>
   <div class="grid">
     <div class="panel"><div class="phead">Zones</div><div id="seqs"></div></div>
@@ -5415,7 +5459,7 @@ function renderSeqs(){
       <span class="dot ${s.alive?'on':'off'}"></span>
       <div class="sm"><div class="a">${esc(zoneTitle(s))}${consBadge(s)}</div>
         <div class="zmeta"><span class="zf"><span class="zk">Channel ID</span> <span class="chex">${esc(s.channel_short)}</span></span><span class="zf"><span class="zk">Sequencer version</span> ${verValue(s)}</span></div>
-        <div class="b">L2 ${l2Tip(s)} · L1 bal ${s.l1_balance!=null?num(s.l1_balance):'-'} · ${s.l1_signers||0} key(s)${tipNote(s)}${activityChip(s)}</div></div>
+        <div class="b">L2 ${l2Tip(s)} · L1 bal ${s.l1_balance!=null?num(s.l1_balance):'-'} · ${s.l1_signers||0} key(s)${bpmStr(s)?' · '+bpmStr(s):''}${tipNote(s)}${activityChip(s)}</div></div>
       <span class="st ${s.alive?'alive':'idle'}">${s.alive?'ALIVE':'IDLE'}</span></a>`).join('')
       + (seqs.length>cur.seqShown?`<div class="empty" style="padding:12px">scroll for ${seqs.length-cur.seqShown} more…</div>`:'')
     : `<div class="empty">${state&&state.discovering?'scanning the L1 for sequencers…':'no sequencers found'}</div>`;
@@ -5488,10 +5532,12 @@ async function renderZone(seq){
     <div class="ovw">
       <div><div class="k">Latest L2 Block</div><div class="v">${l2Tip(s)}</div></div>
       <div><div class="k">L1 Channel Balance</div><div class="v">${s.l1_balance!=null?num(s.l1_balance):'-'}</div></div>
+      <div><div class="k">Throughput</div><div class="v">${bpmStr(s)||'-'}</div></div>
       <div><div class="k">Status</div><div class="v" style="color:${s.alive?'var(--green)':'var(--soft)'}">${s.alive?'ALIVE':'IDLE'}</div></div>
     </div>
     <div class="kv" style="padding:16px">
       <div class="k">Channel id</div><div class="v">${esc(seq)}</div>
+      ${txMixStr(s)?`<div class="k">Tx mix</div><div class="v">${txMixStr(s)}</div>`:''}
       <div class="k">LEZ Version</div><div class="v">${s.version?esc(s.version):'-'}</div>
       <div class="k">Last settled</div><div class="v">${s.tip_change_unix?fmtAge(s.tip_change_unix):'-'} <span class="mut" style="font-size:11px">(channel tip)</span></div>
       <div class="k">Signer keys</div><div class="v">${num(s.l1_signers)}</div>
@@ -5528,7 +5574,7 @@ function rawPayloadPanel(t){
 }
 
 async function renderTx(seq,hash){
-  cur={kind:'tx'};
+  cur={kind:'tx',seq,hash};
   $('view').innerHTML=crumb([{t:'Home',href:'/'},{t:'Zone '+sh(seq),href:'/zone/'+u(seq)},{t:'Tx '+sh(hash)}])+'<div class="panel"><div class="empty">loading transaction…</div></div>';
   let t; try{ const r=await fetch('/api/tx/'+u(hash)); if(r.ok) t=await r.json(); }catch(e){}
   if(!t){ $('view').innerHTML=crumb([{t:'Home',href:'/'},{t:'Zone '+sh(seq),href:'/zone/'+u(seq)},{t:'Tx '+sh(hash)}])+'<div class="panel"><div class="empty">transaction not found in the current window</div></div>'; return; }
@@ -5577,7 +5623,7 @@ async function renderTx(seq,hash){
 }
 
 async function renderProgram(seq,prog){
-  cur={kind:'program'};
+  cur={kind:'program',seq,prog};
   const g=guessFor(prog,null);
   // generic `≈ transfer` describes the operation, not the program's identity - the header
   // keeps the short id and the Shape row below carries the `≈ transfer`.
@@ -5588,6 +5634,7 @@ async function renderProgram(seq,prog){
     <div class="ovw">
       <div><div class="k">Program</div><div class="v" style="font-size:15px;word-break:break-all">${nameCell}</div></div>
       <div><div class="k">Sequencer</div><div class="v" style="font-size:13px"><a class="lnk" href="/zone/${u(seq)}">${esc(sh(seq))}</a></div></div>
+      <div><div class="k">Transactions</div><div class="v" id="progtxcount">…</div></div>
     </div>
     ${g?`<div class="kv" style="padding:0 16px 4px"><div class="k">${g.generic?'Shape':'Name'}</div><div class="v"><span class="pguess">≈ ${esc(g.name)}</span>${g.token?` · defines <span class="pguess" title="token symbol read from this program's on-chain NewFungibleDefinition — unverified">≈ ${esc(g.token)}</span>`:''} <span class="mut" style="font-size:12px">${esc(guessTip(g))}</span></div></div>`:''}
     <div class="kv" style="padding:16px"><div class="k">Program id</div><div class="v">${esc(prog)}</div></div>
@@ -5596,6 +5643,10 @@ async function renderProgram(seq,prog){
    <div class="panel"><div class="phead">Transactions <span class="count" id="count"></span></div>
     <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows"></tbody></table></div></div>`;
   txFeed((cursor)=>{ const p=new URLSearchParams(); p.set('channel',seq); p.set('program',prog); p.set('limit',PAGE); p.set('clock','1'); return '/api/txs?'+cursorParams(p,cursor); });
+  // exact per-program total from the indexed /api/program (O(program-size) key count, no scan).
+  fetch('/api/program/'+u(prog)+'?channel='+u(seq)).then(r=>r.json()).then(d=>{
+    const el=$('progtxcount'); if(el && cur.kind==='program' && cur.prog===prog) el.textContent=num(d.tx_count);
+  }).catch(()=>{});
 }
 // instruction-schema panel: show a registered schema, or (for an unresolved custom
 // program) an open submission form - validated against the program's real instructions.
@@ -5653,12 +5704,15 @@ async function submitSchema(seq,prog){
 }
 
 async function renderToken(seq,tid){
-  cur={kind:'token'};
+  cur={kind:'token',seq,tid};
   const base=[{t:'Home',href:'/'},{t:'Zone '+sh(seq),href:'/zone/'+u(seq)},{t:'Token '+sh(tid)}];
   $('view').innerHTML=crumb(base)+'<div class="panel"><div class="empty">loading token…</div></div>';
   let a; try{ const p=new URLSearchParams(); p.set('channel',seq); filterParams(p);
     a=await (await fetch('/api/token/'+u(tid)+'?'+p.toString())).json(); }catch(e){}
   if(!a){ $('view').innerHTML=crumb(base)+'<div class="panel"><div class="empty">token not found</div></div>'; return; }
+  // the token's ticker, so a live-pushed ATA<->ATA transfer (which carries the name, not the
+  // definition account) still matches this page in feedMatches.
+  if(cur.kind==='token' && cur.tid===tid) cur.tname=a.name||'';
   $('view').innerHTML=crumb(base)+
    `<div class="panel" style="margin-bottom:16px"><div class="phead">Token <span class="count">${esc(a.name||sh(tid))}</span></div>
     <div class="ovw">
@@ -5707,7 +5761,7 @@ function initHolders(seq,tid){
 }
 
 async function renderWallet(addr,seq){
-  cur={kind:'wallet'};
+  cur={kind:'wallet',addr,seq};
   const base=seq?[{t:'Home',href:'/'},{t:'Zone '+sh(seq),href:'/zone/'+u(seq)},{t:'Wallet '+sh(addr)}]:[{t:'Home',href:'/'},{t:'Wallet '+sh(addr)}];
   $('view').innerHTML=crumb(base)+'<div class="panel"><div class="empty">loading account…</div></div>';
   let a; try{ const p=new URLSearchParams(); if(seq) p.set('channel',seq); filterParams(p); const qs=p.toString();
@@ -5785,7 +5839,11 @@ async function loadGuesses(){ try{ GUESS=await (await fetch('/api/program_guesse
 async function loadSchemas(){ try{ SCHEMAS=await (await fetch('/api/schemas')).json()||{}; }catch(e){} }
 const es=new EventSource('/events');
 es.onmessage=(e)=>{ try{ const m=JSON.parse(e.data);
-  if(m.t==='snap'){ state=m.d; renderHeader(); if(cur.kind==='home') renderSeqs(); }
+  if(m.t==='snap'){ state=m.d; renderHeader();
+    // views that read live snapshot fields update in place; feeds keep updating via prependTxs.
+    if(cur.kind==='home'){ renderSeqs(); updateHomeStats(); }
+    else if(cur.kind==='tx' && cur.hash) renderTx(cur.seq, cur.hash); // finality may have advanced
+  }
   else if(m.t==='txs'){ prependTxs(m.d); }
 }catch(_){} };
 (async()=>{ await Promise.all([loadState(),loadProgs(),loadGuesses(),loadSchemas()]); route(); })();
