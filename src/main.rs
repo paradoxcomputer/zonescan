@@ -767,21 +767,20 @@ pub fn decode_inscription_with(ins: &Value, tx_hash: Option<&str>) -> Option<Dec
 fn decode_block_detail(
     bytes: &[u8],
 ) -> (Option<TxMix>, Vec<TxInfo>, Option<(String, String, bool)>, bool, bool) {
-    use common::transaction::NSSATransaction as T;
+    use common::transaction::LeeTransaction as T;
     use borsh::BorshDeserialize;
-    // The linked build is rc4, whose Block = header + body + bedrock_status + a trailing
-    // bedrock_parent_id ([u8;32]). rc5 dropped that trailing field (it isn't part of the
-    // hashed data - HashableBlockData covers only header + transactions). So read the
-    // fields that exist via a reader and default the optional trailing id; rc3/rc4/rc5
-    // (whose header + transaction layouts are identical) all decode.
+    // rc5 Block = header + body + bedrock_status. (rc4 carried a trailing bedrock_parent_id
+    // ([u8;32]) that rc5 dropped; it was never part of the hashed data - HashableBlockData
+    // covers only header + transactions.) We read the fields via a reader and simply leave any
+    // trailing bytes unread, so both the rc5 shape (exact fit) and an older rc4-shape blob
+    // (32 extra trailing bytes) decode - their header + transaction layouts are identical.
     let block = {
         let mut rdr: &[u8] = bytes;
         let parsed = (|| -> Option<common::block::Block> {
             let header = common::block::BlockHeader::deserialize_reader(&mut rdr).ok()?;
             let body = common::block::BlockBody::deserialize_reader(&mut rdr).ok()?;
             let bedrock_status = common::block::BedrockStatus::deserialize_reader(&mut rdr).ok()?;
-            let bedrock_parent_id = <[u8; 32]>::deserialize_reader(&mut rdr).unwrap_or_default();
-            Some(common::block::Block { header, body, bedrock_status, bedrock_parent_id })
+            Some(common::block::Block { header, body, bedrock_status })
         })();
         match parsed {
             Some(b) => b,
@@ -850,7 +849,7 @@ fn decode_block_detail(
                 // the deployment carries the full guest ELF; the deployed program id
                 // is the risc0 image id of that ELF (computed, not stated on-chain).
                 let bytecode = d.clone().into_message().into_bytecode();
-                let deploy_program = nssa::program::Program::new(bytecode.clone())
+                let deploy_program = lee::program::Program::new(bytecode.clone())
                     .ok()
                     .map(|p| program_id_hex(&p.id()))
                     .unwrap_or_default();
@@ -901,7 +900,7 @@ pub fn program_id_hex(pid: &[u32; 8]) -> String {
 /// Human label for a program id: a known built-in name, else a short hex of the id.
 #[cfg(feature = "decode")]
 fn program_label(pid: &[u32; 8]) -> String {
-    use nssa::program::Program;
+    use lee::program::Program;
     use std::collections::HashMap;
     use std::sync::OnceLock;
     static MAP: OnceLock<HashMap<[u32; 8], &'static str>> = OnceLock::new();
@@ -922,12 +921,12 @@ fn program_label(pid: &[u32; 8]) -> String {
     )
 }
 
-/// The built-in program ids (hex) -> name, computed from our (rc4) build. Lets the
+/// The built-in program ids (hex) -> name, computed from our (rc5) build. Lets the
 /// server name programs without a reachable sequencer `getProgramIds` RPC, and resolve
 /// ids stored as raw hex by an older build (e.g. the clock `625e7b…`).
 #[cfg(feature = "decode")]
 pub fn builtin_program_ids() -> Vec<(String, String)> {
-    use nssa::program::Program;
+    use lee::program::Program;
     let hex = |id: [u32; 8]| program_id_hex(&id);
     vec![
         (hex(Program::authenticated_transfer_program().id()), "authenticated_transfer".into()),
@@ -1397,8 +1396,10 @@ mod tests {
     }
 
     // rc5 dropped the trailing `bedrock_parent_id` ([u8;32]) from Block; its header +
-    // transaction layouts are identical to rc4. A block whose trailing 32 bytes are
-    // stripped (the rc5 shape) must still recover the txs + the same hash verdict.
+    // transaction layouts are identical to rc4. The linked lib is now rc5, so `borsh::to_vec`
+    // emits the rc5 shape; an older rc4-shape blob is the same bytes with 32 trailing bytes
+    // appended. Both must recover the same txs + hash verdict (the decoder leaves any trailing
+    // bytes unread).
     #[cfg(feature = "decode")]
     #[test]
     fn decodes_rc4_and_rc5_block_shapes() {
@@ -1407,21 +1408,22 @@ mod tests {
             common::test_utils::produce_dummy_empty_transaction(),
         ];
         let block = common::test_utils::produce_dummy_block(7, Some(common::HashType([1; 32])), txs);
-        let full = borsh::to_vec(&block).unwrap(); // rc4 shape (trailing bedrock_parent_id present)
+        let rc5 = borsh::to_vec(&block).unwrap(); // rc5 shape (no trailing bedrock_parent_id)
 
-        let (mix4, txs4, chk4, f4, s4) = decode_block_detail(&full);
-        assert!(mix4.is_some() && chk4.is_some() && !txs4.is_empty(), "rc4-shaped block decodes");
+        let (mix5, txs5, chk5, f5, s5) = decode_block_detail(&rc5);
+        assert!(mix5.is_some() && chk5.is_some() && !txs5.is_empty(), "rc5-shaped block decodes");
         // dummy blocks are Pending, and Finalized always implies Safe.
-        assert!(!f4 && !s4, "a pending dummy block is neither final nor safe");
+        assert!(!f5 && !s5, "a pending dummy block is neither final nor safe");
 
-        let rc5 = &full[..full.len() - 32]; // strip the trailing bedrock_parent_id (the rc5 shape)
-        let (mix5, txs5, chk5, f5, s5) = decode_block_detail(rc5);
-        assert!(mix5.is_some(), "rc5-shaped block (trailing field dropped) still decodes");
-        assert_eq!((f4, s4), (f5, s5), "rc4/rc5 shapes recover the same bedrock status");
-        // full (rc4) and stripped (rc5) must recover the identical transactions + hash verdict
-        assert_eq!(txs5.len(), txs4.len(), "same transactions recovered");
-        assert_eq!(txs5[0].hash, txs4[0].hash, "same first tx hash");
-        assert_eq!(chk5.unwrap().2, chk4.unwrap().2, "same hash verdict (bedrock_parent_id isn't hashed)");
+        let mut rc4 = rc5.clone();
+        rc4.extend_from_slice(&[0u8; 32]); // old rc4 shape: trailing bedrock_parent_id present
+        let (mix4, txs4, chk4, f4, s4) = decode_block_detail(&rc4);
+        assert!(mix4.is_some(), "rc4-shaped block (trailing field present) still decodes");
+        assert_eq!((f5, s5), (f4, s4), "rc4/rc5 shapes recover the same bedrock status");
+        // rc5 (exact) and rc4 (trailing bytes) must recover the identical transactions + verdict
+        assert_eq!(txs4.len(), txs5.len(), "same transactions recovered");
+        assert_eq!(txs4[0].hash, txs5[0].hash, "same first tx hash");
+        assert_eq!(chk4.unwrap().2, chk5.unwrap().2, "same hash verdict (bedrock_parent_id isn't hashed)");
     }
 
     // A real settled clock block from the netcup L1 (rc5). Its single tx is the clock

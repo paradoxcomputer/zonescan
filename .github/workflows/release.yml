@@ -22,12 +22,14 @@ name: release
 #  ZONE_SCAN_DECODE=0 users never need a Rust toolchain.
 #
 # ── About the decode build ──────────────────────────────────────────────────
-#  `--features decode` pulls common/nssa from the PUBLIC git dependency
+#  `--features decode` pulls common/lee from the PUBLIC git dependency
 #  github.com/logos-blockchain/logos-execution-zone (pinned to the immutable tag
-#  v0.2.0-rc4 in Cargo.toml - a tag, not a branch commit, so it can't be GC'd) plus the
+#  v0.2.0-rc5 in Cargo.toml - a tag, not a branch commit, so it can't be GC'd) plus the
 #  logos-blockchain node stack, whose `pol` build embeds the zk circuits release (fetched
-#  below). It is unproven on windows-msvc / Intel mac, so those are best-effort - a
-#  failure there drops only the full binary, never the light one.
+#  below). `lee` reads the repo's committed prebuilt guest ELFs (artifacts/program_methods/*.bin)
+#  and hashes them for the image ids, so NO risc0 guest toolchain is needed here. It is unproven
+#  on windows-msvc / Intel mac, so those are best-effort - a failure there drops only the full
+#  binary, never the light one.
 #
 # Actions are pinned to commit SHAs (the trailing `# vN` is the human-readable tag).
 
