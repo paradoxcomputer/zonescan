@@ -98,7 +98,7 @@ jobs:
             ext: ".exe"
             experimental: true
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # The decode build's `pol` build script embeds zk verification keys via include_bytes!,
       # so the circuits release must be on disk before the build. zone-scan only DECODES
@@ -231,7 +231,7 @@ jobs:
       contents: read
       id-token: write # npm publish --provenance (sigstore attestation)
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
