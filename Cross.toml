@@ -9,3 +9,9 @@
 [build.env]
 passthrough = ["LOGOS_BLOCKCHAIN_CIRCUITS", "CARGO_NET_GIT_FETCH_WITH_CLI"]
 volumes = ["LOGOS_BLOCKCHAIN_CIRCUITS"]
+
+# The logos-blockchain `pol` stack pulls `rust-rapidsnark`, whose build script downloads a
+# prebuilt rapidsnark blob and `unzip`s it. The cross container doesn't ship `unzip`, so the
+# decode build fails with "unzip: not found". Install it (host tool) before the build.
+[target.aarch64-unknown-linux-gnu]
+pre-build = ["apt-get update && apt-get install -y --no-install-recommends unzip"]
