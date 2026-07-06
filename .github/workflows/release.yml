@@ -133,7 +133,7 @@ jobs:
       # `cross` is only needed for the aarch64 linux cross-compile.
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@682e7d9e49c5e653d371fc6adbda67653461378a # v2
+        uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2
         with:
           tool: cross
 
