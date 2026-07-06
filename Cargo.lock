@@ -720,7 +720,7 @@ name = "bridge_core"
 version = "0.1.0"
 source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0-rc5#27360cb7d6ccb2bfbcca7d171bab8a3938490264"
 dependencies = [
- "lee_core",
+ "lee_core 0.1.0 (git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0-rc5)",
  "serde",
 ]
 
@@ -731,6 +731,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
 dependencies = [
  "tinyvec",
+]
+
+[[package]]
+name = "build_utils"
+version = "0.1.0"
+source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0#a58fbce2ff48c58b7bb5001b1a27e64b9596ee3a"
+dependencies = [
+ "anyhow",
+ "risc0-binfmt",
 ]
 
 [[package]]
@@ -938,7 +947,7 @@ version = "0.1.0"
 source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0-rc5#27360cb7d6ccb2bfbcca7d171bab8a3938490264"
 dependencies = [
  "borsh",
- "lee_core",
+ "lee_core 0.1.0 (git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0-rc5)",
 ]
 
 [[package]]
@@ -973,8 +982,8 @@ dependencies = [
  "borsh",
  "clock_core",
  "hex",
- "lee",
- "lee_core",
+ "lee 0.1.0 (git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0-rc5)",
+ "lee_core 0.1.0 (git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0-rc5)",
  "log",
  "logos-blockchain-common-http-client",
  "serde",
@@ -1664,7 +1673,7 @@ name = "faucet_core"
 version = "0.1.0"
 source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0-rc5#27360cb7d6ccb2bfbcca7d171bab8a3938490264"
 dependencies = [
- "lee_core",
+ "lee_core 0.1.0 (git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0-rc5)",
  "serde",
 ]
 
@@ -2715,6 +2724,27 @@ dependencies = [
 [[package]]
 name = "lee"
 version = "0.1.0"
+source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0#a58fbce2ff48c58b7bb5001b1a27e64b9596ee3a"
+dependencies = [
+ "anyhow",
+ "borsh",
+ "build_utils",
+ "hex",
+ "k256",
+ "lee_core 0.1.0 (git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0)",
+ "log",
+ "rand 0.8.6",
+ "risc0-binfmt",
+ "risc0-zkvm",
+ "serde",
+ "serde_with",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lee"
+version = "0.1.0"
 source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0-rc5#27360cb7d6ccb2bfbcca7d171bab8a3938490264"
 dependencies = [
  "anyhow",
@@ -2724,7 +2754,7 @@ dependencies = [
  "faucet_core",
  "hex",
  "k256",
- "lee_core",
+ "lee_core 0.1.0 (git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0-rc5)",
  "log",
  "rand 0.8.6",
  "risc0-binfmt",
@@ -2733,6 +2763,23 @@ dependencies = [
  "serde",
  "serde_with",
  "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lee_core"
+version = "0.1.0"
+source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0#a58fbce2ff48c58b7bb5001b1a27e64b9596ee3a"
+dependencies = [
+ "base58",
+ "borsh",
+ "bytemuck",
+ "bytesize",
+ "chacha20",
+ "ml-kem",
+ "risc0-zkvm",
+ "serde",
+ "serde_with",
  "thiserror 2.0.18",
 ]
 
@@ -7518,7 +7565,7 @@ dependencies = [
  "common",
  "futures",
  "hex",
- "lee",
+ "lee 0.1.0 (git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.2.0)",
  "redb",
  "reqwest",
  "serde",
