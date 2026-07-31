@@ -641,6 +641,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bincode"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6a120d2e16b3e1b4a24bd70f23b12d3e16b81f113364a26935f8db7245452d"
+
+[[package]]
 name = "bit-vec"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3427,7 +3433,7 @@ version = "0.1.2"
 source = "git+https://github.com/logos-blockchain/logos-blockchain.git?rev=d8711bbc3d43d3ef9755ef9b73af32fd0f703160#d8711bbc3d43d3ef9755ef9b73af32fd0f703160"
 dependencies = [
  "ark-ff",
- "bincode",
+ "bincode 1.3.3",
  "blake2",
  "bytes",
  "const-hex",
@@ -5359,7 +5365,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22b7eafb5d85be59cbd9da83f662cf47d834f1b836e14f675d1530b12c666867"
 dependencies = [
  "anyhow",
- "bincode",
+ "bincode 1.3.3",
  "borsh",
  "bytemuck",
  "bytes",
@@ -7540,7 +7546,7 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
- "bincode",
+ "bincode 3.0.0",
  "borsh",
  "chrono",
  "clap",
