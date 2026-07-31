@@ -44,4 +44,4 @@ lee = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", ta
 # `artifacts` feature embeds the prebuilt guest binaries so their image ids resolve.
 programs = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0", features = ["artifacts"], optional = true }
 borsh = { version = "1.5", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
