@@ -58,6 +58,13 @@ the setup page, or set it via env / `.env` (copy `.env.example`).
 Point it at a **Logos L1 node**. Every sequencer settles its blocks to the L1, so a single
 node sees them all and a sequencer can neither lie about nor hide what it settled. This mode
 adds L1 finality / lag, on-chain channel collateral, and can auto-discover sequencers.
+Discovery also adopts **data channels** — channels whose inscriptions are raw text/data
+payloads rather than valid LEZ sequencer blocks (e.g. cid-pin registries). They are
+indexed like any channel, each inscription shown as a raw row, and badged `data` in the
+UI so they are never mistaken for a sequencer. Set `ZONE_SCAN_DISCOVER_DATA=0` to
+auto-track real sequencers only. Recognized formats get a structured view: a `cid_pin`
+record renders its title, source and per-file IPFS view/download links on the
+transaction page (gateway configurable via `ZONE_SCAN_IPFS_GATEWAY`, default ipfs.io).
 
 ```sh
 ZONE_SCAN_L1_NODE_URL=http://localhost:8080

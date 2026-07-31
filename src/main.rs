@@ -38,6 +38,8 @@ pub const ALIASES: &[(&str, &str)] = &[
     ("tg-dev", "0101010101010101010101010101010101010101010101010101010101010101"),
     ("rc4", "0202020202020202020202020202020202020202020202020202020202020202"),
     ("psychopomp", "4242424242424242424242424242424242424242424242424242424242424242"),
+    ("paradox", "7777777777777777777777777777777777777777777777777777777777777777"),
+    ("paradox-old", "8888888888888888888888888888888888888888888888888888888888888888"),
 ];
 
 /// Display aliases: a sequencer channel id -> a friendly name shown in the UI as the
@@ -45,10 +47,18 @@ pub const ALIASES: &[(&str, &str)] = &[
 /// `ALIASES` above (which maps a typed name -> a channel id for CLI input). Extend by
 /// adding `(channel_hex, "Display Name")` pairs.
 pub const CHANNEL_ALIASES: &[(&str, &str)] = &[
-    // Live netcup zone (rc5, 60s clocks) — the current "Paradox Computer".
+    // Live netcup zone (official LEZ v0.2.0, since 2026-07-31) — the current
+    // "Paradox Computer". Fresh channel: v0.2.0 program ImageIDs are incompatible
+    // with the rc5 chain, so the zone restarted here rather than epoch-reset in place.
+    (
+        "7777777777777777777777777777777777777777777777777777777777777777",
+        "Paradox Computer",
+    ),
+    // The rc5-era Paradox zone, frozen at block 42036 when the sequencer moved to
+    // 7777… on 2026-07-31. Kept tracked (history + rc5 badge), no sequencer RPC.
     (
         "8888888888888888888888888888888888888888888888888888888888888888",
-        "Paradox Computer",
+        "Paradox Computer (old)",
     ),
     // The default LEZ "dev" channel: stock config (default all-0x25 key) settles here,
     // so it's a shared/contended commons, not our zone. We were on it pre-2026-07-01 reset.
@@ -213,12 +223,15 @@ async fn main() -> Result<()> {
                     rpc_url: String::new(),
                     full: false,
                     discovered: false,
+                    data_channel: false,
                 })
                 .collect(),
             program_names: Vec::new(),
             program_schemas: Vec::new(),
             skip_clock: false,
             discover_limit: None,
+            discover_data: None,
+            ipfs_gateway: None,
         });
         return serve::cmd_serve(&host, port, config_path, seed).await;
     }
@@ -849,7 +862,7 @@ fn decode_block_detail(
                 // the deployment carries the full guest ELF; the deployed program id
                 // is the risc0 image id of that ELF (computed, not stated on-chain).
                 let bytecode = d.clone().into_message().into_bytecode();
-                let deploy_program = lee::program::Program::new(bytecode.clone())
+                let deploy_program = lee::program::Program::new(bytecode.clone().into())
                     .ok()
                     .map(|p| program_id_hex(&p.id()))
                     .unwrap_or_default();
@@ -898,21 +911,24 @@ pub fn program_id_hex(pid: &[u32; 8]) -> String {
 }
 
 /// Human label for a program id: a known built-in name, else a short hex of the id.
+/// v0.2.0 moved the built-in constructors from `lee::program::Program` to the
+/// `programs` crate, and added vault/faucet/bridge as embeddable built-ins.
 #[cfg(feature = "decode")]
 fn program_label(pid: &[u32; 8]) -> String {
-    use lee::program::Program;
     use std::collections::HashMap;
     use std::sync::OnceLock;
     static MAP: OnceLock<HashMap<[u32; 8], &'static str>> = OnceLock::new();
     let map = MAP.get_or_init(|| {
-        let mut m = HashMap::new();
-        m.insert(Program::authenticated_transfer_program().id(), "authenticated_transfer");
-        m.insert(Program::token().id(), "token");
-        m.insert(Program::amm().id(), "amm");
-        m.insert(Program::clock().id(), "clock");
-        m.insert(Program::ata().id(), "ata");
-        m.insert(Program::pinata().id(), "pinata");
-        m.insert(Program::pinata_token().id(), "pinata_token");
+        let mut m: HashMap<[u32; 8], &'static str> =
+            builtin_program_ids_raw().into_iter().collect();
+        // Deployment override: a stock image id that the live deployment runs under a
+        // DIFFERENT role/name (e.g. stock vault deployed as `genesis_supply`) must not
+        // be named here - decode stores this label into tx records, and the serve-side
+        // RC5 table is the authority for those ids. Same-name overlaps (clock) stay.
+        m.retain(|id, name| {
+            let hex = program_id_hex(id);
+            !serve::RC5_PROGRAMS.iter().any(|(rid, rname)| *rid == hex && rname != name)
+        });
         m
     });
     map.get(pid).map_or_else(
@@ -921,22 +937,33 @@ fn program_label(pid: &[u32; 8]) -> String {
     )
 }
 
-/// The built-in program ids (hex) -> name, computed from our (rc5) build. Lets the
+/// The linked (v0.2.0 stock) build's built-in ids -> canonical names, unfiltered.
+#[cfg(feature = "decode")]
+fn builtin_program_ids_raw() -> Vec<([u32; 8], &'static str)> {
+    vec![
+        (programs::authenticated_transfer().id(), "authenticated_transfer"),
+        (programs::token().id(), "token"),
+        (programs::amm().id(), "amm"),
+        (programs::clock().id(), "clock"),
+        (programs::ata().id(), "ata"),
+        (programs::pinata().id(), "pinata"),
+        (programs::pinata_token().id(), "pinata_token"),
+        (programs::vault().id(), "vault"),
+        (programs::faucet().id(), "faucet"),
+        (programs::bridge().id(), "bridge"),
+    ]
+}
+
+/// The built-in program ids (hex) -> name, computed from our (v0.2.0) build. Lets the
 /// server name programs without a reachable sequencer `getProgramIds` RPC, and resolve
-/// ids stored as raw hex by an older build (e.g. the clock `625e7b…`).
+/// ids stored as raw hex by an older build (e.g. the clock `625e7b…`). Unfiltered: the
+/// serve-side name map layers deployment tables OVER this (see program_name_map).
 #[cfg(feature = "decode")]
 pub fn builtin_program_ids() -> Vec<(String, String)> {
-    use lee::program::Program;
-    let hex = |id: [u32; 8]| program_id_hex(&id);
-    vec![
-        (hex(Program::authenticated_transfer_program().id()), "authenticated_transfer".into()),
-        (hex(Program::token().id()), "token".into()),
-        (hex(Program::amm().id()), "amm".into()),
-        (hex(Program::clock().id()), "clock".into()),
-        (hex(Program::ata().id()), "ata".into()),
-        (hex(Program::pinata().id()), "pinata".into()),
-        (hex(Program::pinata_token().id()), "pinata_token".into()),
-    ]
+    builtin_program_ids_raw()
+        .into_iter()
+        .map(|(id, name)| (program_id_hex(&id), name.to_string()))
+        .collect()
 }
 
 #[cfg(not(feature = "decode"))]
@@ -1271,11 +1298,13 @@ mod tests {
 
     #[test]
     fn channel_alias_known_and_unknown() {
-        let paradox = "8888888888888888888888888888888888888888888888888888888888888888";
+        let paradox = "7777777777777777777777777777777777777777777777777777777777777777";
         // known id -> friendly name (accepts a 0x prefix / any case)
         assert_eq!(channel_alias(paradox), Some("Paradox Computer"));
         assert_eq!(channel_alias(&format!("0x{}", paradox.to_uppercase())), Some("Paradox Computer"));
-        // prior zone kept as an archived alias
+        // prior zones kept as archived aliases
+        let rc5 = "8888888888888888888888888888888888888888888888888888888888888888";
+        assert_eq!(channel_alias(rc5), Some("Paradox Computer (old)"));
         let old = "0101010101010101010101010101010101010101010101010101010101010101";
         assert_eq!(channel_alias(old), Some("dev · shared default channel"));
         // unknown id -> None (caller keeps the short-hex rendering)
@@ -1427,8 +1456,10 @@ mod tests {
     }
 
     // A real settled clock block from the netcup L1 (rc5). Its single tx is the clock
-    // invocation; decode must surface program_id as the canonical LE-byte form
-    // `884e693a…` (== on-chain / getProgramIds), NOT the old `{w:08x}` word form.
+    // invocation. Under the v0.2.0-linked build this id (`884e693a…`) IS the stock
+    // clock image id (the clock guest is byte-identical across builds), so decode now
+    // resolves it to the NAME "clock" — which also proves the LE-byte id computation:
+    // a `{w:08x}` word-form regression would miss the map and fall back to hex.
     #[cfg(feature = "decode")]
     #[test]
     fn decodes_live_rc5_clock_program_id_as_le_bytes() {
@@ -1436,9 +1467,8 @@ mod tests {
         let d = decode_inscription(&Value::String(fixture.into())).expect("rc5 clock block decodes");
         let progs: Vec<Option<String>> = d.txs.iter().map(|t| t.program.clone()).collect();
         assert!(
-            d.txs.iter().any(|t| t.program.as_deref()
-                == Some("884e693a302d57de1ac4c405ca5bea1df707d1de11d9f87de51b78845aa98e63")),
-            "clock program_id must decode to LE 884e693a..; got {progs:?}"
+            d.txs.iter().any(|t| t.program.as_deref() == Some("clock")),
+            "live clock id must resolve to the linked build's 'clock'; got {progs:?}"
         );
     }
 }

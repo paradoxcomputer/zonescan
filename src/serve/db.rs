@@ -6,10 +6,16 @@
 //! block ids are stored *inverted* - `u64::MAX - block_id` - so a forward range
 //! scan yields newest-first):
 //!
-//! - `txs`          hash → TxRecord                          (source of truth, dedup)
-//! - `idx_feed`     inv(block_id)+hash → hash                (global newest-first feed)
-//! - `idx_channel`  channel+0+inv(block_id)+hash → hash      (per-sequencer feed)
-//! - `idx_account`  account+0+inv(block_id)+hash → hash      (account fan-out)
+//! - `txs`          hash+0+channel → TxRecord                (source of truth, dedup)
+//! - `idx_feed`     inv(block_id)+tail → txkey               (global newest-first feed)
+//! - `idx_channel`  channel+0+inv(block_id)+tail → txkey     (per-sequencer feed)
+//! - `idx_account`  account+0+inv(block_id)+tail → txkey     (account fan-out)
+//!
+//! where `txkey`/`tail` are `hash+0+channel` (see [`tx_key`]). A tx hash covers program +
+//! accounts + instruction data but NOT the channel, so two zones bootstrapped from the same
+//! genesis config inscribe byte-identical txs that share a hash. Keying by hash alone made
+//! the second zone's copy dedup into the first zone's record — silently hiding a whole
+//! zone's genesis under another zone. The channel is part of the identity.
 //! - `seq_summary`  channel → SeqTrack                       (per-sequencer state)
 //! - `acct_bal`     account → AcctBal                        (L1 post-state balance)
 //! - `meta`         "cursor:<channel>" → last L1 slot        (resume, no full re-scan)
@@ -58,7 +64,15 @@ const OWNER_ATA: TableDefinition<&str, &str> = TableDefinition::new("owner_ata")
 // token definition -> its holder ATAs. Key = "definition\0ata", value = owner; range-scan the
 // "definition\0" prefix (paginated) for the token's holders. Built from ata Create ops at ingest.
 const DEF_HOLDER: TableDefinition<&str, &str> = TableDefinition::new("def_holder");
-const TOKEN_MAP_VERSION: u64 = 1;
+// token program -> its definition accounts. Key = "program\0definition", value unused;
+// range-scan the "program\0" prefix. Lets a transfer resolve its token by PROGRAM when
+// neither account is a known holding (e.g. the ATA Create predates the scan window) -
+// only when the program's definitions carry exactly ONE distinct name (see token_op).
+const PROG_DEF: TableDefinition<&str, &str> = TableDefinition::new("prog_def");
+const TOKEN_MAP_VERSION: u64 = 2; // v2: (re)populates prog_def from stored txs
+// Bumped when the tx primary key changes shape. v1 = `hash+0+channel` (was a bare `hash`,
+// which collided across zones with identical genesis txs — see the module docs).
+const TX_KEY_VERSION: u64 = 1;
 // Bumped when raw-inscription txs need re-timestamping for the recency-ordered global feed.
 const RAW_TS_VERSION: u64 = 1;
 // Bumped to rebuild the per-(channel,program) index from stored txs (backfill_program_index).
@@ -125,7 +139,9 @@ pub struct FeedOpts<'a> {
     pub exclude: Option<&'a [String]>,
     /// pagination cursor: return txs strictly older than (timestamp, block_id, hash).
     /// The global feed orders by timestamp; a channel feed by block_id.
-    pub after: Option<(u64, u64, &'a str)>,
+    /// pagination cursor `(timestamp, block_id, hash, channel)`. The channel is part of it
+    /// because index tails are `hash+0+channel` — a bare hash would not land on the row.
+    pub after: Option<(u64, u64, &'a str, &'a str)>,
     /// oldest-first instead of newest-first (reverse iteration + flipped cursor).
     pub oldest: bool,
     pub limit: usize,
@@ -140,14 +156,35 @@ fn inv(block_id: u64) -> [u8; 8] {
 }
 
 /// Composite key for IDX_PROGRAM: "channel\0program\0" + inv(block) + hash.
-fn prog_key(channel: &str, program: &str, iv: &[u8; 8], hash: &[u8]) -> Vec<u8> {
-    let mut k = Vec::with_capacity(channel.len() + program.len() + 10 + hash.len());
+/// Primary key for a tx row: `hash + 0 + channel`.
+///
+/// Hash FIRST so a `hash\0`..`hash\1` range scan finds every zone carrying that hash, which
+/// is what [`Store::get_tx`] needs (the `/api/tx/<hash>` route has no channel). Channel is
+/// part of the key because the hash alone is not an identity: identical genesis txs on two
+/// zones hash the same, and keying by hash let one zone's copy overwrite the other's.
+fn tx_key(hash: &str, channel: &str) -> String {
+    format!("{hash}\0{channel}")
+}
+
+/// The `hash+0+channel` tail shared by every index key, so index entries are unique per
+/// (tx, zone) too. Without the channel, two zones' identical genesis txs collapse to one
+/// index entry at the same block id — the same bug one level down.
+fn idx_tail(hash: &str, channel: &str) -> Vec<u8> {
+    let mut t = Vec::with_capacity(hash.len() + 1 + channel.len());
+    t.extend_from_slice(hash.as_bytes());
+    t.push(0);
+    t.extend_from_slice(channel.as_bytes());
+    t
+}
+
+fn prog_key(channel: &str, program: &str, iv: &[u8; 8], tail: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(channel.len() + program.len() + 10 + tail.len());
     k.extend_from_slice(channel.as_bytes());
     k.push(0);
     k.extend_from_slice(program.as_bytes());
     k.push(0);
     k.extend_from_slice(iv);
-    k.extend_from_slice(hash);
+    k.extend_from_slice(tail);
     k
 }
 
@@ -393,6 +430,17 @@ impl Db {
         }
         let db = Database::create(path)?;
         let db = Db { db: Arc::new(db) };
+        // FIRST: every other migration below reads or writes the derived indexes, so the
+        // primary key has to be the current shape before any of them run.
+        match db.migrate_tx_keys() {
+            Ok(n) if n > 0 => eprintln!(
+                "tx store: re-keyed {n} tx(s) by (hash, zone) — txs shared between zones no \
+                 longer overwrite each other; any that were lost to the old key return on the \
+                 next scan of their L1 slots"
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: tx-key migration failed: {e:#}"),
+        }
         if let Err(e) = db.ensure_time_index() {
             eprintln!("warning: could not build time-ordered feed index: {e:#}");
         }
@@ -435,6 +483,7 @@ impl Db {
             let mut hdef = w.open_table(HOLDING_DEF)?;
             let mut owner_ata = w.open_table(OWNER_ATA)?;
             let mut def_holder = w.open_table(DEF_HOLDER)?;
+            let mut prog_def = w.open_table(PROG_DEF)?;
             for r in recs {
                 if r.hash.is_empty() {
                     continue;
@@ -444,6 +493,9 @@ impl Db {
                 let (def, hold) = token_mappings(r);
                 if let Some((d, name, supply)) = def {
                     tdef.insert(d.as_str(), format!("{name}\t{supply}").as_str())?;
+                    if let Some(p) = r.program.as_deref().filter(|p| !p.is_empty()) {
+                        prog_def.insert(format!("{p}\0{d}").as_str(), "")?;
+                    }
                 }
                 if let Some((h, d)) = hold {
                     hdef.insert(h.as_str(), d.as_str())?;
@@ -457,8 +509,9 @@ impl Db {
                 // predates (instruction_data / deploy fields added after it was first
                 // persisted), rewrite the body in place (indexes are hash-keyed).
                 // (needs_rewrite, old_program) — old_program kept so a relabel can re-key IDX_PROGRAM.
+                let key = tx_key(&r.hash, &r.channel);
                 let stored_needs_rewrite: Option<(bool, Option<String>)> =
-                    match txs.get(r.hash.as_str())? {
+                    match txs.get(key.as_str())? {
                         Some(g) => {
                             let s: TxRecord = de(g.value())?;
                             let needs = (s.instruction_data.is_empty()
@@ -479,19 +532,19 @@ impl Db {
                     };
                 if let Some((needs, old_prog)) = stored_needs_rewrite {
                     if needs {
-                        txs.insert(r.hash.as_str(), ser(r)?.as_slice())?;
+                        txs.insert(key.as_str(), ser(r)?.as_slice())?;
                         // keep IDX_PROGRAM consistent when the program label changed (block/hash
                         // are stable): drop the stale old-program key, add the new one.
                         let np = r.program.as_deref().filter(|p| !p.is_empty());
                         if np != old_prog.as_deref() {
                             let iv = inv(r.block_id);
-                            let h = r.hash.as_bytes();
+                            let tail = idx_tail(&r.hash, &r.channel);
                             if let Some(op) = old_prog.as_deref().filter(|p| !p.is_empty()) {
-                                prog.remove(prog_key(&r.channel, op, &iv, h).as_slice())?;
+                                prog.remove(prog_key(&r.channel, op, &iv, &tail).as_slice())?;
                             }
                             if let Some(p) = np {
-                                prog.insert(prog_key(&r.channel, p, &iv, h).as_slice(),
-                                    r.hash.as_str())?;
+                                prog.insert(prog_key(&r.channel, p, &iv, &tail).as_slice(),
+                                    key.as_str())?;
                             }
                         }
                     }
@@ -499,29 +552,30 @@ impl Db {
                 }
                 new += 1;
                 let body = ser(r)?;
-                txs.insert(r.hash.as_str(), body.as_slice())?;
+                txs.insert(key.as_str(), body.as_slice())?;
                 let iv = inv(r.block_id);
-                let h = r.hash.as_bytes();
+                let h = idx_tail(&r.hash, &r.channel);
+                let h = h.as_slice();
 
-                // time-ordered global feed: inv(timestamp)+inv(block_id)+hash, so the
+                // time-ordered global feed: inv(timestamp)+inv(block_id)+hash+0+channel, so the
                 // newest-by-wall-clock tx leads regardless of per-channel block ids.
                 let it = inv(r.timestamp);
                 let mut tk = Vec::with_capacity(16 + h.len());
                 tk.extend_from_slice(&it);
                 tk.extend_from_slice(&iv);
                 tk.extend_from_slice(h);
-                feed_time.insert(tk.as_slice(), r.hash.as_str())?;
+                feed_time.insert(tk.as_slice(), key.as_str())?;
 
                 let mut ck = Vec::with_capacity(r.channel.len() + 9 + h.len());
                 ck.extend_from_slice(r.channel.as_bytes());
                 ck.push(0);
                 ck.extend_from_slice(&iv);
                 ck.extend_from_slice(h);
-                chan.insert(ck.as_slice(), r.hash.as_str())?;
+                chan.insert(ck.as_slice(), key.as_str())?;
 
                 // per-(channel,program) index for O(limit) program lookups + exact totals.
                 if let Some(p) = r.program.as_deref().filter(|p| !p.is_empty()) {
-                    prog.insert(prog_key(&r.channel, p, &iv, h).as_slice(), r.hash.as_str())?;
+                    prog.insert(prog_key(&r.channel, p, &iv, h).as_slice(), key.as_str())?;
                 }
 
                 for a in &r.accounts {
@@ -530,7 +584,7 @@ impl Db {
                     ak.push(0);
                     ak.extend_from_slice(&iv);
                     ak.extend_from_slice(h);
-                    acct.insert(ak.as_slice(), r.hash.as_str())?;
+                    acct.insert(ak.as_slice(), key.as_str())?;
                 }
 
                 // Token-activity index: a token Transfer touches only the two ATAs, never the
@@ -538,7 +592,7 @@ impl Db {
                 // would miss it. Resolve each ATA -> its definition (learned in HOLDING_DEF from
                 // the ata Create) and index the tx under the definition too, reusing IDX_ACCOUNT so
                 // the token page needs no change. Both ATAs of a transfer resolve to the same
-                // definition -> one row (key includes the hash); skipped when the definition is
+                // definition -> one row (key includes hash+channel); skipped when the definition is
                 // already one of the tx's own accounts (the loop above indexed it).
                 if is_token_program(r.program.as_deref().unwrap_or("")) {
                     let mut seen = std::collections::HashSet::new();
@@ -553,7 +607,7 @@ impl Db {
                             dk.push(0);
                             dk.extend_from_slice(&iv);
                             dk.extend_from_slice(h);
-                            acct.insert(dk.as_slice(), r.hash.as_str())?;
+                            acct.insert(dk.as_slice(), key.as_str())?;
                         }
                     }
                 }
@@ -600,16 +654,125 @@ impl Db {
             for item in txs.iter()? {
                 let (_k, body) = item?;
                 let rec: TxRecord = de(body.value())?;
-                let h = rec.hash.as_bytes();
-                let mut tk = Vec::with_capacity(16 + h.len());
+                let tail = idx_tail(&rec.hash, &rec.channel);
+                let mut tk = Vec::with_capacity(16 + tail.len());
                 tk.extend_from_slice(&inv(rec.timestamp));
                 tk.extend_from_slice(&inv(rec.block_id));
-                tk.extend_from_slice(h);
-                ti.insert(tk.as_slice(), rec.hash.as_str())?;
+                tk.extend_from_slice(&tail);
+                ti.insert(tk.as_slice(), tx_key(&rec.hash, &rec.channel).as_str())?;
             }
         }
         w.commit()?;
         Ok(())
+    }
+
+    /// One-time migration for stores whose tx rows are keyed by a bare `hash`.
+    ///
+    /// Those stores are also missing every tx that was silently deduped away by the old key
+    /// (a zone whose genesis matched an earlier zone's), and no key rewrite can invent rows
+    /// that were never written — those return on the next scan of their L1 slots. What this
+    /// does is make the on-disk shape correct: re-key every surviving row as
+    /// `hash+0+channel` and rebuild the derived indexes so their keys and values agree with
+    /// it. Rebuilding beats patching entry-by-entry: the indexes are pure functions of the
+    /// tx rows, so a rebuild cannot leave a half-migrated mix behind.
+    ///
+    /// Guarded by a meta version, so it runs once. Returns how many rows were re-keyed.
+    pub fn migrate_tx_keys(&self) -> Result<usize> {
+        {
+            let r = self.db.begin_read()?;
+            if let Ok(m) = r.open_table(META) {
+                if m.get("tx_key_version")?.map(|v| v.value()) == Some(TX_KEY_VERSION) {
+                    return Ok(0);
+                }
+            }
+        }
+        // Read every row first: a redb table can't be mutated mid-iteration. Values are
+        // self-describing JSON carrying both hash and channel, so the old key is not needed.
+        let all: Vec<TxRecord> = {
+            let r = self.db.begin_read()?;
+            let mut v = Vec::new();
+            if let Ok(txs) = r.open_table(TXS) {
+                for item in txs.iter()? {
+                    let (_k, body) = item?;
+                    v.push(de::<TxRecord>(body.value())?);
+                }
+            }
+            v
+        };
+        let w = self.db.begin_write()?;
+        let mut n = 0usize;
+        {
+            let mut txs = w.open_table(TXS)?;
+            let mut feed_time = w.open_table(IDX_FEED_TIME)?;
+            let mut chan = w.open_table(IDX_CHANNEL)?;
+            let mut acct = w.open_table(IDX_ACCOUNT)?;
+            let mut prog = w.open_table(IDX_PROGRAM)?;
+            txs.retain(|_, _| false)?;
+            feed_time.retain(|_, _| false)?;
+            chan.retain(|_, _| false)?;
+            acct.retain(|_, _| false)?;
+            prog.retain(|_, _| false)?;
+            for rec in &all {
+                if rec.hash.is_empty() {
+                    continue;
+                }
+                let key = tx_key(&rec.hash, &rec.channel);
+                txs.insert(key.as_str(), ser(rec)?.as_slice())?;
+                let iv = inv(rec.block_id);
+                let tail = idx_tail(&rec.hash, &rec.channel);
+
+                let mut tk = Vec::with_capacity(16 + tail.len());
+                tk.extend_from_slice(&inv(rec.timestamp));
+                tk.extend_from_slice(&iv);
+                tk.extend_from_slice(&tail);
+                feed_time.insert(tk.as_slice(), key.as_str())?;
+
+                let mut ck = Vec::with_capacity(rec.channel.len() + 9 + tail.len());
+                ck.extend_from_slice(rec.channel.as_bytes());
+                ck.push(0);
+                ck.extend_from_slice(&iv);
+                ck.extend_from_slice(&tail);
+                chan.insert(ck.as_slice(), key.as_str())?;
+
+                if let Some(p) = rec.program.as_deref().filter(|p| !p.is_empty()) {
+                    prog.insert(prog_key(&rec.channel, p, &iv, &tail).as_slice(), key.as_str())?;
+                }
+                for a in &rec.accounts {
+                    let mut ak = Vec::with_capacity(a.len() + 9 + tail.len());
+                    ak.extend_from_slice(a.as_bytes());
+                    ak.push(0);
+                    ak.extend_from_slice(&iv);
+                    ak.extend_from_slice(&tail);
+                    acct.insert(ak.as_slice(), key.as_str())?;
+                }
+                // Replay the token-activity rows too (ATA -> definition), or the token page
+                // would lose every transfer on rebuild: those rows are indexed under the
+                // definition account, which is never one of the tx's own accounts.
+                // HOLDING_DEF is not wiped here, so the same lookup the ingest path uses works.
+                if is_token_program(rec.program.as_deref().unwrap_or("")) {
+                    let hdef = w.open_table(HOLDING_DEF)?;
+                    let mut seen = std::collections::HashSet::new();
+                    for a in &rec.accounts {
+                        let d = match hdef.get(a.as_str())? {
+                            Some(g) => g.value().to_string(),
+                            None => continue,
+                        };
+                        if seen.insert(d.clone()) && !rec.accounts.iter().any(|x| *x == d) {
+                            let mut dk = Vec::with_capacity(d.len() + 9 + tail.len());
+                            dk.extend_from_slice(d.as_bytes());
+                            dk.push(0);
+                            dk.extend_from_slice(&iv);
+                            dk.extend_from_slice(&tail);
+                            acct.insert(dk.as_slice(), key.as_str())?;
+                        }
+                    }
+                }
+                n += 1;
+            }
+            w.open_table(META)?.insert("tx_key_version", TX_KEY_VERSION)?;
+        }
+        w.commit()?;
+        Ok(n)
     }
 
     /// One-time migration for stores written before raw txs carried a sortable timestamp.
@@ -649,21 +812,22 @@ impl Db {
             let mut txs = w.open_table(TXS)?;
             let mut feed_time = w.open_table(IDX_FEED_TIME)?;
             for mut rec in stale.iter().cloned() {
-                let h = rec.hash.clone();
-                // drop the stale inv(0)+inv(block_id)+hash time-index key
+                let tail = idx_tail(&rec.hash, &rec.channel);
+                let key = tx_key(&rec.hash, &rec.channel);
+                // drop the stale inv(0)+inv(block_id)+tail time-index key
                 let mut old = inv(0).to_vec();
                 old.extend_from_slice(&inv(rec.block_id));
-                old.extend_from_slice(h.as_bytes());
+                old.extend_from_slice(&tail);
                 feed_time.remove(old.as_slice())?;
                 // observation time: seconds in seen_unix, millis in timestamp (block scale)
                 let seen = if rec.seen_unix > 0 { rec.seen_unix } else { now };
                 rec.seen_unix = seen;
                 rec.timestamp = seen.saturating_mul(1000);
-                txs.insert(h.as_str(), ser(&rec)?.as_slice())?;
+                txs.insert(key.as_str(), ser(&rec)?.as_slice())?;
                 let mut tk = inv(rec.timestamp).to_vec();
                 tk.extend_from_slice(&inv(rec.block_id));
-                tk.extend_from_slice(h.as_bytes());
-                feed_time.insert(tk.as_slice(), h.as_str())?;
+                tk.extend_from_slice(&tail);
+                feed_time.insert(tk.as_slice(), key.as_str())?;
             }
             let mut m = w.open_table(META)?;
             m.insert("raw_ts_version", RAW_TS_VERSION)?;
@@ -684,18 +848,44 @@ impl Db {
         .unwrap_or(0)
     }
 
-    /// One transaction by hash.
-    pub fn get_tx(&self, hash: &str) -> Result<Option<TxRecord>> {
+    /// One transaction by hash, optionally pinned to a zone.
+    ///
+    /// The same hash can legitimately exist on SEVERAL zones (identical genesis txs), so a
+    /// bare-hash lookup scans the `hash\0` prefix. With `channel` set the matching zone's row
+    /// wins; without one — or when that zone doesn't carry it — the first row is returned so
+    /// an unscoped `/api/tx/<hash>` link still resolves instead of 404ing.
+    pub fn get_tx_on(&self, hash: &str, channel: Option<&str>) -> Result<Option<TxRecord>> {
+        if hash.is_empty() {
+            return Ok(None);
+        }
         let r = self.db.begin_read()?;
         let t = match r.open_table(TXS) {
             Ok(t) => t,
             Err(_) => return Ok(None),
         };
-        match t.get(hash)? {
-            Some(g) => Ok(Some(de(g.value())?)),
-            None => Ok(None),
+        // exact hit first: avoids the scan on the common (zone-scoped) path.
+        if let Some(ch) = channel.filter(|c| !c.is_empty()) {
+            if let Some(g) = t.get(tx_key(hash, ch).as_str())? {
+                return Ok(Some(de(g.value())?));
+            }
         }
+        // `hash\0` .. `hash\u{1}` brackets exactly this hash's rows across every zone.
+        let lo = format!("{hash}\0");
+        let hi = format!("{hash}\u{1}");
+        let mut first = None;
+        for item in t.range::<&str>(lo.as_str()..hi.as_str())? {
+            let (_k, v) = item?;
+            let rec: TxRecord = de(v.value())?;
+            if channel.is_some_and(|c| !c.is_empty() && rec.channel == c) {
+                return Ok(Some(rec));
+            }
+            if first.is_none() {
+                first = Some(rec);
+            }
+        }
+        Ok(first)
     }
+
 
     fn matches(rec: &TxRecord, o: &FeedOpts) -> bool {
         if let Some(k) = o.kind {
@@ -918,13 +1108,47 @@ impl Db {
         let prog = rec.program.as_deref().unwrap_or("");
         let amount = token_display_amount(rec);
         let name = if is_token_program(prog) || is_ata_program(prog) {
-            rec.accounts.iter().find_map(|a| {
-                self.resolve_token(a).map(|(_, n, _)| n).filter(|n| !n.is_empty())
-            })
+            rec.accounts
+                .iter()
+                .find_map(|a| {
+                    self.resolve_token(a).map(|(_, n, _)| n).filter(|n| !n.is_empty())
+                })
+                // no account link (e.g. the ATA Create predates the scan window): fall
+                // back to the PROGRAM's own definitions - safe only when they carry
+                // exactly one distinct name, so no multi-token program is mislabeled.
+                .or_else(|| self.program_token_name(prog))
         } else {
             None
         };
         (amount, name)
+    }
+
+    /// The single distinct token name defined by `program`, when unambiguous: resolves
+    /// each learned definition (`prog_def`) through `token_def` and returns the name
+    /// only if exactly one distinct non-empty name exists; `None` for zero or several.
+    fn program_token_name(&self, program: &str) -> Option<String> {
+        if program.is_empty() {
+            return None;
+        }
+        let r = self.db.begin_read().ok()?;
+        let pd = r.open_table(PROG_DEF).ok()?;
+        let tdef = r.open_table(TOKEN_DEF).ok()?;
+        let lo = format!("{program}\0");
+        let hi = format!("{program}\u{1}");
+        let mut name: Option<String> = None;
+        for (k, _) in pd.range(lo.as_str()..hi.as_str()).ok()?.flatten() {
+            let Some(def) = k.value().split('\0').nth(1) else { continue };
+            let Ok(Some(v)) = tdef.get(def) else { continue };
+            let n = v.value().split('\t').next().unwrap_or("");
+            if n.is_empty() {
+                continue;
+            }
+            match &name {
+                Some(seen) if seen != n => return None, // several tokens: ambiguous
+                _ => name = Some(n.to_string()),
+            }
+        }
+        name
     }
 
     /// If `account` is a known token's definition or a holding of one, its (symbol, role) -
@@ -965,6 +1189,7 @@ impl Db {
     /// channels with no sequencer RPC). Returns the definition count learned.
     pub fn relearn_tokens(&self) -> Result<usize> {
         let mut defs: Vec<(String, String)> = Vec::new();
+        let mut prog_defs: Vec<(String, String)> = Vec::new(); // (program, definition)
         let mut holds: Vec<(String, String)> = Vec::new();
         let mut atas: Vec<(String, String, String)> = Vec::new(); // (owner, ata, definition)
         // token ops (hash, block, accounts) to link into the token-activity index (see commit()).
@@ -977,6 +1202,9 @@ impl Db {
                     let rec: TxRecord = de(v.value())?;
                     let (def, hold) = token_mappings(&rec);
                     if let Some((d, name, supply)) = def {
+                        if let Some(p) = rec.program.as_deref().filter(|p| !p.is_empty()) {
+                            prog_defs.push((p.to_string(), d.clone()));
+                        }
                         defs.push((d, format!("{name}\t{supply}")));
                     }
                     if let Some((h, d)) = hold {
@@ -1005,8 +1233,12 @@ impl Db {
             let mut hdef = w.open_table(HOLDING_DEF)?;
             let mut owner_ata = w.open_table(OWNER_ATA)?;
             let mut def_holder = w.open_table(DEF_HOLDER)?;
+            let mut prog_def = w.open_table(PROG_DEF)?;
             for (d, v) in &defs {
                 tdef.insert(d.as_str(), v.as_str())?;
+            }
+            for (p, d) in &prog_defs {
+                prog_def.insert(format!("{p}\0{d}").as_str(), "")?;
             }
             for (h, d) in &holds {
                 hdef.insert(h.as_str(), d.as_str())?;
@@ -1140,11 +1372,11 @@ impl Db {
             prefix0.push(0);
             let mut hi = ch.as_bytes().to_vec();
             hi.push(1);
-            let cursor = o.after.map(|(_, bid, h)| {
+            let cursor = o.after.map(|(_, bid, h, c)| {
                 let mut k = ch.as_bytes().to_vec();
                 k.push(0);
                 k.extend_from_slice(&inv(bid));
-                k.extend_from_slice(h.as_bytes());
+                k.extend_from_slice(&idx_tail(h, c));
                 k
             });
             if o.oldest {
@@ -1182,10 +1414,10 @@ impl Db {
                 Ok(t) => t,
                 Err(_) => return Ok(vec![]),
             };
-            let cursor = o.after.map(|(ts, bid, h)| {
+            let cursor = o.after.map(|(ts, bid, h, c)| {
                 let mut k = inv(ts).to_vec();
                 k.extend_from_slice(&inv(bid));
-                k.extend_from_slice(h.as_bytes());
+                k.extend_from_slice(&idx_tail(h, c));
                 k
             });
             if o.oldest {
@@ -1241,6 +1473,8 @@ impl Db {
                 by_chan.entry(rec.channel.clone()).or_default().push(rec);
             }
         }
+        // keyed by the COMPOSITE tx key: the same hash can exist on several zones, and this
+        // replay is per-zone, so a bare hash would relabel the wrong zone's row.
         let mut updates: Vec<(String, &'static str)> = Vec::new();
         for (_chan, mut txs) in by_chan {
             txs.sort_by_key(|t| t.block_id);
@@ -1262,7 +1496,7 @@ impl Db {
                     // withdraw/receive into public), while a debit is a shield.
                     let pre = bal.get(acct).copied().unwrap_or(0);
                     let sub = if post > pre { "deshield" } else { "shield" };
-                    updates.push((t.hash.clone(), sub));
+                    updates.push((tx_key(&t.hash, &t.channel), sub));
                     bal.insert(acct.clone(), post); // authoritative post-state
                 } else if t.kind == "public" {
                     if let Some(amt) = transfer_amount(t) {
@@ -1283,8 +1517,8 @@ impl Db {
         let mut n = 0usize;
         {
             let mut t = w.open_table(TXS)?;
-            for (hash, sub) in updates {
-                let cur: Option<TxRecord> = match t.get(hash.as_str())? {
+            for (key, sub) in updates {
+                let cur: Option<TxRecord> = match t.get(key.as_str())? {
                     Some(g) => Some(de(g.value())?),
                     None => None,
                 };
@@ -1292,7 +1526,7 @@ impl Db {
                     if rec.subtype != sub {
                         rec.subtype = sub.to_string();
                         let body = ser(&rec)?;
-                        t.insert(hash.as_str(), body.as_slice())?;
+                        t.insert(key.as_str(), body.as_slice())?;
                         n += 1;
                     }
                 }
@@ -1309,7 +1543,7 @@ impl Db {
         &self,
         id: &str,
         scope: Option<&str>,
-        after: Option<(u64, &str)>,
+        after: Option<(u64, &str, &str)>,
         kind: Option<&str>,
         types: Option<&[String]>,
         oldest: bool,
@@ -1331,11 +1565,11 @@ impl Db {
         hi.push(1);
         // pagination: on a cursor page, start just after it and skip the (full-scan)
         // per-channel breakdown + total - those are only needed for the first page.
-        let cursor = after.map(|(bid, h)| {
+        let cursor = after.map(|(bid, h, c)| {
             let mut k = id.as_bytes().to_vec();
             k.push(0);
             k.extend_from_slice(&inv(bid));
-            k.extend_from_slice(h.as_bytes());
+            k.extend_from_slice(&idx_tail(h, c));
             k
         });
         let paged = cursor.is_some();
@@ -1673,6 +1907,41 @@ mod tests {
         set_program_kinds(HashMap::new()); // reset the process-global for other tests
     }
 
+    /// A transfer whose accounts have no learned ATA/holding link still resolves its token
+    /// NAME through the program's own definitions - but only while the program has exactly
+    /// one distinct token name (a second, differently-named definition turns it ambiguous).
+    #[test]
+    fn transfer_resolves_token_by_program_when_unambiguous() {
+        use std::collections::HashMap;
+        let _g = GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!("zs-progdef-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let ftoken = "ed01f2f48533fae789e7c51e756c422b5e5aa75df601aaf5042d74c5bba92778";
+        set_program_kinds(HashMap::from([(ftoken.to_string(), ("token".to_string(), 0.9, false))]));
+        // NewFungibleDefinition (variant 1, name len 7 "MED0707", supply 1_000_000)
+        let mut def = rec("d1", "ch", 1, Some(ftoken));
+        def.instruction_data = vec![1u32, 7, 809780557, 3616823, 1_000_000, 0, 0, 0];
+        def.accounts = vec!["DEF".into(), "SUPPLY".into()];
+        db.commit(&[def], &[], &[], &[]).unwrap();
+        // transfer between two accounts with NO holding->definition link learned
+        let mut tr = rec("t1", "ch", 2, Some(ftoken));
+        tr.instruction_data = vec![0u32, 1, 0, 0, 0];
+        tr.accounts = vec!["UNLINKED_A".into(), "UNLINKED_B".into()];
+        let (amount, name) = db.token_op(&tr);
+        assert_eq!(amount.as_deref(), Some("1"));
+        assert_eq!(name.as_deref(), Some("MED0707"), "resolved via the program's sole definition");
+        // a second definition with a DIFFERENT name makes the program ambiguous -> None
+        let mut def2 = rec("d2", "ch", 3, Some(ftoken));
+        def2.instruction_data = vec![1u32, 7, 809780557, 3616824, 1_000_000, 0, 0, 0]; // "MED0807"-ish
+        def2.accounts = vec!["DEF2".into(), "SUPPLY2".into()];
+        db.commit(&[def2], &[], &[], &[]).unwrap();
+        assert_eq!(db.token_op(&tr).1, None, "two distinct names: no program-level guess");
+        set_program_kinds(HashMap::new());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// BUG 2 fix: `finalized_block_for` = highest plausible block whose L1 slot <= lib, so the
     /// reconciler can promote `finalized_block_id` as lib advances (raw/garbage rows ignored).
     #[test]
@@ -1928,6 +2197,56 @@ mod tests {
         }
     }
 
+    /// Two zones bootstrapped from the same genesis config inscribe BYTE-IDENTICAL txs, which
+    /// therefore share a hash. Keying tx rows by hash alone made the second zone's copy dedup
+    /// into the first's — one zone's genesis silently vanished, and its txs rendered under the
+    /// other zone. Identity is (hash, channel); every read path must respect that.
+    #[test]
+    fn identical_tx_on_two_zones_is_kept_per_zone() {
+        let path = std::env::temp_dir().join(format!("zs-samehash-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+
+        // same hash, same block, same everything except the zone — the real genesis case.
+        let a = rec("genesis1", "chanA", 1, Some("faucet"));
+        let b = rec("genesis1", "chanB", 1, Some("faucet"));
+        assert_eq!(
+            db.commit(&[a, b], &[], &[], &[]).unwrap(),
+            2,
+            "both zones' copies must count as new; 1 means one overwrote the other"
+        );
+
+        // each zone's feed sees its own copy...
+        for ch in ["chanA", "chanB"] {
+            let f = db
+                .feed(&FeedOpts { channel: Some(ch), limit: 10, ..Default::default() })
+                .unwrap();
+            assert_eq!(f.len(), 1, "zone {ch} lost its copy of the shared-hash tx");
+            assert_eq!(f[0].channel, ch);
+        }
+        // ...and the global feed carries both, not one.
+        let all = db.feed(&FeedOpts { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(all.len(), 2, "global feed collapsed two distinct rows into one");
+
+        // by-hash lookup resolves the requested zone, and still answers without one.
+        for ch in ["chanA", "chanB"] {
+            let got = db.get_tx_on("genesis1", Some(ch)).unwrap().expect("row for zone");
+            assert_eq!(got.channel, ch, "asked for {ch}, got another zone's row");
+        }
+        let any = db.get_tx_on("genesis1", None).unwrap().expect("unscoped lookup resolves");
+        assert!(any.channel == "chanA" || any.channel == "chanB");
+        // an unknown zone falls back rather than 404ing an otherwise-valid hash
+        assert!(db.get_tx_on("genesis1", Some("nope")).unwrap().is_some());
+
+        // the account fan-out must not collapse either (both rows share acctA)
+        let (rows, total, _by_chan) =
+            db.account("acctA", None, None, None, None, false, 10).unwrap();
+        assert_eq!(rows.len(), 2, "account view collapsed the two zones' rows");
+        assert_eq!(total, 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn token_op_resolves_name_and_amount() {
         let path = std::env::temp_dir().join(format!("zs-tokop-{}.redb", std::process::id()));
@@ -2018,8 +2337,8 @@ mod tests {
         db.commit(&[fund, mk("s1", 10, "100"), mk("d1", 20, "150")], &[], &[], &[]).unwrap();
         let n = db.relabel_privacy().unwrap();
         assert!(n >= 1);
-        assert_eq!(db.get_tx("s1").unwrap().unwrap().subtype, "shield"); // first op = deposit
-        assert_eq!(db.get_tx("d1").unwrap().unwrap().subtype, "deshield"); // balance rose
+        assert_eq!(db.get_tx_on("s1", None).unwrap().unwrap().subtype, "shield"); // first op = deposit
+        assert_eq!(db.get_tx_on("d1", None).unwrap().unwrap().subtype, "deshield"); // balance rose
     }
 
     #[test]
@@ -2059,7 +2378,7 @@ mod tests {
             &[], &[], &[],
         ).unwrap();
         db.relabel_privacy().unwrap();
-        assert_eq!(db.get_tx("v1").unwrap().unwrap().subtype, "deshield");
+        assert_eq!(db.get_tx_on("v1", None).unwrap().unwrap().subtype, "deshield");
     }
 
     #[test]
@@ -2075,7 +2394,7 @@ mod tests {
         assert_eq!(db.commit(&recs, &[], &[], &[]).unwrap(), 2);
 
         // a private tx round-trips through JSON (would fail under bincode + skip_serializing_if)
-        let got = db.get_tx("bb").unwrap().unwrap();
+        let got = db.get_tx_on("bb", None).unwrap().unwrap();
         assert_eq!(got.kind, "private");
         assert_eq!(got.program, None);
         assert_eq!(got.nullifiers, vec!["n1".to_string()]);
@@ -2093,7 +2412,7 @@ mod tests {
         assert_eq!(db.feed(&FeedOpts { exclude: Some(&amm), limit: 10, ..Default::default() }).unwrap().len(), 1);
 
         // pagination: after the newest (bb, ts/block 6) returns the next page (aa)
-        let pg = db.feed(&FeedOpts { after: Some((1_700_000_000_000, 6, "bb")), limit: 10, ..Default::default() }).unwrap();
+        let pg = db.feed(&FeedOpts { after: Some((1_700_000_000_000, 6, "bb", "chan1")), limit: 10, ..Default::default() }).unwrap();
         assert_eq!(pg.iter().map(|t| t.hash.as_str()).collect::<Vec<_>>(), ["aa"]);
 
         // oldest-first global + channel feeds are reversed (aa block 5 before bb block 6)
@@ -2104,7 +2423,7 @@ mod tests {
         // oldest pagination: page 1 (limit 1) is aa; the next page (after aa) is the newer bb
         let op1 = db.feed(&FeedOpts { oldest: true, limit: 1, ..Default::default() }).unwrap();
         assert_eq!(op1.iter().map(|t| t.hash.as_str()).collect::<Vec<_>>(), ["aa"]);
-        let op2 = db.feed(&FeedOpts { oldest: true, after: Some((1_700_000_000_000, 5, "aa")), limit: 10, ..Default::default() }).unwrap();
+        let op2 = db.feed(&FeedOpts { oldest: true, after: Some((1_700_000_000_000, 5, "aa", "chan1")), limit: 10, ..Default::default() }).unwrap();
         assert_eq!(op2.iter().map(|t| t.hash.as_str()).collect::<Vec<_>>(), ["bb"]);
 
         // computed-type filter: amm matches the public amm tx; "authenticated_transfer" matches the private send

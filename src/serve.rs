@@ -34,7 +34,7 @@ use tokio::sync::broadcast;
 use crate::{
     build_client, channel_alias, channel_tip, collect_inscriptions, decode_inscription,
     decode_inscription_with, find_u64, get_json, info_l1_version, info_mode, info_u64, jget_u64,
-    jhex, resolve_channel, scan_channels, short, Decoded, EndpointResult, ScanRec, TxMix,
+    jhex, resolve_channel, scan_channels, short, Decoded, EndpointResult, ScanRec, TxInfo, TxMix,
     MAX_PLAUSIBLE_BLOCK_ID,
 };
 
@@ -46,6 +46,8 @@ use db::Db;
 const TX_CAP: usize = 4000;
 /// Default finalized-slot window for discovery seeding.
 const DEFAULT_DISCOVER: u64 = 6000;
+/// Inscriptions sampled per unknown channel when discovery classifies it.
+const DISCOVER_SAMPLES: usize = 8;
 
 // --- runtime configuration (editable via /admin, persisted to disk) --------
 
@@ -66,6 +68,12 @@ pub struct SeqCfg {
     /// discovery cap counts only auto-added ones.
     #[serde(default, skip_serializing_if = "is_false")]
     pub discovered: bool,
+    /// A raw DATA channel: its sampled inscriptions do not decode as valid LEZ sequencer
+    /// blocks (e.g. text/JSON payloads inscribed directly on the L1). Tracked and indexed
+    /// like any channel, but badged explicitly in the UI so it's never mistaken for a
+    /// sequencer. Set by discovery; can also be set by hand in the config.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub data_channel: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -124,10 +132,21 @@ pub struct Config {
     /// instruction words decode into typed fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub program_schemas: Vec<ProgSchema>,
-    /// When set, auto-discover rc4-compatible sequencers on the L1 and track up to this
-    /// many of them (counting only auto-discovered ones, not hand-configured).
+    /// When set, auto-discover LEZ sequencers on the L1 and track up to this many of them
+    /// (counting only auto-discovered ones, not hand-configured). The check is
+    /// build-agnostic — it accepts any channel whose inscriptions decode as LEZ sequencer
+    /// blocks, rc3 through v0.2.0 — so don't read "rc4" into it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discover_limit: Option<usize>,
+    /// Whether discovery also adopts raw DATA channels (inscriptions that aren't valid
+    /// LEZ sequencer blocks). `None` = on (the default); set false (or env
+    /// `ZONE_SCAN_DISCOVER_DATA=0`) to only ever auto-track real sequencers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discover_data: Option<bool>,
+    /// IPFS gateway base URL used by the UI to link the files of cid-pin inscriptions
+    /// (env `ZONE_SCAN_IPFS_GATEWAY`). `None` = the UI default (https://ipfs.io).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipfs_gateway: Option<String>,
 }
 
 impl Config {
@@ -213,7 +232,7 @@ fn parse_sequencers_env(s: &str) -> Vec<SeqCfg> {
             let rpc_url = p.next().unwrap_or("").to_string();
             let label = p.next().unwrap_or("").to_string();
             let full = matches!(p.next(), Some("full") | Some("true") | Some("1"));
-            SeqCfg { label, channel_id, rpc_url, full, discovered: false }
+            SeqCfg { label, channel_id, rpc_url, full, discovered: false, data_channel: false }
         })
         .filter(|s| !s.channel_id.is_empty())
         .collect()
@@ -239,6 +258,18 @@ pub fn overlay_env(cfg: &mut Config) {
     }
     if let Some(v) = env_nonempty("ZONE_SCAN_DISCOVER_LIMIT").and_then(|s| s.parse::<usize>().ok()) {
         cfg.discover_limit = Some(v);
+    }
+    if let Some(v) = env_bool("ZONE_SCAN_DISCOVER_DATA") {
+        cfg.discover_data = Some(v);
+    }
+    if let Some(v) = env_nonempty("ZONE_SCAN_IPFS_GATEWAY") {
+        // http(s) only: this lands in <a href>, so a stray scheme must never pass
+        let v = v.trim_end_matches('/');
+        if v.starts_with("http://") || v.starts_with("https://") {
+            cfg.ipfs_gateway = Some(v.to_string());
+        } else {
+            eprintln!("ZONE_SCAN_IPFS_GATEWAY ignored: must start with http(s)://");
+        }
     }
     if let Some(v) = env_nonempty("ZONE_SCAN_SEQUENCERS") {
         let seqs = parse_sequencers_env(&v);
@@ -479,10 +510,34 @@ struct L1Track {
     /// info poll (~8s), capped at FINALITY_SERIES_CAP so it stays O(1) memory. Powers the
     /// dashboard finality-lag sparkline; sampled only when both tip and lib slots are known.
     finality_series: std::collections::VecDeque<(u64, u64)>,
+    /// Bounded time-series of the L1 tip slot: (unix_secs, tip_slot), same cadence and cap
+    /// as `finality_series`. Exists purely to MEASURE the chain's slot rate, so the
+    /// "how long until this is irreversible" estimate is derived from observation instead
+    /// of a hardcoded guess. See `measured_slot_secs`.
+    slot_series: std::collections::VecDeque<(u64, u64)>,
 }
 
 /// How many finality-lag samples to retain (~8s each ⇒ ~180 = 24 min of history).
 const FINALITY_SERIES_CAP: usize = 180;
+
+/// Minimum wall-clock span (secs) a slot-rate measurement needs before we trust it. Below
+/// this a couple of jittery polls could imply a wildly wrong rate, and a wrong number here
+/// is worse than none: the whole point is to stop asserting a finality time we can't back up.
+const SLOT_RATE_MIN_SPAN_SECS: u64 = 120;
+
+/// Measured seconds-per-slot from the tip-slot samples, or None when we can't back a number
+/// up yet (too few samples, too short a span, or a non-advancing / rewound tip). Returns a
+/// float because sub-second slot times are plausible and rounding to u64 would floor to 0.
+fn measured_slot_secs(series: &std::collections::VecDeque<(u64, u64)>) -> Option<f64> {
+    let (t0, s0) = *series.front()?;
+    let (t1, s1) = *series.back()?;
+    let dt = t1.checked_sub(t0)?;
+    let ds = s1.checked_sub(s0)?;
+    if dt < SLOT_RATE_MIN_SPAN_SECS || ds == 0 {
+        return None;
+    }
+    Some(dt as f64 / ds as f64)
+}
 
 /// Result of cross-checking a sequencer's settled chain against the L1 (and its
 /// RPC). All-zero counts with `checked > 0` means the chain verified clean.
@@ -584,7 +639,7 @@ struct SeqTrack {
     /// stream-independent liveness signal, polled from `/channel/:id`.
     last_tip: String,
     tip_change_unix: u64,
-    /// detected LEZ build ("rc3"/"rc4"), from a recognized built-in program id.
+    /// detected LEZ build ("rc3"/"rc4"/"rc5"/"v0.2"), from a recognized built-in program id.
     version: Option<String>,
     // --- L1 channel-tip metadata (`/channel/:id`), for the pending-activity panel ---
     /// L1 slot of the channel's settlement tip (`tip_slot`) - the frontier of on-L1
@@ -614,6 +669,18 @@ struct SeqTrack {
     /// rows); this flag only drives the channel-level "raw" activity summary.
     #[serde(default)]
     saw_undecodable: bool,
+    /// True once an inscription DID decode as a real LEZ block. With `saw_undecodable`
+    /// this classifies observed content: a raw-only channel (undecodable seen, never a
+    /// block) surfaces as a data channel even when hand-configured (see `track_is_data`).
+    #[serde(default)]
+    saw_block: bool,
+}
+
+/// A channel whose observed content is ONLY raw (non-block) inscriptions - no valid LEZ
+/// block ever decoded. Badged as a data channel in the UI exactly like discovery-adopted
+/// ones (the persisted config flag ORs with this observed classification).
+fn track_is_data(t: &SeqTrack) -> bool {
+    t.saw_undecodable && !t.saw_block
 }
 
 impl SeqTrack {
@@ -856,6 +923,8 @@ fn ingest(s: &mut ServerState, channel: &str, slot: Option<u64>, d: &Decoded, no
         // - any non-clock tx => real user activity (the tx table has content).
         if d.undecodable {
             e.saw_undecodable = true;
+        } else {
+            e.saw_block = true;
         }
         if d.txs.iter().any(|t| !t.program.as_deref().is_some_and(is_clock_program)) {
             e.user_tx_seen = true;
@@ -872,16 +941,24 @@ fn ingest(s: &mut ServerState, channel: &str, slot: Option<u64>, d: &Decoded, no
         if d.bedrock_final {
             e.finalized_block_id = e.finalized_block_id.max(d.block_id);
         }
-        // tag the sequencer's LEZ build from a recognized program id (clock every block)
-        if e.version.is_none() {
-            for t in &d.txs {
-                if let Some(v) = t.program.as_deref().and_then(lez_version) {
-                    e.version = Some(v.to_string());
-                    break;
-                }
+        // tag the sequencer's LEZ build from a recognized program id. Take the LATEST
+        // build-distinctive signal, not the first: a zone can UPGRADE (e.g. 0101 moved
+        // from a fork build to stock v0.2.0), and a sticky first-seen tag would freeze
+        // the stale version forever (the field is persisted). Version-neutral programs
+        // (clock and other shared guests) return None and never clobber a real tag.
+        if let Some(v) = version_from_txs(&d.txs) {
+            if e.version.as_deref() != Some(v) {
+                e.version = Some(v.to_string());
             }
         }
     }
+}
+
+/// The build-distinctive LEZ version signalled by a block's txs (the first tx whose
+/// program resolves to a versioned build), or None if every tx is version-neutral
+/// (clock / shared guests / unknown). Kept pure for testing the upgrade transition.
+fn version_from_txs(txs: &[TxInfo]) -> Option<&'static str> {
+    txs.iter().find_map(|t| t.program.as_deref().and_then(lez_version))
 }
 
 /// Raise a channel's L1-finality thresholds for a block observed *inscribed on the L1*.
@@ -982,6 +1059,9 @@ struct Snapshot {
     /// clock txs aren't stored (the feed shows only non-clock txs).
     skip_clock: bool,
     tx_total: usize,
+    /// Operator-configured IPFS gateway for cid-pin file links (UI defaults to ipfs.io).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipfs_gateway: Option<String>,
     l1: L1Snap,
     sequencers: Vec<SeqSnap>,
 }
@@ -1009,6 +1089,12 @@ struct L1Snap {
     /// Bounded finality-lag history as `[unix, lag]` pairs (oldest→newest) for the sparkline.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     finality_series: Vec<[u64; 2]>,
+    /// MEASURED seconds until an inscribed-but-not-yet-final block becomes irreversible:
+    /// `finality_lag` slots × the observed seconds-per-slot. None until the slot rate has
+    /// been observed long enough to be trustworthy — the UI then states the lag in slots
+    /// rather than inventing a duration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finality_eta_secs: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1038,7 +1124,7 @@ struct SeqSnap {
     seq_tip: Option<u64>,
     /// unix secs when the channel tip last changed (it settled a block); 0 if unseen.
     tip_change_unix: u64,
-    /// detected LEZ build ("rc3"/"rc4"), or None if not yet recognized.
+    /// detected LEZ build ("rc3"/"rc4"/"rc5"/"v0.2"), or None if not yet recognized.
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     // --- L1 channel-tip metadata + pending-activity flag (`/channel/:id`) ---
@@ -1065,9 +1151,37 @@ struct SeqSnap {
     /// their own rows), or "clock-only" (idle heartbeats). None => normal (user txs render).
     #[serde(skip_serializing_if = "Option::is_none")]
     activity_state: Option<&'static str>,
+    /// A raw DATA channel (inscriptions are not valid LEZ sequencer blocks) - either
+    /// configured/adopted as one, or observed to carry only raw inscriptions and never
+    /// a decodable block. The UI badges it explicitly so it's never read as a sequencer.
+    #[serde(skip_serializing_if = "is_false")]
+    data_channel: bool,
 }
 
-fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
+/// Channel ids configured/adopted as raw data channels, resolved like `channel_ids`
+/// (alias->hex, trimmed) and then normalized like `channel_alias` (no `0x`, lowercase) so
+/// they match `s.seqs` keys, letting `build_snapshot` badge them without the config lock.
+fn data_channel_set(app: &AppState) -> HashSet<String> {
+    app.config
+        .lock()
+        .unwrap()
+        .sequencers
+        .iter()
+        .filter(|c| c.data_channel)
+        .map(|c| {
+            let id = c.channel_id.trim();
+            let id = resolve_channel(id).unwrap_or_else(|_| id.to_string());
+            id.trim_start_matches("0x").to_ascii_lowercase()
+        })
+        .collect()
+}
+
+fn build_snapshot(
+    s: &ServerState,
+    db_total: Option<u64>,
+    data_channels: &HashSet<String>,
+    ipfs_gateway: Option<String>,
+) -> Snapshot {
     let now = now_unix();
     let mut sequencers: Vec<SeqSnap> = s
         .seqs
@@ -1128,6 +1242,9 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
                 config_threshold: t.l1_config_threshold,
                 withdraw_threshold: t.l1_withdraw_threshold,
                 activity_state,
+                data_channel: data_channels
+                    .contains(&ch.trim_start_matches("0x").to_ascii_lowercase())
+                    || track_is_data(t),
             }
         })
         .collect();
@@ -1141,6 +1258,11 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
         (Some(t), Some(l)) => Some(t.saturating_sub(l)),
         _ => None,
     };
+    // Time-to-finality = lag (slots) × measured secs/slot. Both halves must be real: no
+    // measured rate ⇒ no estimate (the UI falls back to stating the lag in slots).
+    let finality_eta_secs = finality_lag
+        .zip(measured_slot_secs(&s.l1.slot_series))
+        .map(|(lag, secs)| (lag as f64 * secs).round() as u64);
     Snapshot {
         node: s.node.clone(),
         updated_unix: now,
@@ -1148,6 +1270,7 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
         discovering: s.discovering,
         skip_clock: SKIP_CLOCK.load(Ordering::Relaxed),
         tx_total: db_total.map(|n| n as usize).unwrap_or_else(|| s.txs.len()),
+        ipfs_gateway,
         l1: L1Snap {
             reachable: s.l1.reachable,
             height: s.l1.height,
@@ -1161,6 +1284,7 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
             synced: s.l1.mode.as_deref().map(|m| m == "online"),
             l1_version: s.l1.l1_version,
             finality_series: s.l1.finality_series.iter().map(|&(t, l)| [t, l]).collect(),
+            finality_eta_secs,
         },
         sequencers,
     }
@@ -1168,9 +1292,11 @@ fn build_snapshot(s: &ServerState, db_total: Option<u64>) -> Snapshot {
 
 fn broadcast(app: &AppState) {
     let db_total = app.db.as_ref().map(|d| d.tx_total());
+    let data_channels = data_channel_set(app);
+    let ipfs_gateway = app.config.lock().unwrap().ipfs_gateway.clone();
     let snap = {
         let s = app.inner.lock().unwrap();
-        build_snapshot(&s, db_total)
+        build_snapshot(&s, db_total, &data_channels, ipfs_gateway)
     };
     // tagged so the client can distinguish snapshots from pushed tx batches.
     if let Ok(d) = serde_json::to_value(&snap) {
@@ -1286,7 +1412,7 @@ pub async fn cmd_serve(
                         if !a.config.lock().unwrap().sequencer_mode() {
                             match discover_compatible(&a, cap).await {
                                 Ok(f) if !f.is_empty() => {
-                                    println!("discover: now tracking {} new sequencer(s)", f.len());
+                                    println!("discover: now tracking {} new channel(s)", f.len());
                                 }
                                 Ok(_) => {}
                                 Err(e) => eprintln!("discover: {e:#}"),
@@ -1305,6 +1431,12 @@ pub async fn cmd_serve(
     if app.db.is_some() {
         let a = app.clone();
         tokio::spawn(async move {
+            // Classify what's ALREADY stored before waiting on anything. On a restart the
+            // redb store is already full of txs, so the old unconditional 8s sleep left a
+            // window where foreign-program token names resolved to None purely because
+            // PROGRAM_INFO hadn't been published yet. On a cold/empty store this is a no-op,
+            // so the early pass costs nothing there.
+            refresh_guesses(&a).await;
             tokio::time::sleep(Duration::from_secs(8)).await; // let the initial ingest settle
             loop {
                 refresh_guesses(&a).await;
@@ -1615,31 +1747,72 @@ async fn apply_config(app: &AppState) -> Result<()> {
     Ok(())
 }
 
-/// Auto-discover rc4-compatible sequencers on the L1: scan a recent window with NO
-/// channel filter, and for every channel not already tracked, decode its blocks under
-/// our (rc4) build and recompute their header hashes. A channel is "compatible" when it
-/// has at least one block with a real header hash and EVERY such block recomputes
-/// correctly - i.e. it runs the same block-hashing build we do. Incompatible
-/// (different-version) channels fail the recompute (or don't borsh-decode at all) and
-/// are skipped. Up to `total_cap` auto-discovered channels are tracked in total; newly
-/// found ones are appended to the config (and persisted), then `apply_config` re-seeds
-/// so the backfill + live stream pick them up.
+/// What discovery decided a sampled, not-yet-tracked channel is.
+#[derive(PartialEq, Debug)]
+enum ChannelKind {
+    /// Valid LEZ sequencer blocks whose header hashes recompute under our build.
+    Sequencer,
+    /// Raw DATA inscriptions (text/JSON/bytes) - not LEZ sequencer blocks at all.
+    Data,
+    /// Blocks that borsh-decode but fail (or can't run) the hash recompute - a
+    /// different-version sequencer, or any block in a light (no-decode) build.
+    /// Left untracked: it's neither verifiably ours nor honestly "data".
+    Skip,
+}
+
+/// Classify a channel from its sampled decoded inscriptions.
+fn classify_channel(blocks: &[Decoded]) -> ChannelKind {
+    let decoded: Vec<&Decoded> = blocks.iter().filter(|d| !d.hash.is_empty()).collect();
+    // compatible sequencer: at least one real header hash, and every one recomputes
+    if !decoded.is_empty() && decoded.iter().all(|d| d.hash_ok) {
+        return ChannelKind::Sequencer;
+    }
+    // data channel: EVERY sample is a non-block payload (mis-parsed block_id sentinel) -
+    // one block-like sample anywhere means this is not a pure data channel. Distinct
+    // from hash-empty: a light build leaves hash empty on REAL blocks too.
+    if !blocks.is_empty() && blocks.iter().all(|d| d.undecodable) {
+        return ChannelKind::Data;
+    }
+    ChannelKind::Skip
+}
+
+/// Auto-discover channels on the L1: scan a recent window with NO channel filter and
+/// classify every channel not already tracked (see `classify_channel`). Rc4-compatible
+/// **sequencers** - blocks decode under our build and every header hash recomputes -
+/// are adopted as before. Channels whose inscriptions are NOT valid LEZ sequencer
+/// blocks (raw text/data payloads) are adopted too, flagged `data_channel` so the UI
+/// badges them explicitly (disable via `discover_data: false` /
+/// `ZONE_SCAN_DISCOVER_DATA=0`). The cap is budgeted so data channels can never starve
+/// sequencers: up to `total_cap` auto-adopted SEQUENCERS regardless of adopted data
+/// channels, while data channels only fill cap slots sequencers haven't. Newly found
+/// channels are appended to the config (and persisted), then `apply_config` re-seeds so
+/// the backfill + live stream pick them up.
 async fn discover_compatible(app: &AppState, total_cap: usize) -> Result<Vec<String>> {
     let cfg = app.config.lock().unwrap().clone();
     if !cfg.is_configured() {
         anyhow::bail!("L1 node not configured");
     }
     let already: BTreeSet<String> = cfg.channel_ids().into_iter().collect();
-    let existing = cfg.sequencers.iter().filter(|s| s.discovered).count();
-    let budget = total_cap.saturating_sub(existing);
-    if budget == 0 {
+    let adopt_data = cfg.discover_data.unwrap_or(true);
+    // Two budgets against the same cap: sequencers count only auto-adopted SEQUENCERS,
+    // so previously-adopted data channels can never exhaust the cap and starve a
+    // sequencer that launches later. Data channels count ALL auto-adopted channels,
+    // taking only slots sequencers (existing or found this pass) haven't.
+    let existing_seq = cfg.sequencers.iter().filter(|s| s.discovered && !s.data_channel).count();
+    let existing_all = cfg.sequencers.iter().filter(|s| s.discovered).count();
+    let seq_budget = total_cap.saturating_sub(existing_seq);
+    let data_budget = total_cap.saturating_sub(existing_all);
+    if seq_budget == 0 && (data_budget == 0 || !adopt_data) {
         return Ok(vec![]);
     }
     let base = cfg.base();
     let socks = cfg.socks();
     // scan EVERY L1 block (genesis -> lib), not just the recent window, so no sequencer
-    // is ever missed - however old or briefly-active. One sample block per channel keeps
-    // it light despite the full range. `discover_slots`, if set, caps the depth.
+    // is ever missed - however old or briefly-active. A handful of samples per channel
+    // keeps it light despite the full range (more than one, so a single stray raw payload
+    // on a mixed channel can't misclassify a real sequencer as a data channel — walking
+    // newest-first, a live sequencer's clock ticks dominate its recent samples).
+    // `discover_slots`, if set, caps the depth.
     let client = build_client(socks.as_deref(), Some(Duration::from_secs(90)), None)?;
     let gen = app.generation.load(Ordering::SeqCst);
     let lib = match get_json(&client, &format!("{base}/cryptarchia/info")).await {
@@ -1664,11 +1837,15 @@ async fn discover_compatible(app: &AppState, total_cap: usize) -> Result<Vec<Str
                 collect_inscriptions(b, &mut ins);
                 for ri in ins {
                     let cid = ri.channel;
-                    if already.contains(&cid) || by_chan.contains_key(&cid) {
-                        continue; // already tracked, or already sampled this channel
+                    if already.contains(&cid) {
+                        continue; // already tracked
+                    }
+                    let samples = by_chan.entry(cid).or_default();
+                    if samples.len() >= DISCOVER_SAMPLES {
+                        continue; // enough samples for this channel
                     }
                     if let Some(d) = decode_inscription(&ri.value) {
-                        by_chan.insert(cid, vec![d]);
+                        samples.push(d);
                     }
                 }
             }
@@ -1678,31 +1855,52 @@ async fn discover_compatible(app: &AppState, total_cap: usize) -> Result<Vec<Str
         }
         hi = from - 1;
     }
-    let mut found = Vec::new();
-    for (ch, blocks) in by_chan {
-        if already.contains(&ch) {
-            continue;
+    // sequencers first, then data channels, so data channels never eat a sequencer's slot
+    let mut found_seq = Vec::new();
+    for (ch, blocks) in &by_chan {
+        if found_seq.len() >= seq_budget {
+            break;
         }
-        // require real decoded blocks (non-empty header hash) and every one recomputes
-        let decoded: Vec<&Decoded> = blocks.iter().filter(|d| !d.hash.is_empty()).collect();
-        if !decoded.is_empty() && decoded.iter().all(|d| d.hash_ok) {
-            found.push(ch);
-            if found.len() >= budget {
+        if classify_channel(blocks) == ChannelKind::Sequencer {
+            found_seq.push(ch.clone());
+        }
+    }
+    let mut found_data = Vec::new();
+    if adopt_data {
+        // data channels take only cap slots that sequencers (existing or just found)
+        // haven't; a full data budget never blocks a later sequencer (see above)
+        let data_slots = data_budget.saturating_sub(found_seq.len());
+        for (ch, blocks) in &by_chan {
+            if found_data.len() >= data_slots {
                 break;
+            }
+            if classify_channel(blocks) == ChannelKind::Data {
+                found_data.push(ch.clone());
             }
         }
     }
 
-    if !found.is_empty() {
+    if !found_seq.is_empty() || !found_data.is_empty() {
         {
             let mut c = app.config.lock().unwrap();
-            for ch in &found {
+            for ch in &found_seq {
                 c.sequencers.push(SeqCfg {
                     label: format!("seq-{}", &ch[..ch.len().min(6)]),
                     channel_id: ch.clone(),
                     rpc_url: String::new(),
                     full: true,
                     discovered: true,
+                    data_channel: false,
+                });
+            }
+            for ch in &found_data {
+                c.sequencers.push(SeqCfg {
+                    label: format!("data-{}", &ch[..ch.len().min(6)]),
+                    channel_id: ch.clone(),
+                    rpc_url: String::new(),
+                    full: true,
+                    discovered: true,
+                    data_channel: true,
                 });
             }
         }
@@ -1710,14 +1908,24 @@ async fn discover_compatible(app: &AppState, total_cap: usize) -> Result<Vec<Str
         if let Err(e) = save_config(&app.config_path, &snapshot) {
             eprintln!("discover: failed to persist config: {e:#}");
         }
-        println!(
-            "discover: +{} rc4-compatible sequencer(s): {}",
-            found.len(),
-            found.iter().map(|c| &c[..c.len().min(8)]).collect::<Vec<_>>().join(", ")
-        );
+        if !found_seq.is_empty() {
+            println!(
+                "discover: +{} LEZ sequencer(s): {}",
+                found_seq.len(),
+                found_seq.iter().map(|c| &c[..c.len().min(8)]).collect::<Vec<_>>().join(", ")
+            );
+        }
+        if !found_data.is_empty() {
+            println!(
+                "discover: +{} data channel(s) (inscriptions are not LEZ sequencer blocks): {}",
+                found_data.len(),
+                found_data.iter().map(|c| &c[..c.len().min(8)]).collect::<Vec<_>>().join(", ")
+            );
+        }
         apply_config(app).await?;
     }
-    Ok(found)
+    found_seq.extend(found_data);
+    Ok(found_seq)
 }
 
 /// One-shot discovery: scan recent finalized blocks and seed the feed + per-channel
@@ -2294,6 +2502,14 @@ async fn refresh_info(client: &Client, base: &str, app: &AppState) {
                 s.l1.finality_series.push_back((now, tip.saturating_sub(lib)));
                 while s.l1.finality_series.len() > FINALITY_SERIES_CAP {
                     s.l1.finality_series.pop_front();
+                }
+            }
+            // sample the tip slot itself, so the slot RATE can be measured (see
+            // `measured_slot_secs`) and the finality estimate stops being a guess.
+            if let Some(tip) = s.l1.tip_slot {
+                s.l1.slot_series.push_back((now, tip));
+                while s.l1.slot_series.len() > FINALITY_SERIES_CAP {
+                    s.l1.slot_series.pop_front();
                 }
             }
             s.l1.mode = info_mode(&v);
@@ -2970,12 +3186,29 @@ async fn index(State(app): State<AppState>, headers: axum::http::HeaderMap) -> R
         Html(
             DASH_HTML
                 .replace("{{ORIGIN}}", &origin)
-                .replace("{{CHANNEL_ALIASES}}", &channel_alias_js()),
+                .replace("{{CHANNEL_ALIASES}}", &channel_alias_js())
+                .replace("{{BUILD_TAG}}", &build_tag()),
         )
         .into_response()
     } else {
         // /setup is token-gated, so don't redirect there - tell the operator to run setup.
         Html(NOT_CONFIGURED_HTML).into_response()
+    }
+}
+
+/// This build's identity for the UI footer: `v<crate version>` plus the git revision when
+/// the build had one (`build.rs`; absent from tarball/vendored/npm builds, where the
+/// version alone is all there is). Deliberately plain text - an operator checking which
+/// binary a box is running should be able to read it off the page without a tooltip.
+pub(crate) fn build_tag() -> String {
+    let ver = env!("CARGO_PKG_VERSION");
+    // `option_env!`, not `env!`: a source tree without `build.rs` (or with build scripts
+    // disabled) must still COMPILE. `env!` would make the missing var a build error, and
+    // the npm package's build-from-source fallback is a real path for platforms with no
+    // prebuilt binary — a version tag is never worth failing someone's install over.
+    match option_env!("ZONESCAN_GIT").unwrap_or("") {
+        "" => format!("v{ver}"),
+        git => format!("v{ver} · {git}"),
     }
 }
 
@@ -3129,7 +3362,7 @@ const RC3_PROGRAMS: &[(&str, &str)] = &[
 /// a live settled block (`884e693a…`); the source-tree clock (`e23158e6…`) differs and is
 /// kept only as a fallback for a differently-built rc5 zone. User-deployed programs (not
 /// natives) are not here and correctly render as raw hex.
-const RC5_PROGRAMS: &[(&str, &str)] = &[
+pub(crate) const RC5_PROGRAMS: &[(&str, &str)] = &[
     // deployed clock (empirical, from a live settled block)
     ("884e693a302d57de1ac4c405ca5bea1df707d1de11d9f87de51b78845aa98e63", "clock"),
     // 12 non-clock natives (netcup build, LE-bytes)
@@ -3169,14 +3402,40 @@ fn is_clock_program(p: &str) -> bool {
 }
 
 /// Which LEZ build a sequencer runs, inferred from a program label/id it inscribes.
-/// The rc4 build (the one we link) labels its OWN built-ins by name, so a known name
-/// means rc4; an rc3 built-in only ever appears as its raw hex id.
+/// The build we LINK (v0.2.0 stock) labels its own built-ins by name at decode, so a
+/// known name means v0.2; older builds' ids only ever appear as raw hex and resolve
+/// through the RC5/RC3 id tables below. The CLOCK is deliberately absent from the name
+/// list: its guest is byte-identical across builds (the live netcup-rc5 clock id
+/// `884e693a…` IS stock v0.2.0's clock id), so a clock tick carries no version signal —
+/// tagging from it would mislabel an rc5 zone as v0.2. Version comes from the
+/// build-distinctive natives instead.
+///
+/// SHARED_GUEST_IDS lists ids deployed by BOTH the live rc5-era zones and the stock
+/// v0.2.0 build (identical guests): the empirical clock, and the stock vault/faucet
+/// running here as genesis_supply/genesis_supply_bridge. They carry no version signal.
+const SHARED_GUEST_IDS: &[&str] = &[
+    "884e693a302d57de1ac4c405ca5bea1df707d1de11d9f87de51b78845aa98e63", // clock
+    "40acaa4547c36a0e243d1bcb3e880b7fa3fd2175002a3977fa5b7299c5e5754f", // vault / genesis_supply
+    "c316e2bed1d90687b35b80d460d35e7fe40130bbd2563cf19ee12e0e06c74508", // faucet / genesis_supply_bridge
+];
+
 fn lez_version(program: &str) -> Option<&'static str> {
+    if SHARED_GUEST_IDS.contains(&program) {
+        return None; // shared guest: version-ambiguous by construction
+    }
     if matches!(
         program,
-        "token" | "amm" | "clock" | "ata" | "pinata" | "pinata_token" | "authenticated_transfer"
+        "token"
+            | "amm"
+            | "ata"
+            | "pinata"
+            | "pinata_token"
+            | "authenticated_transfer"
+            | "vault"
+            | "faucet"
+            | "bridge"
     ) {
-        return Some("rc4");
+        return Some("v0.2");
     }
     if RC5_PROGRAMS.iter().any(|(id, _)| *id == program) {
         return Some("rc5");
@@ -3188,9 +3447,13 @@ fn lez_version(program: &str) -> Option<&'static str> {
 }
 
 fn program_name_map(app: &AppState) -> HashMap<String, String> {
+    // precedence (low->high): linked-build names < deployment tables < RPC registry <
+    // operator aliases. The deployment tables must OVERRIDE the linked build: since
+    // v0.2.0 the stock vault/faucet image ids are also live here under deployment
+    // roles (genesis_supply / genesis_supply_bridge) and must keep those names.
     let mut m: HashMap<String, String> = crate::builtin_program_ids().into_iter().collect();
     for (id, name) in RC3_PROGRAMS.iter().chain(RC5_PROGRAMS) {
-        m.entry((*id).to_string()).or_insert_with(|| (*name).to_string());
+        m.insert((*id).to_string(), (*name).to_string());
     }
     for (k, v) in app.programs.lock().unwrap().iter() {
         m.insert(k.clone(), v.clone());
@@ -3559,8 +3822,10 @@ async fn api_schema_submit(
 
 async fn api_state(State(app): State<AppState>) -> Json<Snapshot> {
     let db_total = app.db.as_ref().map(|d| d.tx_total());
+    let data_channels = data_channel_set(&app);
+    let ipfs_gateway = app.config.lock().unwrap().ipfs_gateway.clone();
     let s = app.inner.lock().unwrap();
-    Json(build_snapshot(&s, db_total))
+    Json(build_snapshot(&s, db_total, &data_channels, ipfs_gateway))
 }
 
 #[derive(serde::Deserialize)]
@@ -3586,6 +3851,8 @@ struct TxQuery {
     before_ts: Option<u64>,
     before_block: Option<u64>,
     before_hash: Option<String>,
+    /// zone half of the cursor: a hash alone can name rows on several zones.
+    before_channel: Option<String>,
     limit: Option<usize>,
 }
 
@@ -3608,12 +3875,41 @@ fn raw_payload_repr(bytes: &[u8]) -> (Option<String>, String) {
     (text, hex)
 }
 
+/// A small `(type, title)` summary of a raw inscription in a known JSON format
+/// (currently the keeper `cid_pin`), so list rows can say what was inscribed without
+/// shipping the whole payload. `label` is a JSON-encoded string inside the JSON.
+fn raw_summary(payload: &[u8]) -> Option<(&'static str, String)> {
+    let v: Value = serde_json::from_slice(payload).ok()?;
+    if v.get("type").and_then(Value::as_str)? != "cid_pin" {
+        return None;
+    }
+    let title = v
+        .get("label")
+        .and_then(|l| match l {
+            // label is usually a JSON-encoded string, but accept an inline object too
+            Value::String(s) => serde_json::from_str::<Value>(s).ok(),
+            Value::Object(_) => Some(l.clone()),
+            _ => None,
+        })
+        .and_then(|l| l.get("title").and_then(Value::as_str).map(str::to_string))
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| v.get("cid").and_then(Value::as_str).map(str::to_string))?;
+    Some(("cid_pin", title.trim().to_string()))
+}
+
 fn enrich_tx(app: &AppState, rec: &TxRecord) -> Value {
     let mut v = serde_json::to_value(rec).unwrap_or(Value::Null);
     // The raw payload can be sizeable; list rows don't need it (they only badge "raw"). It's
     // re-surfaced as raw_text/raw_hex on the tx-detail (enrich_tx_detail).
     if let Value::Object(o) = &mut v {
         o.remove("raw_payload");
+        // ...but a recognized format still gets a one-line summary for the row label.
+        if rec.kind == "raw" {
+            if let Some((ty, title)) = raw_summary(&rec.raw_payload) {
+                o.insert("raw_type".into(), json!(ty));
+                o.insert("raw_title".into(), json!(title));
+            }
+        }
     }
     if let (Value::Object(o), Some(db)) = (&mut v, app.db.as_ref()) {
         let (amount, token) = db.token_op(rec);
@@ -3695,6 +3991,13 @@ fn enrich_tx_detail(app: &AppState, rec: &TxRecord) -> Value {
         // For a raw inscription: surface the actual content (UTF-8 text and/or a hex dump).
         if rec.kind == "raw" && !rec.raw_payload.is_empty() {
             let (text, hex) = raw_payload_repr(&rec.raw_payload);
+            // valid JSON that fails the printability heuristic is still text - without
+            // this the row can say "cid_pin · title" while the panel has no raw_text.
+            let text = text.or_else(|| {
+                serde_json::from_slice::<Value>(&rec.raw_payload)
+                    .ok()
+                    .map(|_| String::from_utf8_lossy(&rec.raw_payload).into_owned())
+            });
             o.insert("raw_len".into(), json!(rec.raw_payload.len()));
             o.insert("raw_hex".into(), json!(hex));
             if let Some(t) = text {
@@ -3755,8 +4058,13 @@ async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<
         );
         ex
     });
-    let after: Option<(u64, u64, String)> = match (q.before_block, q.before_hash.as_deref()) {
-        (Some(b), Some(h)) if !h.is_empty() => Some((q.before_ts.unwrap_or(0), b, h.to_string())),
+    let after: Option<(u64, u64, String, String)> = match (q.before_block, q.before_hash.as_deref()) {
+        (Some(b), Some(h)) if !h.is_empty() => Some((
+            q.before_ts.unwrap_or(0),
+            b,
+            h.to_string(),
+            q.before_channel.clone().unwrap_or_default(),
+        )),
         _ => None,
     };
 
@@ -3776,7 +4084,7 @@ async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<
                 q: n.as_deref(),
                 programs: pr.as_deref(),
                 exclude: ex.as_deref(),
-                after: af.as_ref().map(|(ts, b, h)| (*ts, *b, h.as_str())),
+                after: af.as_ref().map(|(ts, b, h, c)| (*ts, *b, h.as_str(), c.as_str())),
                 oldest,
                 limit,
             })
@@ -3823,11 +4131,15 @@ async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<
             None => true,
         })
         .filter(|t| {
-            // pagination cursor: skip everything up to and including (before_hash).
+            // pagination cursor: skip everything up to and including the cursor row. Match
+            // the zone too when the caller sent one — the same hash can name a row on
+            // several zones, and stopping at the wrong one drops or repeats a page.
             if passed {
                 return true;
             }
-            if after.as_ref().is_some_and(|(_, _, h)| *h == t.hash) {
+            if after.as_ref().is_some_and(|(_, _, h, c)| {
+                *h == t.hash && (c.is_empty() || *c == t.channel)
+            }) {
                 passed = true;
             }
             false
@@ -3852,17 +4164,44 @@ async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<
     Json(out.iter().map(|r| enrich_tx(&app, r)).collect())
 }
 
+/// `?channel=` disambiguates a hash that exists on more than one zone (identical genesis txs
+/// hash the same on every zone that shares a genesis config). The dashboard passes the zone
+/// from the `/zone/<z>/tx/<hash>` URL; without it, whichever zone carries the hash wins, so
+/// an unscoped link still resolves.
+#[derive(serde::Deserialize)]
+struct TxDetailQuery {
+    channel: Option<String>,
+}
+
 async fn api_tx(
     State(app): State<AppState>,
     Path(hash): Path<String>,
+    Query(q): Query<TxDetailQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    // normalize like the stored form (lowercase hex, no `0x`); a bad value just means
+    // "no zone preference" rather than an error, so the link still resolves.
+    let want = q
+        .channel
+        .as_deref()
+        .map(|c| c.trim().trim_start_matches("0x").to_ascii_lowercase())
+        .filter(|c| !c.is_empty());
     if let Some(db) = app.db.clone() {
         let h = hash.clone();
-        if let Ok(Ok(Some(t))) = tokio::task::spawn_blocking(move || db.get_tx(&h)).await {
+        let c = want.clone();
+        let got = tokio::task::spawn_blocking(move || db.get_tx_on(&h, c.as_deref())).await;
+        if let Ok(Ok(Some(t))) = got {
             return Ok(Json(enrich_tx_detail(&app, &t)));
         }
     }
-    let found = app.inner.lock().unwrap().txs.iter().find(|t| t.hash == hash).cloned();
+    let found = {
+        let s = app.inner.lock().unwrap();
+        // prefer the requested zone's copy in the in-memory fallback too
+        s.txs
+            .iter()
+            .find(|t| t.hash == hash && want.as_deref().is_some_and(|c| t.channel == c))
+            .or_else(|| s.txs.iter().find(|t| t.hash == hash))
+            .cloned()
+    };
     found.map(|t| Json(enrich_tx_detail(&app, &t))).ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -3872,6 +4211,8 @@ struct AcctQuery {
     channel: Option<String>,
     before_block: Option<u64>,
     before_hash: Option<String>,
+    /// zone half of the cursor: a hash alone can name rows on several zones.
+    before_channel: Option<String>,
     limit: Option<usize>,
     /// feed filter (shared with /api/txs): visibility, computed-type set, sort.
     kind: Option<String>,
@@ -3894,8 +4235,10 @@ async fn api_account(
         .filter(|s| !s.is_empty())
         .and_then(|c| resolve_channel(c).ok());
 
-    let after: Option<(u64, String)> = match (q.before_block, q.before_hash.as_deref()) {
-        (Some(b), Some(h)) if !h.is_empty() => Some((b, h.to_string())),
+    let after: Option<(u64, String, String)> = match (q.before_block, q.before_hash.as_deref()) {
+        (Some(b), Some(h)) if !h.is_empty() => {
+            Some((b, h.to_string(), q.before_channel.clone().unwrap_or_default()))
+        }
         _ => None,
     };
     // transaction history + per-channel breakdown: durable store first.
@@ -3918,7 +4261,7 @@ async fn api_account(
             db.account(
                 &idc,
                 sc.as_deref(),
-                af.as_ref().map(|(b, h)| (*b, h.as_str())),
+                af.as_ref().map(|(b, h, c)| (*b, h.as_str(), c.as_str())),
                 k.as_deref(),
                 ty.as_deref(),
                 oldest,
@@ -4199,8 +4542,9 @@ struct DiscoverQuery {
     limit: Option<usize>,
 }
 
-/// Discover rc4-compatible sequencers live on the L1 and start tracking up to `limit`
-/// of them. Spawned (the unfiltered window scan can be slow); the newly tracked
+/// Discover LEZ sequencers live on the L1 and start tracking up to `limit` of them.
+/// Build-agnostic: any channel whose inscriptions decode as LEZ sequencer blocks counts,
+/// rc3 through v0.2.0. Spawned (the unfiltered window scan can be slow); the newly tracked
 /// sequencers appear in /api/state as they're added.
 async fn api_discover(State(app): State<AppState>, Query(q): Query<DiscoverQuery>) -> Json<Value> {
     let cap = q
@@ -4399,6 +4743,8 @@ struct TokenPageQuery {
     channel: Option<String>,
     before_block: Option<u64>,
     before_hash: Option<String>,
+    /// zone half of the cursor: a hash alone can name rows on several zones.
+    before_channel: Option<String>,
     limit: Option<usize>,
     /// feed filter (shared with /api/txs): visibility, computed-type set, sort.
     kind: Option<String>,
@@ -4420,8 +4766,10 @@ async fn api_token(
         .filter(|s| !s.is_empty())
         .and_then(|c| resolve_channel(c).ok());
 
-    let after: Option<(u64, String)> = match (q.before_block, q.before_hash.as_deref()) {
-        (Some(b), Some(h)) if !h.is_empty() => Some((b, h.to_string())),
+    let after: Option<(u64, String, String)> = match (q.before_block, q.before_hash.as_deref()) {
+        (Some(b), Some(h)) if !h.is_empty() => {
+            Some((b, h.to_string(), q.before_channel.clone().unwrap_or_default()))
+        }
         _ => None,
     };
     let limit = q.limit.unwrap_or(50).min(500);
@@ -4458,7 +4806,7 @@ async fn api_token(
             db.account(
                 &idc,
                 sc.as_deref(),
-                af.as_ref().map(|(b, h)| (*b, h.as_str())),
+                af.as_ref().map(|(b, h, c)| (*b, h.as_str(), c.as_str())),
                 vk.as_deref(),
                 ty.as_deref(),
                 oldest,
@@ -4752,11 +5100,21 @@ const DASH_HTML: &str = r#"<!doctype html>
     margin-left:6px;vertical-align:middle;letter-spacing:.3px;text-transform:uppercase}
   .v-rc4{background:#dcfce7;color:#166534}
   .v-rc5{background:#e0e7ff;color:#3730a3} .v-rc3{background:#fef3c7;color:#92400e}
+  /* stock v0.2.0 build (named natively by the linked crate); dot escaped in the selector */
+  .v-v0\.2{background:#ccfbf1;color:#0f766e}
+  /* raw data channel (not LEZ sequencer blocks): the amber "raw" palette */
+  .v-data{background:#fef9c3;color:#854d0e}
   /* L1-finality badge: green "final" > blue "on L1 · finalizing" > grey "pending" */
   .fbadge{display:inline-block;font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;vertical-align:middle}
   .fbadge.fin{background:rgba(19,169,123,.14);color:var(--green)}
   .fbadge.safe{background:rgba(37,99,235,.12);color:#1d4ed8}
   .fbadge.pend{background:#eef0f3;color:#6b7280}
+  /* zones-list kind filter: All | rc | data */
+  .zseg{display:inline-flex;gap:4px}
+  .zseg button{font-size:11px;font-weight:600;padding:2px 10px;border-radius:6px;border:1px solid var(--line2);
+    background:transparent;color:var(--soft);cursor:pointer;font-family:inherit}
+  .zseg button:hover{color:var(--navy)}
+  .zseg button.on{background:var(--navy);border-color:var(--navy);color:#fff}
   .filt{display:flex;gap:6px}
   .kbtn{border:1px solid var(--line2);background:#fff;color:var(--muted);border-radius:7px;padding:5px 11px;font-size:12px;cursor:pointer}
   .kbtn.sel{border-color:var(--fg);color:var(--fg);background:#ececef}
@@ -4792,6 +5150,8 @@ const DASH_HTML: &str = r#"<!doctype html>
   #sfoot a:hover{color:var(--fg);text-decoration:none}
   #sfoot svg{width:13px;height:13px;display:block}
   #sfoot .npm{display:inline-flex;align-items:center;opacity:.55;cursor:default}
+  /* build tag: monospace so a git hash is selectable/comparable at a glance */
+  #sfoot .bld{font-family:var(--mono);color:var(--muted);cursor:default}
   code{background:#eef1f6;padding:1px 5px;border-radius:4px;font-size:12px;font-family:var(--mono)}
 
   /* address overlay */
@@ -4998,7 +5358,23 @@ function instrText(t,tok){
   const w=t.instruction_data||[]; if(!w.length) return '';
   // deployer-supplied schema (ABI) for a custom program decodes it into typed fields
   if(t.program && SCHEMAS[t.program]){ const d=decodeBySchema(w, SCHEMAS[t.program]); if(d) return d; }
-  const name=PROGS[t.program]||t.program, a=t.accounts||[];
+  let name=PROGS[t.program]||t.program;
+  // an unnamed program with a confident, non-generic fingerprint decodes by the guessed
+  // built-in shape - the SAME shape that already resolved its amount/token server-side.
+  // The ≈ marker keeps the attribution honest (shape-verified, identity unproven).
+  let gmark='';
+  if(name===t.program && typeof guessFor==='function'){
+    const g=guessFor(t.program,t);
+    if(g && !g.generic && ['token','authenticated_transfer','ata','amm','pinata','pinata_token'].includes(g.name)){
+      name=g.name;
+      gmark=`<span class="htag" title="decoded by this program's fingerprinted ${esc(g.name)} shape — best-guess, unverified">≈ ${esc(g.name)}</span>`;
+    }
+  }
+  const out=instrTextByName(t,tok,name,w);
+  return (out&&gmark)?gmark+out:out;
+}
+function instrTextByName(t,tok,name,w){
+  const a=t.accounts||[];
   const acc=(i)=>a[i]?`<a class="lnk" href="/zone/${u(t.channel)}/wallet/${u(a[i])}">${esc(sh(a[i],6,4))}</a>`:'';
   const ft=(i)=>(a[0]?` · from ${acc(0)}`:'')+(a[1]?` → to ${acc(1)}`:'');
   // token-standard Instruction (risc0 enum): 0 Transfer, 1 NewFungibleDefinition,
@@ -5007,7 +5383,8 @@ function instrText(t,tok){
     const v=w[0]>>>0;
     const tn=['Transfer','NewFungibleDefinition','NewDefinitionWithMetadata','InitializeAccount','Burn','Mint','PrintNft'][v];
     if(v===0 && w.length>=5){ // Transfer{amount: u128}
-      let tk='token-standard';
+      // best label wins: linked definition > server-resolved symbol > generic
+      let tk=t.token?`<b>${esc(t.token)}</b>`:'token-standard';
       if(tok&&tok.resolved&&tok.definition){ const lbl=tok.name||sh(tok.definition,6,4);
         tk=`<a class="lnk" href="/zone/${u(t.channel)}/token/${u(tok.definition)}">${esc(lbl)}</a>`; }
       return `<b>Transfer</b> <b>${grp(u128le(w,1).toString())}</b> ${tk}`+ft();
@@ -5066,7 +5443,8 @@ function instrText(t,tok){
     // value-transfer: [variant(small), u128 amount] with the high words zero
     if(w.length===5&&(w[0]>>>0)<=15&&!(w[3]||w[4])&&((w[1]|w[2])>>>0)){
       const amt=u64le(w,1); // high u128 words are zero, so the amount fits a u64
-      const tg=t.token_guess?`<span class="pguess">≈ ${esc(t.token_guess)}</span>`:'<span class="mut">token/program unresolved</span>';
+      const rt=tok||t.token; // resolved name beats the fingerprint guess
+      const tg=rt?esc(rt):(t.token_guess?`<span class="pguess">≈ ${esc(t.token_guess)}</span>`:'<span class="mut">token/program unresolved</span>');
       return `${tag}<b>Transfer</b> <b>${grp(amt.toString())}</b> ${tg} <span class="mut" style="font-size:11px">· value-transfer shape · variant ${w[0]>>>0}</span>`+ft();
     }
   }
@@ -5166,6 +5544,8 @@ function renderByLayout(w,layout,t){
 }
 
 function verBadge(s){ return s.version?`<span class="vbadge v-${esc(s.version)}" title="LEZ build">${esc(s.version)}</span>`:''; }
+// explicit marker for a channel adopted as raw DATA - never to be read as a sequencer.
+function dataBadge(s){ return s&&s.data_channel?`<span class="vbadge v-data" title="data channel - its inscriptions do not decode as valid LEZ sequencer blocks">data</span>`:''; }
 // a zone's display title: the friendly alias when known, else the short hex.
 function zoneTitle(s){ return aliasOf(s.channel) || s.channel_short || sh(s.channel); }
 // sequencer (LEZ/zone) version as a labeled value: the rc-family badge (rc3/rc4/rc5),
@@ -5210,8 +5590,24 @@ function accShort(a){ return a?esc(sh(a,6,4)):'?'; }
 function grp(s){ return s==null?'':String(s).replace(/\B(?=(\d{3})+(?!\d))/g,','); }
 // L1-finality (three tiers) from a tx's block_id vs the sequencer's two thresholds:
 //   block_id <= finalized_block_id            -> "final"   (irreversible, past lib_slot)
-//   finalized < block_id <= safe_block_id     -> "on L1"   (inscribed, finalizing ~1h)
+//   finalized < block_id <= safe_block_id     -> "on L1"   (inscribed, finalizing)
 //   block_id > safe_block_id                  -> "pending" (not yet inscribed / unseen on L1)
+// How long "finalizing" lasts is MEASURED (l1.finality_eta_secs = lag slots × observed
+// secs/slot), never assumed: when the rate hasn't been observed long enough we state the
+// lag in slots instead of naming a duration we can't back up.
+function finalityEta(){
+  const l1=(state&&state.l1)||{};
+  if(l1.finality_eta_secs!=null) return 'about '+dur(l1.finality_eta_secs);
+  if(l1.finality_lag!=null) return num(l1.finality_lag)+' slots behind';
+  return 'lag unknown';
+}
+// compact duration for an estimate: "45 secs" / "12 mins" / "1.4 hrs"
+function dur(s){
+  s=Number(s)||0;
+  if(s<90) return s+' secs';
+  if(s<5400) return Math.round(s/60)+' mins';
+  return (s/3600).toFixed(1)+' hrs';
+}
 function seqFinal(ch){ const q=((state&&state.sequencers)||[]).find(x=>x.channel===ch); return q?(q.finalized_block_id||0):0; }
 function seqSafe(ch){ const q=((state&&state.sequencers)||[]).find(x=>x.channel===ch); return q?Math.max(q.safe_block_id||0,q.finalized_block_id||0):0; }
 function finalityBadge(t){
@@ -5228,7 +5624,7 @@ function finalityBadge(t){
   if(t.block_id<=fin)
     return `<span class="fbadge fin" title="final - irreversibly settled on the L1 (finalized up to block #${num(fin)})">final</span>`;
   if(t.block_id<=safe)
-    return `<span class="fbadge safe" title="inscribed on the L1 and finalizing (irreversible once past the L1's last-final slot, ~1h); finalized up to #${num(fin)}">on L1 · finalizing</span>`;
+    return `<span class="fbadge safe" title="inscribed on the L1 and finalizing (irreversible once past the L1's last-final slot — ${finalityEta()}); finalized up to #${num(fin)}">on L1 · finalizing</span>`;
   return `<span class="fbadge pend" title="pending - not yet observed inscribed on the L1 (on L1 up to #${num(safe)})">pending</span>`;
 }
 // A human one-line ACTION for a tx: "<verb> <amount> <token> from <a> to <b>", derived from
@@ -5238,7 +5634,10 @@ function txAction(t){
   const w=t.instruction_data||[], a=t.accounts||[], name=progName(t.program), tok=t.token, amt=t.amount;
   const amtS=amt!=null?grp(amt):'';
   const ft=(a[0]?' from '+accShort(a[0]):'')+(a[1]?' to '+accShort(a[1]):'');
-  if(t.kind==='raw') return 'Raw inscription'+(t.slot?' · L1 slot '+num(t.slot):'');
+  if(t.kind==='raw'){
+    if(t.raw_type==='cid_pin'&&t.raw_title) return 'Pinned · '+esc(t.raw_title);
+    return 'Raw inscription'+(t.slot?' · L1 slot '+num(t.slot):'');
+  }
   if(t.kind==='deploy') return 'Deploy program'+(t.deploy_program?' '+esc(progShort(t.deploy_program)):'');
   if(t.kind==='private'){ const s=t.subtype; if(s==='shield') return 'Shield (private deposit)'; if(s==='deshield') return 'Deshield (private withdraw)'; return 'Private transfer'; }
   if(name==='ata'){ const v=w[0]>>>0;
@@ -5252,8 +5651,16 @@ function txAction(t){
     if(v===4) return `Burn ${amtS?amtS+' ':''}${tok?esc(tok):'tokens'}`;
     if(v===5) return `Mint ${amtS?amtS+' ':''}${tok?esc(tok):'tokens'}`; }
   if(name==='authenticated_transfer'){
-    if(w.length>=4 && u128le(w,0)===0n) return `Register native account${a[0]?' '+accShort(a[0]):''}`;
-    const na=w.length>=4?grp(u128le(w,0).toString()):amtS;
+    // rc5 wraps native in an ENUM: [0, u128] = Transfer (amount at w1, 5 words) and the
+    // 1-word [1] = CreateAccount. rc3/rc4 is a BARE u128 (4 words): all-zero = Register,
+    // else the amount at w0. Reading u128le(w,0) on the rc5 shape put the variant word
+    // into the low limb (a 1-LEZ transfer showed as 2^32). Prefer the server-decoded
+    // amount (amtS) - it already handles both shapes - and only fall back to local words.
+    if(w.length===1 && (w[0]>>>0)===1) return `Register native account${a[0]?' '+accShort(a[0]):''}`;
+    if(w.length===4 && u128le(w,0)===0n) return `Register native account${a[0]?' '+accShort(a[0]):''}`;
+    const na=amt!=null?amtS
+      :(w.length===5&&(w[0]>>>0)===0?grp(u128le(w,1).toString())
+      :(w.length===4?grp(u128le(w,0).toString()):''));
     return `Transfer ${na?na+' ':''}LEZ${ft}`; }
   if(name==='pinata') return `Claim native LEZ${a[0]?' to '+accShort(a[0]):''}`;
   if(name==='faucet') return `Faucet dispense ${tok?esc(tok)+' ':''}${a[0]?'to '+accShort(a[0]):''}`.replace(/ +$/,'');
@@ -5264,9 +5671,10 @@ function txAction(t){
     const def=r0def(w);
     if(def) return `New token <span class="pguess" title="name read from the on-chain NewFungibleDefinition instruction — program unverified">≈ ${esc(def.name)}</span> · supply ${grp(def.supply)}`;
     // value-transfer shape (server decoded t.amount per-tx): show the amount, and the token
-    // symbol when attribution exists (program-level single definition, or def-account match).
+    // symbol when attribution exists - resolved (t.token, learned from the chain's own
+    // definitions) beats the fingerprint guess, which beats "(token unresolved)".
     if(amt!=null){
-      const tg=t.token_guess?` <span class="pguess" title="token symbol from this program's NewFungibleDefinition — best-guess, unverified">≈ ${esc(t.token_guess)}</span>`:' <span class="mut">(token unresolved)</span>';
+      const tg=tok?` ${esc(tok)}`:(t.token_guess?` <span class="pguess" title="token symbol from this program's NewFungibleDefinition — best-guess, unverified">≈ ${esc(t.token_guess)}</span>`:' <span class="mut">(token unresolved)</span>');
       return `Transfer ${amtS}${tg}${ft}`;
     }
   }
@@ -5311,7 +5719,9 @@ function attachFeedScroll(){
   const tb=$('rows'); const sc=tb&&tb.closest('.tscroll'); if(!sc) return;
   sc.onscroll=()=>{ const f=cur.feed; if(f&&!f.done&&!f.loading && sc.scrollTop+sc.clientHeight>=sc.scrollHeight-300) feedMore(); };
 }
-function cursorParams(p,cursor){ if(cursor){ if(cursor.ts!=null) p.set('before_ts',cursor.ts); p.set('before_block',cursor.block); p.set('before_hash',cursor.hash); } return p; }
+// before_channel is part of the cursor because a hash is not unique across zones
+// (identical genesis txs); without it, paging past one zone's row skips the other's.
+function cursorParams(p,cursor){ if(cursor){ if(cursor.ts!=null) p.set('before_ts',cursor.ts); p.set('before_block',cursor.block); p.set('before_hash',cursor.hash); if(cursor.channel) p.set('before_channel',cursor.channel); } return p; }
 // buildUrl(cursor) -> the fetch URL for the next page (cursor=null for the first).
 function txFeed(buildUrl){
   cur.feed={buildUrl, cursor:null, done:false, loading:false, count:0, first:true, seen:new Set()};
@@ -5332,7 +5742,7 @@ async function feedMore(){
     if(f.first){ f.first=false; tb.innerHTML=''; }
     if(list.length){ tb.insertAdjacentHTML('beforeend', txRows(list)); f.count+=list.length;
       list.forEach(t=>f.seen&&f.seen.add(t.hash));
-      const last=list[list.length-1]; f.cursor={ts:last.timestamp, block:last.block_id, hash:last.hash}; }
+      const last=list[list.length-1]; f.cursor={ts:last.timestamp, block:last.block_id, hash:last.hash, channel:last.channel}; }
     if(!f.count) tb.innerHTML=`<tr><td colspan="7" class="empty">${state&&state.discovering?'⏳ scanning recent L1 blocks…':'no transactions'}</td></tr>`;
     if(list.length<PAGE) f.done=true;
     const cnt=$('count'); if(cnt) cnt.textContent='';
@@ -5344,7 +5754,7 @@ async function feedMore(){
 function txFeedLiveTick(buildUrl){ if(window.scrollY<200 && (!cur.feed||!cur.feed.loading)) txFeed(buildUrl); }
 // attach infinite scroll to a page that already rendered its first page of `list`.
 function attachScroll(buildUrl, list){
-  cur.feed={buildUrl, cursor:list.length?{ts:list[list.length-1].timestamp,block:list[list.length-1].block_id,hash:list[list.length-1].hash}:null,
+  cur.feed={buildUrl, cursor:list.length?{ts:list[list.length-1].timestamp,block:list[list.length-1].block_id,hash:list[list.length-1].hash,channel:list[list.length-1].channel}:null,
     done:list.length<PAGE, loading:false, count:list.length, first:false, seen:new Set(list.map(t=>t.hash))};
   attachFeedScroll();
 }
@@ -5398,6 +5808,8 @@ function renderHeader(){
 
 // ---- views ----
 let cur={kind:'home'};
+// zones-list kind filter: 'all' | 'rc' (sequencer zones) | 'data' (raw data channels)
+let zoneFilter='all';
 
 // blocks/min throughput (cumulative avg over the observed window) — already in the snapshot.
 function bpmStr(s){ const v=s&&s.blocks_per_min;
@@ -5432,7 +5844,7 @@ function renderHome(){
     <div class="card"><div class="k">Zones</div><div class="v" id="stat_zones">${num(seqs.length)}</div><div class="s">${alive} active</div></div>
   </div>
   <div class="grid">
-    <div class="panel"><div class="phead">Zones</div><div id="seqs"></div></div>
+    <div class="panel"><div class="phead"><span>Zones</span>${zoneSeg()}</div><div id="seqs"></div></div>
     <div class="panel">
       <div class="phead"><span>Latest Transactions</span>
         <span style="display:flex;align-items:center;gap:10px">
@@ -5451,18 +5863,31 @@ function homeFeedUrl(cursor){
   filterParams(p);
   return '/api/txs?'+cursorParams(p,cursor);
 }
+// the Zones panel filter control (All | rc | data); rendered once with the panel,
+// so snapshot-driven renderSeqs() refreshes never reset it.
+function zoneSeg(){
+  const opts=[['all','All','all tracked channels'],['rc','rc','LEZ sequencer zones only'],['data','data','raw data channels only (inscriptions are not LEZ sequencer blocks)']];
+  return `<span class="zseg">${opts.map(([k,l,t])=>`<button type="button" class="${zoneFilter===k?'on':''}" data-zf="${k}" onclick="setZoneFilter('${k}')" title="${t}">${l}</button>`).join('')}</span>`;
+}
+function setZoneFilter(k){
+  zoneFilter=k; cur.seqShown=60;
+  document.querySelectorAll('.zseg button').forEach(b=>b.classList.toggle('on',b.dataset.zf===k));
+  renderSeqs();
+}
 function renderSeqs(){
-  const seqs=(state&&state.sequencers)||[]; const el=$('seqs'); if(!el) return;
+  const all=(state&&state.sequencers)||[]; const el=$('seqs'); if(!el) return;
+  const seqs=zoneFilter==='rc'?all.filter(s=>!s.data_channel):zoneFilter==='data'?all.filter(s=>s.data_channel):all;
   if(!cur.seqShown) cur.seqShown=60;
   const slice=seqs.slice(0,cur.seqShown);
+  const none={all:'sequencers',rc:'sequencer zones',data:'data channels'}[zoneFilter]||'sequencers';
   el.innerHTML = seqs.length ? slice.map(s=>`<a class="srow" href="/zone/${u(s.channel)}" style="text-decoration:none;color:inherit">
       <span class="dot ${s.alive?'on':'off'}"></span>
-      <div class="sm"><div class="a">${esc(zoneTitle(s))}${consBadge(s)}</div>
+      <div class="sm"><div class="a">${esc(zoneTitle(s))}${dataBadge(s)}${consBadge(s)}</div>
         <div class="zmeta"><span class="zf"><span class="zk">Channel ID</span> <span class="chex">${esc(s.channel_short)}</span></span><span class="zf"><span class="zk">Sequencer version</span> ${verValue(s)}</span></div>
-        <div class="b">L2 ${l2Tip(s)} · L1 bal ${s.l1_balance!=null?num(s.l1_balance):'-'} · ${s.l1_signers||0} key(s)${bpmStr(s)?' · '+bpmStr(s):''}${tipNote(s)}${activityChip(s)}</div></div>
+        <div class="b">L2 ${l2Tip(s)} · L1 bal ${s.l1_balance!=null?grp(s.l1_balance):'-'} · ${s.l1_signers||0} key(s)${bpmStr(s)?' · '+bpmStr(s):''}${tipNote(s)}${activityChip(s)}</div></div>
       <span class="st ${s.alive?'alive':'idle'}">${s.alive?'ALIVE':'IDLE'}</span></a>`).join('')
       + (seqs.length>cur.seqShown?`<div class="empty" style="padding:12px">scroll for ${seqs.length-cur.seqShown} more…</div>`:'')
-    : `<div class="empty">${state&&state.discovering?'scanning the L1 for sequencers…':'no sequencers found'}</div>`;
+    : `<div class="empty">${state&&state.discovering?'scanning the L1 for sequencers…':'no '+none+' found'}</div>`;
   el.onscroll=()=>{ if(el.scrollTop+el.clientHeight>=el.scrollHeight-100 && cur.seqShown<seqs.length){ cur.seqShown+=60; renderSeqs(); } };
 }
 
@@ -5518,7 +5943,7 @@ function activityPanel(s){
       ${extra}
       <div class="k">Inscriber</div><div class="v">${insc}${thr}</div>
       <div class="k">Tip hash</div><div class="v">${tiph}</div>
-      <div class="k">Channel balance</div><div class="v">${s.l1_balance!=null?num(s.l1_balance):'-'}</div>
+      <div class="k">Channel balance</div><div class="v">${s.l1_balance!=null?grp(s.l1_balance):'-'}</div>
     </div>
     <div class="mut" style="padding:6px 18px 16px;font-size:12px;line-height:1.55">${esc(note)}</div>
   </div>`;
@@ -5528,10 +5953,10 @@ async function renderZone(seq){
   cur={kind:'zone',seq};
   const s=((state&&state.sequencers)||[]).find(x=>x.channel===seq)||{channel:seq,channel_short:sh(seq)};
   $('view').innerHTML=`${crumb([{t:'Home',href:'/'},{t:'Zone '+sh(seq)}])}
-  <div class="panel" style="margin-bottom:16px"><div class="phead">Sequencer ${chanLabel(s.channel, s.channel_short)} ${verBadge(s)}${consBadge(s)}</div>
+  <div class="panel" style="margin-bottom:16px"><div class="phead">${s.data_channel?'Channel':'Sequencer'} ${chanLabel(s.channel, s.channel_short)} ${dataBadge(s)}${verBadge(s)}${consBadge(s)}</div>
     <div class="ovw">
       <div><div class="k">Latest L2 Block</div><div class="v">${l2Tip(s)}</div></div>
-      <div><div class="k">L1 Channel Balance</div><div class="v">${s.l1_balance!=null?num(s.l1_balance):'-'}</div></div>
+      <div><div class="k">L1 Channel Balance</div><div class="v">${s.l1_balance!=null?grp(s.l1_balance):'-'}</div></div>
       <div><div class="k">Throughput</div><div class="v">${bpmStr(s)||'-'}</div></div>
       <div><div class="k">Status</div><div class="v" style="color:${s.alive?'var(--green)':'var(--soft)'}">${s.alive?'ALIVE':'IDLE'}</div></div>
     </div>
@@ -5560,6 +5985,62 @@ async function renderZone(seq){
 // group a hex string into space-separated byte pairs, 32 bytes per line, for a readable dump.
 function fmtHex(h){ h=(h||'').replace(/[^0-9a-fA-F]/g,''); const bytes=h.match(/.{1,2}/g)||[]; let out='';
   for(let i=0;i<bytes.length;i+=32){ out+=bytes.slice(i,i+32).join(' ')+'\n'; } return out.replace(/\n$/,''); }
+// bytes -> human size for pinned-content totals
+function fmtBytes(n){ if(n==null||isNaN(n)) return '—'; const un=['B','KB','MB','GB','TB']; let i=0,v=Number(n); while(v>=1024&&i<un.length-1){v/=1024;i++;} return (i?v.toFixed(1):String(v))+' '+un[i]; }
+// Parse a raw inscription that is a keeper `cid_pin` record; null => not one.
+// Shape: {v,type:'cid_pin',cid,label:'<json string>',source,ts} where label carries
+// {files:[{cid,name}],id,module,source,title,totalSize}.
+function parseCidPin(t){
+  if(!t.raw_text) return null;
+  let j; try{ j=JSON.parse(t.raw_text); }catch(e){ return null; }
+  if(!j||typeof j!=='object'||j.type!=='cid_pin') return null;
+  let lab={}; if(typeof j.label==='string'){ try{ lab=JSON.parse(j.label)||{}; }catch(e){} }
+  else if(j.label&&typeof j.label==='object'){ lab=j.label; }
+  return {j,lab};
+}
+// Structured panel for a cid_pin inscription: what was pinned (title, source) and its
+// IPFS files, each linked through the gateway (state.ipfs_gateway, default ipfs.io).
+// The exact on-chain bytes stay available in the payload panel rendered below it.
+function cidPinPanel(p){
+  const {j,lab}=p;
+  // never let a config value smuggle a scheme (javascript:) into hrefs - http(s) only
+  let gwRaw=String((state&&state.ipfs_gateway)||'https://ipfs.io').replace(/\/+$/,'');
+  if(!/^https?:\/\//i.test(gwRaw)) gwRaw='https://ipfs.io';
+  const gw=esc(gwRaw);
+  // entries are attacker-controlled on-chain JSON: drop non-objects (null would throw)
+  const files=(Array.isArray(lab.files)?lab.files:[]).filter(f=>f&&typeof f==='object');
+  const ts=Number(j.ts), size=Number(lab.totalSize);
+  const title=(lab.title&&String(lab.title).trim())||j.cid||'(untitled)';
+  const iaId=lab.source==='internet_archive'?(lab.id||String(j.cid||'').replace(/^ia:/,'')):null;
+  const srcCell=iaId?`<a class="lnk" href="https://archive.org/details/${u(iaId)}" target="_blank" rel="noopener">archive.org/details/${esc(iaId)}</a>`
+                    :(lab.source?esc(lab.source):'—');
+  const gwHref=(f)=>`${gw}/ipfs/${u(f.cid||'')}?filename=${u(f.name||'')}`;
+  const rows=files.map(f=>`<tr>
+    <td>${esc(f.name||'?')}</td>
+    <td class="mono" style="font-size:11px" title="${esc(f.cid||'')}">${esc(sh(f.cid||'',12,8))}</td>
+    <td style="white-space:nowrap"><a class="lnk" href="${gwHref(f)}" target="_blank" rel="noopener">view</a> · <a class="lnk" href="${gwHref(f)}&download=true">download</a></td></tr>`).join('');
+  return `<div class="panel" style="margin-top:16px"><div class="phead">Pinned content <span class="badge b-ty-raw" title="a cid_pin inscription - an IPFS pin record inscribed on the L1">cid_pin</span></div>
+    <div style="padding:16px 18px 4px;font-size:17px;font-weight:600;color:var(--navy)">${esc(title)}</div>
+    <div class="kv" style="padding:12px 18px 6px">
+      <div class="k">Source</div><div class="v">${srcCell}</div>
+      ${j.cid?`<div class="k">Pin id</div><div class="v" style="font-family:var(--mono);font-size:12px">${esc(j.cid)}</div>`:''}
+      ${j.source?`<div class="k">Pinned by</div><div class="v">${esc(j.source)}${lab.module&&lab.module!==j.source?' · '+esc(lab.module):''}</div>`:''}
+      ${Number.isFinite(ts)&&ts>0?`<div class="k">Pinned at</div><div class="v">${new Date(ts*1000).toUTCString()} <span class="mut" style="font-size:11px">(${fmtAge(ts)})</span></div>`:''}
+      ${Number.isFinite(size)?`<div class="k">Total size</div><div class="v">${fmtBytes(size)} <span class="mut" style="font-size:11px">(${num(size)} bytes)</span></div>`:''}
+    </div>
+    ${files.length?`<div class="tscroll" style="padding:0 18px 8px"><table class="ttbl"><thead><tr><th>File (${files.length})</th><th>CID</th><th>IPFS</th></tr></thead><tbody>${rows}</tbody></table></div>`
+                  :'<div class="mut" style="padding:0 18px 8px;font-size:12px">no files listed</div>'}
+    <div class="mut" style="padding:6px 18px 16px;font-size:12px;line-height:1.5">File links resolve through the IPFS gateway <span style="font-family:var(--mono)">${gw}</span> — content is served by the IPFS network, not by this explorer${state&&state.ipfs_gateway?'':' (operators can set ZONE_SCAN_IPFS_GATEWAY to use their own gateway)'}.</div>
+  </div>`;
+}
+// All content panels for a raw inscription: a structured view for recognized formats
+// (cid_pin), always followed by the exact on-chain payload. The structured render is
+// fenced: adversarial on-chain JSON must never be able to suppress the payload panel.
+function rawPanels(t){
+  let s='';
+  try{ const p=parseCidPin(t); if(p) s=cidPinPanel(p); }catch(e){}
+  return s+rawPayloadPanel(t);
+}
 // tx-detail content block for a raw inscription: its bytes as decoded UTF-8 text (when
 // printable) or a hex dump. No fabricated decoded fields - just the on-chain content.
 function rawPayloadPanel(t){
@@ -5576,8 +6057,11 @@ function rawPayloadPanel(t){
 async function renderTx(seq,hash){
   cur={kind:'tx',seq,hash};
   $('view').innerHTML=crumb([{t:'Home',href:'/'},{t:'Zone '+sh(seq),href:'/zone/'+u(seq)},{t:'Tx '+sh(hash)}])+'<div class="panel"><div class="empty">loading transaction…</div></div>';
-  let t; try{ const r=await fetch('/api/tx/'+u(hash)); if(r.ok) t=await r.json(); }catch(e){}
+  // pass the zone from the URL: the same hash can exist on several zones (identical genesis
+  // txs), and this page is zone-scoped, so ask for THIS zone's copy.
+  let t; try{ const r=await fetch('/api/tx/'+u(hash)+(seq?'?channel='+u(seq):'')); if(r.ok) t=await r.json(); }catch(e){}
   if(!t){ $('view').innerHTML=crumb([{t:'Home',href:'/'},{t:'Zone '+sh(seq),href:'/zone/'+u(seq)},{t:'Tx '+sh(hash)}])+'<div class="panel"><div class="empty">transaction not found in the current window</div></div>'; return; }
+  cur.tx=t; // kept so snapshot updates can refresh the finality badge in place
   const z=t.channel||seq;
   const taMap={}; (t.token_accounts||[]).forEach(x=>{ taMap[x.account]=x; }); // account -> {symbol, role}
   const accLinks=(arr)=> arr&&arr.length?`<div class="chips">${arr.map(x=>{
@@ -5587,7 +6071,7 @@ async function renderTx(seq,hash){
   const li=(arr)=> arr&&arr.length?`<div class="chips">${arr.map(x=>`<span>${esc(x)}</span>`).join('')}</div>`:'<span class="mut">none</span>';
   $('view').innerHTML=crumb([{t:'Home',href:'/'},{t:'Zone '+sh(z),href:'/zone/'+u(z)},{t:'Tx '+sh(hash)}])+
    `<div class="panel"><div class="phead">Transaction ${visBadge(t)} ${typeBadge(t)}</div>
-    <div style="padding:16px 18px 2px;font-size:17px;font-weight:600;color:var(--navy)">${txAction(t)} ${finalityBadge(t)}</div>
+    <div style="padding:16px 18px 2px;font-size:17px;font-weight:600;color:var(--navy)">${txAction(t)} <span id="finbadge">${finalityBadge(t)}</span></div>
     <div class="kv" style="padding:14px 18px 18px">
     <div class="k">Txn Hash</div><div class="v">${esc(t.hash)}</div>
     <div class="k">Visibility</div><div class="v">${cap(txVis(t))}</div>
@@ -5604,7 +6088,7 @@ async function renderTx(seq,hash){
     ${t.nullifiers&&t.nullifiers.length?`<div class="k">Nullifiers (${t.nullifiers.length})</div><div class="v">${li(t.nullifiers)}</div>`:''}
     ${t.commitments&&t.commitments.length?`<div class="k">Commitments (${t.commitments.length})</div><div class="v">${li(t.commitments)}</div>`:''}
     ${t.encrypted_outputs!=null?`<div class="k">Encrypted outputs</div><div class="v">${t.encrypted_outputs} (private, opaque)</div>`:''}
-   </div></div>${t.kind==='raw'?rawPayloadPanel(t):''}`;
+   </div></div>${t.kind==='raw'?rawPanels(t):''}`;
   // token-standard transfer: resolve which token (name) via the holding account, then refine
   if(progName(t.program)==='token' && t.instruction_data && t.instruction_data.length>=5 && t.instruction_data[0]===0 && t.accounts && t.accounts[0]){
     try{ const tok=await (await fetch('/api/token_of?account='+u(t.accounts[0])+'&channel='+u(z))).json();
@@ -5614,7 +6098,11 @@ async function renderTx(seq,hash){
   // custom/deployed program, no registered schema: infer a tentative field layout from
   // the program's instruction corpus and decode this tx by it (variant · fixed · id · …).
   const BUILTIN=['token','amm','clock','pinata','pinata_token','ata','authenticated_transfer','privacy_preserving_circuit'];
-  if(t.program && t.instruction_data && t.instruction_data.length && !SCHEMAS[t.program] && !BUILTIN.includes(progName(t.program))){
+  // a confident non-generic fingerprint counts as a builtin shape too: instrText already
+  // decoded it semantically, and the generic inferred-field dump must not overwrite that.
+  const gShape=(()=>{ try{ const g=guessFor(t.program,t); return (g&&!g.generic)?g.name:null; }catch(e){ return null; } })();
+  if(t.program && t.instruction_data && t.instruction_data.length && !SCHEMAS[t.program]
+     && !BUILTIN.includes(progName(t.program)) && !BUILTIN.includes(gShape)){
     try{ const lay=await ensureLayout(t.program, z);
       const html=lay && renderByLayout(t.instruction_data, lay, t);
       const el=$('instrval'); if(html && el && cur.kind==='tx') el.innerHTML=html;
@@ -5842,7 +6330,10 @@ es.onmessage=(e)=>{ try{ const m=JSON.parse(e.data);
   if(m.t==='snap'){ state=m.d; renderHeader();
     // views that read live snapshot fields update in place; feeds keep updating via prependTxs.
     if(cur.kind==='home'){ renderSeqs(); updateHomeStats(); }
-    else if(cur.kind==='tx' && cur.hash) renderTx(cur.seq, cur.hash); // finality may have advanced
+    // finality may have advanced: refresh the badge IN PLACE - a full renderTx here
+    // re-fetched and rebuilt the page on every snapshot (a visible reload every few
+    // seconds, scroll position lost).
+    else if(cur.kind==='tx' && cur.tx){ const fb=$('finbadge'); if(fb) fb.innerHTML=finalityBadge(cur.tx); }
   }
   else if(m.t==='txs'){ prependTxs(m.d); }
 }catch(_){} };
@@ -5856,7 +6347,7 @@ let guessTick=0;
 setInterval(()=>{ if(!Object.keys(PROGS).length) loadProgs(); if((++guessTick%6)===0) loadGuesses(); renderHeader(); }, 5000);
 </script>
 <footer id="sfoot">
-  <span><a href="https://www.gnu.org/licenses/gpl-3.0.html" target="_blank" rel="noopener noreferrer">GPL-3.0</a> · <a href="https://github.com/paradoxcomputer" target="_blank" rel="noopener noreferrer">Paradox Computer</a></span>
+  <span><span class="bld" title="the zonescan build serving this page">zonescan {{BUILD_TAG}}</span> · <a href="https://www.gnu.org/licenses/gpl-3.0.html" target="_blank" rel="noopener noreferrer">GPL-3.0</a> · <a href="https://github.com/paradoxcomputer" target="_blank" rel="noopener noreferrer">Paradox Computer</a></span>
   <a href="https://github.com/paradoxcomputer/zonescan" target="_blank" rel="noopener noreferrer" title="Source on GitHub" aria-label="GitHub"><svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
   <a href="https://www.npmjs.com/package/@paradoxcomputer/zonescan" target="_blank" rel="noopener noreferrer" class="npm" title="npm package" aria-label="npm"><svg viewBox="0 0 576 512" fill="currentColor" aria-hidden="true"><path d="M288 288h-32v-64h32v64zm288-128v192H288v32H160v-32H0V160h576zm-416 32H32v128h64v-96h32v96h32V192zm160 0H192v160h64v-32h64V192zm224 0H352v128h64v-96h32v96h32v-96h32v96h32V192z"/></svg>npm</a>
 </footer>
@@ -6007,18 +6498,28 @@ async function save(){
     socks5: seqMode ? null : ($('socks').value.trim()||null),
     discover_slots: $('disc').value? parseInt($('disc').value,10):null,
     full_history: $('full').checked,
-    sequencers: [...document.querySelectorAll('.seqrow')].map(r=>({
-      label:r.querySelector('.lbl').value.trim(),
-      channel_id:r.querySelector('.cid').value.trim(),
-      rpc_url:r.querySelector('.rpc').value.trim(),
-      full:r.querySelector('.full').checked })).filter(s=>s.channel_id||s.label||s.rpc_url),
+    sequencers: [...document.querySelectorAll('.seqrow')].map(r=>{
+      const channel_id=r.querySelector('.cid').value.trim();
+      // keep the discovery flags of an already-tracked channel across a form save
+      // (the rows don't carry them); dropping data_channel would silently un-badge it.
+      // match 0x/case/whitespace-insensitively - the server treats those as one id.
+      const cnorm=v=>String(v||'').trim().replace(/^0x/i,'').toLowerCase();
+      const prev=((LOADED&&LOADED.sequencers)||[]).find(s=>cnorm(s.channel_id)===cnorm(channel_id))||{};
+      return { label:r.querySelector('.lbl').value.trim(),
+        channel_id,
+        rpc_url:r.querySelector('.rpc').value.trim(),
+        full:r.querySelector('.full').checked,
+        discovered:!!prev.discovered,
+        data_channel:!!prev.data_channel }; }).filter(s=>s.channel_id||s.label||s.rpc_url),
     program_names: [...document.querySelectorAll('.progrow')].map(r=>({
       id:r.querySelector('.pid').value.trim(),
       name:r.querySelector('.pname').value.trim() })).filter(p=>p.id&&p.name),
     program_schemas: [...document.querySelectorAll('.schemarow')].map(r=>{
       let inst=null; try{ inst=JSON.parse(r.querySelector('.sjson').value.trim()); }catch(e){}
       return { id:r.querySelector('.sid').value.trim(), instruction:inst }; }).filter(s=>s.id&&s.instruction!=null),
-    discover_limit: LOADED.discover_limit!=null?LOADED.discover_limit:null };
+    discover_limit: LOADED.discover_limit!=null?LOADED.discover_limit:null,
+    discover_data: LOADED.discover_data!=null?LOADED.discover_data:null,
+    ipfs_gateway: LOADED.ipfs_gateway!=null?LOADED.ipfs_gateway:null };
   if(seqMode){ if(!cfg.sequencers.some(s=>s.rpc_url)){ $('msg').textContent='local-sequencer mode needs at least one sequencer with an RPC url'; return; } }
   else if(!cfg.l1_node_url){ $('msg').textContent='L1 node URL is required (or switch to “Local sequencer · no L1”)'; return; }
   $('msg').textContent='saving…';
@@ -6036,6 +6537,193 @@ load();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The footer build tag is what an operator reads to confirm which binary a box runs, so
+    // it must always render something and must never leak the raw `{{BUILD_TAG}}` template.
+    // A git-less build (tarball / vendored / npm) still gets the crate version.
+    #[test]
+    fn build_tag_always_identifies_the_build() {
+        let tag = build_tag();
+        assert!(tag.starts_with('v'), "tag should lead with the version: {tag}");
+        assert!(tag.contains(env!("CARGO_PKG_VERSION")), "tag must name the crate version: {tag}");
+        assert!(!tag.contains("{{"), "tag must not carry an unreplaced placeholder: {tag}");
+        // In this repo build.rs finds git, so the revision half must be present too. A
+        // build without the script (npm source fallback) sets nothing and shows the version.
+        let git = option_env!("ZONESCAN_GIT").unwrap_or("");
+        if !git.is_empty() {
+            assert!(tag.contains(git), "tag must name the revision: {tag}");
+            assert!(tag.contains(" · "), "version and revision should be separated: {tag}");
+        }
+    }
+
+    // The dashboard is assembled by string replacement, so a placeholder added to the HTML
+    // without a matching `.replace` ships as literal `{{...}}` to the browser. Cheap guard.
+    #[test]
+    fn dashboard_html_has_no_unreplaced_placeholders() {
+        let page = DASH_HTML
+            .replace("{{ORIGIN}}", "http://example.test")
+            .replace("{{CHANNEL_ALIASES}}", &channel_alias_js())
+            .replace("{{BUILD_TAG}}", &build_tag());
+        assert!(!page.contains("{{"), "dashboard still contains an unreplaced placeholder");
+    }
+
+    // The finality ETA is only ever shown when it can be BACKED UP by observation, so the
+    // rate measurement must return None rather than a guess whenever the samples can't
+    // support one. A wrong duration here is worse than no duration: it is exactly the
+    // fabricated-"~1h" bug this replaced.
+    #[test]
+    fn measured_slot_secs_only_trusts_a_long_enough_advancing_sample() {
+        let series = |v: &[(u64, u64)]| -> std::collections::VecDeque<(u64, u64)> {
+            v.iter().copied().collect()
+        };
+        // 300s span over 150 slots -> 2.0 s/slot.
+        let s = series(&[(1_000, 500), (1_300, 650)]);
+        assert_eq!(measured_slot_secs(&s), Some(2.0));
+        // sub-second slot times must not floor to zero (why the fn returns f64)
+        let sub = series(&[(0, 0), (120, 480)]);
+        assert_eq!(measured_slot_secs(&sub), Some(0.25));
+        // too short a span -> no estimate (two jittery polls can't set a rate)
+        let brief = series(&[(1_000, 500), (1_060, 530)]);
+        assert_eq!(measured_slot_secs(&brief), None);
+        // stalled tip over a long span -> no estimate (would divide by zero)
+        let stalled = series(&[(1_000, 500), (2_000, 500)]);
+        assert_eq!(measured_slot_secs(&stalled), None);
+        // a rewound tip (reorg / node swap) -> no estimate, no panic on the subtraction
+        let rewound = series(&[(1_000, 900), (2_000, 500)]);
+        assert_eq!(measured_slot_secs(&rewound), None);
+        // clock skew running backwards -> no estimate, no panic
+        let skewed = series(&[(2_000, 500), (1_000, 900)]);
+        assert_eq!(measured_slot_secs(&skewed), None);
+        // not enough samples at all
+        assert_eq!(measured_slot_secs(&series(&[])), None);
+        assert_eq!(measured_slot_secs(&series(&[(1_000, 500)])), None);
+    }
+
+    // The linked (v0.2.0 stock) build's image ids alias ids already live on this
+    // deployment wherever a guest is byte-identical across builds. Every alias must be
+    // (a) version-neutral (in SHARED_GUEST_IDS, so lez_version never tags from it) and
+    // (b) named by the deployment tables, not the linked build, when the names differ.
+    // If this test fails after a dep retag, a new alias appeared: extend
+    // SHARED_GUEST_IDS and re-check the naming precedence.
+    #[cfg(feature = "decode")]
+    #[test]
+    fn linked_build_id_aliases_are_version_neutral() {
+        let linked: std::collections::HashMap<String, String> =
+            crate::builtin_program_ids().into_iter().collect();
+        let mut aliased: Vec<(&str, &str, &str)> = RC5_PROGRAMS
+            .iter()
+            .filter_map(|(id, name)| linked.get(*id).map(|ln| (*id, *name, ln.as_str())))
+            .collect();
+        aliased.sort_unstable_by_key(|(_, n, _)| *n);
+        let pairs: Vec<(&str, &str)> = aliased.iter().map(|(_, n, l)| (*n, *l)).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("clock", "clock"),
+                ("genesis_supply", "vault"),
+                ("genesis_supply_bridge", "faucet"),
+            ],
+            "known shared guests between the deployment and the stock v0.2.0 build"
+        );
+        for (id, name, _) in &aliased {
+            assert!(SHARED_GUEST_IDS.contains(id), "alias {name} must be version-neutral");
+            assert_eq!(lez_version(id), None, "alias {name} must not carry a version tag");
+        }
+    }
+
+    // Discovery classification: compatible sequencers vs raw data channels vs skip.
+    #[test]
+    fn classify_channel_kinds() {
+        let seq_block = Decoded { hash: "aa".into(), hash_ok: true, ..Default::default() };
+        let skewed = Decoded { hash: "aa".into(), hash_ok: false, ..Default::default() };
+        // a raw payload mis-parses: implausible block_id => undecodable, empty hash
+        let raw = Decoded { undecodable: true, ..Default::default() };
+        // a real block in the light build: no hash to check, but NOT undecodable
+        let light_block = Decoded::default();
+
+        assert_eq!(classify_channel(&[seq_block.clone()]), ChannelKind::Sequencer);
+        assert_eq!(classify_channel(&[raw.clone()]), ChannelKind::Data);
+        // a mixed channel (stray raw payloads alongside verified blocks) is a sequencer;
+        // its raw inscriptions still ingest as raw rows once tracked
+        assert_eq!(classify_channel(&[raw.clone(), seq_block.clone()]), ChannelKind::Sequencer);
+        // one hash mismatch poisons the channel: different-version sequencer, skip
+        assert_eq!(classify_channel(&[seq_block, skewed]), ChannelKind::Skip);
+        // a light build can't verify sequencers - and must not call their blocks "data"
+        assert_eq!(classify_channel(&[light_block.clone()]), ChannelKind::Skip);
+        // mixed raw + unverifiable block: not all-raw, skip
+        assert_eq!(classify_channel(&[raw, light_block]), ChannelKind::Skip);
+        assert_eq!(classify_channel(&[]), ChannelKind::Skip);
+    }
+
+    // A zone that UPGRADES its build must re-tag: version tracks the latest
+    // build-distinctive signal, and shared/neutral programs never clobber it. Regression
+    // for the live case where 0101 moved fork-rc5 -> stock v0.2.0 but showed a stale rc5.
+    #[cfg(feature = "decode")]
+    #[test]
+    fn version_retags_on_build_upgrade() {
+        let tx = |prog: &str| TxInfo { program: Some(prog.to_string()), ..Default::default() };
+        // stock v0.2.0 natives resolve to their names (via the linked build) -> "v0.2"
+        assert_eq!(version_from_txs(&[tx("authenticated_transfer")]), Some("v0.2"));
+        assert_eq!(version_from_txs(&[tx("pinata")]), Some("v0.2"));
+        // a fork native only ever appears as its raw hex id -> resolves via RC5 table
+        let fork_auth = "d9a19237236822b1f8100576ebd19a19f74178f99e284c983a4ac44acbd5b472";
+        assert_eq!(version_from_txs(&[tx(fork_auth)]), Some("rc5"));
+        // shared guests (clock) and unknown programs are version-neutral
+        assert_eq!(version_from_txs(&[tx("clock")]), None);
+        assert_eq!(version_from_txs(&[tx("deadbeef")]), None);
+        // simulate the sticky-field replacement: an existing rc5 tag advances to v0.2
+        let mut version: Option<String> = Some("rc5".into());
+        if let Some(v) = version_from_txs(&[tx("clock"), tx("authenticated_transfer")]) {
+            if version.as_deref() != Some(v) {
+                version = Some(v.to_string());
+            }
+        }
+        assert_eq!(version.as_deref(), Some("v0.2"), "upgrade must overwrite the stale tag");
+    }
+
+    // A hand-configured channel whose observed content is raw-only must classify as a
+    // data channel; one valid block anywhere keeps it a sequencer.
+    #[test]
+    fn raw_only_channel_is_effective_data() {
+        let raw_only = SeqTrack { saw_undecodable: true, ..Default::default() };
+        assert!(track_is_data(&raw_only));
+        let mixed = SeqTrack { saw_undecodable: true, saw_block: true, ..Default::default() };
+        assert!(!track_is_data(&mixed), "a sequencer with stray raw noise stays a sequencer");
+        assert!(!track_is_data(&SeqTrack::default()), "nothing observed yet");
+    }
+
+    // The keeper `cid_pin` shape (label is a JSON-encoded string) must yield a row
+    // summary; non-JSON and other types must not.
+    #[test]
+    fn raw_summary_extracts_cid_pin_title() {
+        let label = r#"{"files":[{"cid":"zDvZRwzm3xyz","name":"a.pdf"}],"id":"x","module":"keeper","source":"internet_archive","title":" Cypherpunk Manifesto","totalSize":5012896}"#;
+        let payload = serde_json::json!({
+            "v": 1, "type": "cid_pin", "cid": "ia:x", "label": label,
+            "source": "keeper", "ts": 1783231175u64,
+        });
+        let (ty, title) = raw_summary(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(ty, "cid_pin");
+        assert_eq!(title, "Cypherpunk Manifesto", "title is trimmed");
+        assert!(raw_summary(b"dweb-via-paradox #1 17820").is_none(), "plain text");
+        assert!(raw_summary(br#"{"type":"other"}"#).is_none(), "unknown type");
+        // no label title -> fall back to the pin id
+        let p2 = serde_json::json!({"type": "cid_pin", "cid": "ia:y", "label": "{}"});
+        assert_eq!(raw_summary(&serde_json::to_vec(&p2).unwrap()).unwrap().1, "ia:y");
+    }
+
+    // A persisted config written before `data_channel` existed must load cleanly
+    // (missing => false), and the flag must round-trip when set.
+    #[test]
+    fn seqcfg_data_channel_serde_compat() {
+        let old = r#"{"label":"x","channel_id":"ab","rpc_url":"","full":true,"discovered":true}"#;
+        let cfg: SeqCfg = serde_json::from_str(old).unwrap();
+        assert!(!cfg.data_channel);
+        let mut cfg = cfg;
+        cfg.data_channel = true;
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: SeqCfg = serde_json::from_str(&json).unwrap();
+        assert!(back.data_channel && back.discovered);
+    }
 
     // End-to-end for the guest `f8aab825…`: its 3 raw TEXT inscriptions must each become a
     // "raw" tx row keyed by the mantle_tx.hash (NOT a garbage block_id), be listed on the
@@ -6090,7 +6778,7 @@ mod tests {
 
         // tx-detail: each hash resolves and its content decodes to the guest's text.
         for (id, _slot, text) in items {
-            let got = db.get_tx(id).unwrap().expect("raw tx retrievable by hash");
+            let got = db.get_tx_on(id, None).unwrap().expect("raw tx retrievable by hash");
             let (rendered, hex) = raw_payload_repr(&got.raw_payload);
             assert_eq!(rendered.as_deref(), Some(text), "content shown as UTF-8 text");
             assert_eq!(hex, hex::encode(text.as_bytes()), "hex dump available too");
@@ -6109,8 +6797,9 @@ mod tests {
         let vault = "a8d1ec6d803dfc54a55d3cf576388a7d461b02a38bd4cd87ebf30837a2f1df07";
         // clock recognized => skip_clock drops the ~91% clock rows
         assert!(is_clock_program(clock), "live rc5 clock must be recognized for skip_clock");
-        // all three resolve to rc5 => the "Sequencer version" tag shows rc5
-        assert_eq!(lez_version(clock), Some("rc5"));
+        // the clock guest is SHARED with stock v0.2.0 (same image id), so it is
+        // version-neutral; the build-distinctive natives carry the rc5 tag instead
+        assert_eq!(lez_version(clock), None);
         assert_eq!(lez_version(auth), Some("rc5"));
         assert_eq!(lez_version(vault), Some("rc5"));
         // and resolve to human names (program_name_map merges RC5_PROGRAMS)
