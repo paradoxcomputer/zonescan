@@ -33,7 +33,8 @@ use tokio::sync::broadcast;
 
 use crate::{
     build_client, channel_alias, channel_tip, collect_inscriptions, decode_inscription,
-    decode_inscription_with, find_u64, get_json, info_l1_version, info_mode, info_u64, jget_u64,
+    decode_block_bytes, decode_inscription_with, find_u64, get_json, info_l1_version, info_mode,
+    info_u64, jget_u64,
     jhex, resolve_channel, scan_channels, short, Decoded, EndpointResult, ScanRec, TxInfo, TxMix,
     MAX_PLAUSIBLE_BLOCK_ID,
 };
@@ -806,7 +807,22 @@ struct TxRecord {
 }
 
 /// Build feed records from a decoded inscription + its context.
+/// Ingest mapping: clock ticks are dropped per the server's `SKIP_CLOCK` config.
 fn records_from(channel: &str, slot: Option<u64>, d: &Decoded, seen_unix: u64) -> Vec<TxRecord> {
+    records_from_opts(channel, slot, d, seen_unix, SKIP_CLOCK.load(Ordering::Relaxed))
+}
+
+/// As `records_from`, with an explicit clock policy. `/api/decode` passes `false`: a local dev
+/// sequencer is almost entirely clock ticks, so filtering them server-side would render an
+/// otherwise-healthy local zone as empty. The dashboard already has a clock filter chip, so
+/// the choice belongs to the client there.
+fn records_from_opts(
+    channel: &str,
+    slot: Option<u64>,
+    d: &Decoded,
+    seen_unix: u64,
+    skip_clock: bool,
+) -> Vec<TxRecord> {
     // A raw (non-block) inscription doesn't decode to an rc5 sequencer block. Rather than drop
     // it, surface it as ONE "raw" tx keyed by its `mantle_tx.hash` (its on-L1 inscription id),
     // carrying the raw payload bytes so the tx-detail can show the actual content. It has no
@@ -833,7 +849,6 @@ fn records_from(channel: &str, slot: Option<u64>, d: &Decoded, seen_unix: u64) -
             ..Default::default()
         }];
     }
-    let skip_clock = SKIP_CLOCK.load(Ordering::Relaxed);
     d.txs
         .iter()
         // clock ticks every block (~99% of txs); drop them from storage when configured
@@ -1044,6 +1059,8 @@ struct AppState {
     token_defs: Arc<Mutex<HashMap<String, String>>>,
     /// cache of resolved token info, keyed by account id (holding or definition).
     token_cache: Arc<Mutex<HashMap<String, Value>>>,
+    /// Fixed-window per-IP counters for `/api/decode`: (minute, ip -> hits).
+    decode_hits: Arc<std::sync::Mutex<(u64, HashMap<String, usize>)>>,
     /// Token gating configuration changes (see `resolve_admin_token`); empty = open.
     admin_token: Arc<String>,
 }
@@ -1388,6 +1405,7 @@ pub async fn cmd_serve(
         token_defs: Arc::new(Mutex::new(HashMap::new())),
         token_cache: Arc::new(Mutex::new(HashMap::new())),
         admin_token: Arc::new(admin_token),
+        decode_hits: Arc::new(std::sync::Mutex::new((0, HashMap::new()))),
     };
 
     if config.is_configured() {
@@ -1527,6 +1545,12 @@ pub async fn cmd_serve(
         .route("/api/state", get(api_state))
         .route("/api/txs", get(api_txs))
         .route("/api/tx/:hash", get(api_tx))
+        // body limit pinned to DECODE_MAX_B64 so an oversized post is refused with a status,
+        // not a dropped connection (axum's 2 MB default would otherwise win silently).
+        .route(
+            "/api/decode",
+            post(api_decode).layer(axum::extract::DefaultBodyLimit::max(DECODE_MAX_B64)),
+        )
         .route("/api/account/:id", get(api_account))
         .route("/api/program/:id", get(api_program))
         .route("/api/programs", get(api_programs))
@@ -4164,6 +4188,149 @@ async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<
     Json(out.iter().map(|r| enrich_tx(&app, r)).collect())
 }
 
+/// Max blocks accepted in one `/api/decode` call. This is NOT the real cost bound - decode
+/// cost tracks bytes, which `DECODE_MAX_B64` already caps - it just bounds per-block overhead
+/// and response size. Measured: a mostly-clock block is ~0.4 KB of base64, so 64 blocks used
+/// barely 3% of the byte budget and forced a client walking any real history into hundreds of
+/// requests against the rate limit. 512 keeps one request's work modest (~0.13s measured)
+/// while letting the byte cap do the actual limiting.
+const DECODE_MAX_BLOCKS: usize = 512;
+/// Max total base64 accepted in one `/api/decode` call. Independent of the block cap: a few
+/// enormous blobs cost as much as many small ones. Kept in lockstep with the route's
+/// `DefaultBodyLimit` below — axum enforces its own limit first, and if that were the smaller
+/// of the two the caller would get a severed connection instead of a clean 413.
+/// Generous for real traffic: blocks run ~700 B to a few KB, so 64 of them is far under this.
+const DECODE_MAX_B64: usize = 2 * 1024 * 1024;
+/// Per-IP decode calls allowed per minute. `/api/decode` is unauthenticated CPU on a public
+/// host, so it needs a ceiling that does not depend on clients behaving.
+const DECODE_RATE_PER_MIN: usize = 60;
+
+#[derive(serde::Deserialize)]
+struct DecodeReq {
+    /// Base64 block payloads, exactly as a sequencer's `getBlock` returns them.
+    blocks: Vec<String>,
+    /// Channel id the blocks belong to, for labelling only — never used to look anything up.
+    #[serde(default)]
+    channel: Option<String>,
+}
+
+/// Decode sequencer blocks supplied BY THE CALLER, for the "local zone" view.
+///
+/// The dashboard reads a visitor's own sequencer over `ws://127.0.0.1:<port>` (WebSockets are
+/// exempt from CORS, which plain HTTP JSON-RPC to loopback is not) and posts the resulting
+/// base64 blocks here, because the block format is Borsh binary and the decoder is this
+/// server's Rust — reimplementing it in the browser would mean maintaining a second,
+/// version-skewing decoder.
+///
+/// Deliberately PURE: it decodes and returns. It never writes to the store, never touches
+/// tracked-zone state, and never consults the caller's `channel` for anything but a label.
+/// That is what keeps an open compute endpoint from becoming a way to inject rows into the
+/// shared index.
+async fn api_decode(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<DecodeReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !decode_rate_ok(&app, &headers) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    if req.blocks.len() > DECODE_MAX_BLOCKS {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("too many blocks (max {DECODE_MAX_BLOCKS})"),
+        ));
+    }
+    let total: usize = req.blocks.iter().map(String::len).sum();
+    if total > DECODE_MAX_B64 {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "payload too large".into()));
+    }
+    // Label only. Normalized so it renders like any other channel id; never trusted.
+    let channel = req
+        .channel
+        .as_deref()
+        .map(|c| c.trim().trim_start_matches("0x").to_ascii_lowercase())
+        .filter(|c| c.len() == 64 && c.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_default();
+
+    let mut out = Vec::with_capacity(req.blocks.len());
+    for b64 in &req.blocks {
+        let Some(bytes) = b64_decode(b64) else {
+            out.push(json!({"ok": false, "error": "not base64"}));
+            continue;
+        };
+        let Some(d) = decode_block_bytes(&bytes) else {
+            out.push(json!({"ok": false, "error": "not a decodable block"}));
+            continue;
+        };
+        if d.undecodable {
+            out.push(json!({"ok": false, "error": "not a LEZ block (or an unknown build)"}));
+            continue;
+        }
+        // clock ticks kept: a local dev chain is mostly clock, and the UI can filter.
+        let recs = records_from_opts(&channel, None, &d, 0, false);
+        // detail shape (a superset of the list shape): the local tx page renders straight
+        // from these rows, since the server has no record of this chain to look up later.
+        let txs: Vec<Value> = recs.iter().map(|r| enrich_tx_detail(&app, r)).collect();
+        out.push(json!({
+            "ok": true,
+            "block_id": d.block_id,
+            "timestamp": d.timestamp,
+            "tx_count": d.tx_count,
+            "hash": d.hash,
+            "prev_hash": d.prev_hash,
+            "hash_ok": d.hash_ok,
+            "txs": txs,
+        }));
+    }
+    Ok(Json(json!({"blocks": out})))
+}
+
+/// Fixed-alphabet base64 decoder (no new dependency for one endpoint). Ignores ASCII
+/// whitespace, rejects any other stray character rather than silently producing garbage.
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut idx = [255u8; 256];
+    for (i, c) in T.iter().enumerate() {
+        idx[*c as usize] = i as u8;
+    }
+    let (mut acc, mut bits, mut out) = (0u32, 0u32, Vec::with_capacity(s.len() * 3 / 4));
+    for &c in s.as_bytes() {
+        if c.is_ascii_whitespace() || c == b'=' {
+            continue;
+        }
+        let v = idx[c as usize];
+        if v == 255 {
+            return None;
+        }
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Fixed-window per-IP limiter for `/api/decode`. Coarse on purpose: it exists to stop one
+/// client monopolising CPU, not to be a general-purpose quota system.
+fn decode_rate_ok(app: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "local".to_string());
+    let minute = now_unix() / 60;
+    let mut g = app.decode_hits.lock().unwrap();
+    if g.0 != minute {
+        *g = (minute, HashMap::new());
+    }
+    let n = g.1.entry(ip).or_insert(0);
+    *n += 1;
+    *n <= DECODE_RATE_PER_MIN
+}
+
 /// `?channel=` disambiguates a hash that exists on more than one zone (identical genesis txs
 /// hash the same on every zone that shares a genesis config). The dashboard passes the zone
 /// from the `/zone/<z>/tx/<hash>` URL; without it, whichever zone carries the hash wins, so
@@ -5109,6 +5276,51 @@ const DASH_HTML: &str = r#"<!doctype html>
   .fbadge.fin{background:rgba(19,169,123,.14);color:var(--green)}
   .fbadge.safe{background:rgba(37,99,235,.12);color:#1d4ed8}
   .fbadge.pend{background:#eef0f3;color:#6b7280}
+  /* local-zone panel (the `local` tab) */
+  .lz{padding:12px}
+  .lzrow{display:flex;gap:8px;align-items:center}
+  .lzin{flex:1;min-width:0;font-family:var(--mono);font-size:12px;padding:7px 9px;
+    border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+  .lzin:disabled{opacity:.6}
+  .lzbtn{padding:7px 14px;border:1px solid var(--line);border-radius:6px;background:var(--panel);
+    color:var(--fg);font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
+  .lzbtn:hover:not(:disabled){border-color:var(--muted)}
+  /* the call to action is the point of this panel, so it reads as a primary button */
+  .lzbtn.primary{background:var(--fg);color:var(--panel);border-color:var(--fg)}
+  .lzbtn.primary:hover:not(:disabled){opacity:.88}
+  /* disconnect drops the zone from view: destructive, so it reads as such */
+  .lzbtn.danger{background:#fef3f2;color:#b42318;border-color:#fecdca}
+  .lzbtn.danger:hover:not(:disabled){background:#fee4e2;border-color:#fda29b}
+  /* Zones header stacks: title + All/rc/data on one row, the local entry point beneath it */
+  .phead.stack{flex-direction:column;align-items:stretch;gap:9px}
+  .phead .pheadrow{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .zlbtn{width:100%;padding:7px 12px;border:1px dashed var(--line2);border-radius:7px;
+    background:transparent;color:var(--muted);font-size:11.5px;font-weight:600;cursor:pointer;
+    font-family:inherit;letter-spacing:.01em;transition:border-color .12s,color .12s}
+  .zlbtn:hover{border-color:var(--navy);color:var(--navy)}
+  .zlbtn.on{background:var(--navy);border-color:var(--navy);border-style:solid;color:#fff}
+  /* connected but not the active tab: a dot signals it is live without shouting */
+  .zlbtn.live:not(.on){border-style:solid;border-color:var(--green,#12805c);color:var(--green,#12805c)}
+
+  /* local-zone panel internals */
+  .lzlbl{font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;
+    color:var(--soft);margin-bottom:6px}
+  .lznote{margin-top:12px;padding:10px 12px;background:var(--bg);border:1px solid var(--line);
+    border-radius:7px;display:flex;flex-direction:column;gap:7px}
+  .lznrow{display:flex;gap:9px;align-items:flex-start;font-size:11.5px;line-height:1.5;color:var(--muted)}
+  .lznrow b{color:var(--fg);font-weight:600}
+  .lzni{flex:0 0 16px;text-align:center;font-family:var(--mono);color:var(--soft)}
+  .lzbusy{margin-top:12px;font-size:12px;color:var(--muted)}
+  /* Latest Transactions source tabs (network | local sequencer) */
+  .ftabs{display:inline-flex;gap:4px;padding:8px 12px 0}
+  .ftabs button{padding:5px 12px;border:1px solid var(--line);border-radius:6px;background:var(--panel);
+    color:var(--muted);font-size:12px;font-weight:600;cursor:pointer}
+  .ftabs button.on{background:var(--fg);color:var(--panel);border-color:var(--fg)}
+  .ftabs button:hover:not(.on){color:var(--fg)}
+  .lzbtn:disabled{opacity:.6;cursor:default}
+  .lzok{margin-top:10px;font-size:12px;color:var(--muted)}
+  .lzerr{margin-top:10px;font-size:12px;color:#b42318;background:#fef3f2;border:1px solid #fecdca;
+    border-radius:6px;padding:8px 10px}
   /* zones-list kind filter: All | rc | data */
   .zseg{display:inline-flex;gap:4px}
   .zseg button{font-size:11px;font-weight:600;padding:2px 10px;border-radius:6px;border:1px solid var(--line2);
@@ -5303,8 +5515,8 @@ function guessFor(p,row){ if(p&&PROGS[p]) return null; return (row&&row.program_
 // tooltip for a guess. `generic` = the value-transfer SHAPE fallback (describes the operation,
 // not a program identity); specific guesses carry the fingerprint confidence.
 function guessTip(g){ const n=g.samples?` · ${g.samples} tx${g.samples===1?'':'s'}`:'';
-  if(g.generic) return `value-transfer shape; exact program unresolved — best-guess, unverified`+n;
-  return `best-guess from tx fingerprint — unverified · ${Math.round((g.confidence||0)*100)}% confidence`+n; }
+  if(g.generic) return `value-transfer shape; exact program unresolved - best-guess, unverified`+n;
+  return `best-guess from tx fingerprint - unverified · ${Math.round((g.confidence||0)*100)}% confidence`+n; }
 // render a best-guess as `≈ name` - italic/muted, tooltip, NEVER styled like a verified name.
 function guessHtml(g){
   const lo=(g.confidence||0)<0.6?' lo':'';
@@ -5367,7 +5579,7 @@ function instrText(t,tok){
     const g=guessFor(t.program,t);
     if(g && !g.generic && ['token','authenticated_transfer','ata','amm','pinata','pinata_token'].includes(g.name)){
       name=g.name;
-      gmark=`<span class="htag" title="decoded by this program's fingerprinted ${esc(g.name)} shape — best-guess, unverified">≈ ${esc(g.name)}</span>`;
+      gmark=`<span class="htag" title="decoded by this program's fingerprinted ${esc(g.name)} shape - best-guess, unverified">≈ ${esc(g.name)}</span>`;
     }
   }
   const out=instrTextByName(t,tok,name,w);
@@ -5550,7 +5762,7 @@ function dataBadge(s){ return s&&s.data_channel?`<span class="vbadge v-data" tit
 function zoneTitle(s){ return aliasOf(s.channel) || s.channel_short || sh(s.channel); }
 // sequencer (LEZ/zone) version as a labeled value: the rc-family badge (rc3/rc4/rc5),
 // or an em-dash when the zone has no decoded version yet (e.g. a light/no-decode build).
-function verValue(s){ return s.version?`<span class="vbadge v-${esc(s.version)}" title="LEZ build">${esc(s.version)}</span>`:'<span class="mut">—</span>'; }
+function verValue(s){ return s.version?`<span class="vbadge v-${esc(s.version)}" title="LEZ build">${esc(s.version)}</span>`:'<span class="mut">-</span>'; }
 function consBadge(s){
   const c=s.consistency||{};
   const skew=c.checked>0 && c.hash_failures===c.checked; // uniform hash fail = version skew
@@ -5624,7 +5836,7 @@ function finalityBadge(t){
   if(t.block_id<=fin)
     return `<span class="fbadge fin" title="final - irreversibly settled on the L1 (finalized up to block #${num(fin)})">final</span>`;
   if(t.block_id<=safe)
-    return `<span class="fbadge safe" title="inscribed on the L1 and finalizing (irreversible once past the L1's last-final slot — ${finalityEta()}); finalized up to #${num(fin)}">on L1 · finalizing</span>`;
+    return `<span class="fbadge safe" title="inscribed on the L1 and finalizing (irreversible once past the L1's last-final slot - ${finalityEta()}); finalized up to #${num(fin)}">on L1 · finalizing</span>`;
   return `<span class="fbadge pend" title="pending - not yet observed inscribed on the L1 (on L1 up to #${num(safe)})">pending</span>`;
 }
 // A human one-line ACTION for a tx: "<verb> <amount> <token> from <a> to <b>", derived from
@@ -5669,12 +5881,12 @@ function txAction(t){
   if(isRawId(t.program)){
     // NewFungibleDefinition content: [1, r0-string name, u128 supply] => "New token ≈ NAME".
     const def=r0def(w);
-    if(def) return `New token <span class="pguess" title="name read from the on-chain NewFungibleDefinition instruction — program unverified">≈ ${esc(def.name)}</span> · supply ${grp(def.supply)}`;
+    if(def) return `New token <span class="pguess" title="name read from the on-chain NewFungibleDefinition instruction - program unverified">≈ ${esc(def.name)}</span> · supply ${grp(def.supply)}`;
     // value-transfer shape (server decoded t.amount per-tx): show the amount, and the token
     // symbol when attribution exists - resolved (t.token, learned from the chain's own
     // definitions) beats the fingerprint guess, which beats "(token unresolved)".
     if(amt!=null){
-      const tg=tok?` ${esc(tok)}`:(t.token_guess?` <span class="pguess" title="token symbol from this program's NewFungibleDefinition — best-guess, unverified">≈ ${esc(t.token_guess)}</span>`:' <span class="mut">(token unresolved)</span>');
+      const tg=tok?` ${esc(tok)}`:(t.token_guess?` <span class="pguess" title="token symbol from this program's NewFungibleDefinition - best-guess, unverified">≈ ${esc(t.token_guess)}</span>`:' <span class="mut">(token unresolved)</span>');
       return `Transfer ${amtS}${tg}${ft}`;
     }
   }
@@ -5697,7 +5909,7 @@ function txRows(list){
   return list.map(t=>{
     const z=t.channel;
     // a raw inscription has no L2 block; locate it by its L1 slot instead of a block height.
-    const blockCell=t.kind==='raw'?`<span class="mut nowrap" title="L1 slot">L1 ${t.slot?num(t.slot):'—'}</span>`:`#${num(t.block_id)}`;
+    const blockCell=t.kind==='raw'?`<span class="mut nowrap" title="L1 slot">L1 ${t.slot?num(t.slot):'-'}</span>`:`#${num(t.block_id)}`;
     return `<tr>
       <td><a class="lnk" href="/zone/${u(z)}/tx/${u(t.hash)}">${esc(sh(t.hash))}</a></td>
       <td>${visBadge(t)}</td>
@@ -5844,19 +6056,54 @@ function renderHome(){
     <div class="card"><div class="k">Zones</div><div class="v" id="stat_zones">${num(seqs.length)}</div><div class="s">${alive} active</div></div>
   </div>
   <div class="grid">
-    <div class="panel"><div class="phead"><span>Zones</span>${zoneSeg()}</div><div id="seqs"></div></div>
+    <div class="panel"><div class="phead stack">
+        <div class="pheadrow"><span>Zones</span>${zoneSeg()}</div>
+        ${zoneLocalBtn()}
+      </div><div id="seqs"></div></div>
     <div class="panel">
       <div class="phead"><span>Latest Transactions</span>
         <span style="display:flex;align-items:center;gap:10px">
         ${state&&state.skip_clock?'<span class="mut" style="font-size:12px;white-space:nowrap" title="clock txs tick every block and are not stored">clock ticks not indexed</span>':''}
         <span class="count" id="count"></span></span></div>
+      <div id="feedtabs">${feedTabs()}</div>
       ${filterBar()}
       <div class="tscroll"><table class="ttbl">${txHead}<tbody id="rows"><tr><td colspan="7" class="empty">loading…</td></tr></tbody></table></div>
     </div>
   </div>`;
-  wireFilter(()=>txFeed(homeFeedUrl));
-  renderSeqs(); txFeed(homeFeedUrl);
+  wireFilter(()=>{ if(feedTab==='local') showLocalFeed(); else txFeed(homeFeedUrl); });
+  renderSeqs();
+  // A restored local chain keeps its tab selected across navigation, so the user lands back
+  // where they were instead of on the network feed.
+  if(feedTab==='local'&&LOCAL.status==='ok') showLocalFeed(); else txFeed(homeFeedUrl);
 }
+
+// The Latest Transactions source switch. The local tab only exists once a local zone is
+// connected — an empty tab would be a dead end.
+function feedTabs(){
+  if(LOCAL.status!=='ok') return '';
+  const t=[['network','Network','transactions from the zones this server tracks'],
+           ['local','Local sequencer','transactions read from your own sequencer, in this browser']];
+  return `<span class="ftabs">${t.map(([k,l,ti])=>`<button type="button" class="${feedTab===k?'on':''}" data-ft="${k}" onclick="setFeedTab('${k}')" title="${ti}">${l}</button>`).join('')}</span>`;
+}
+function renderFeedTabs(){ const el=$('feedtabs'); if(el) el.innerHTML=feedTabs(); }
+function setFeedTab(k){
+  feedTab=k; renderFeedTabs();
+  if(k==='local') showLocalFeed(); else txFeed(homeFeedUrl);
+}
+// Render the local chain into the SAME table as the network feed. The rows are already
+// tagged with the pseudo-zone, so txRows gives them working links for free.
+function showLocalFeed(){
+  cur.feed=null; window.onscroll=null;         // no infinite scroll: the window is finite
+  const tb=$('rows'); if(!tb) return;
+  const list=filterLocal(LOCAL.txs);
+  tb.innerHTML = list.length ? txRows(list)
+    : `<tr><td colspan="7" class="empty">no transactions match in the ${num(LOCAL.blocks)} block(s) read</td></tr>`;
+  const cnt=$('count'); if(cnt) cnt.textContent='';
+}
+// Reuse the panel's own predicate so the Visibility/Type/Sort controls keep meaning exactly
+// what they say when the local tab is selected — the same filter the network feed sends to
+// the server, applied here in the browser because there is no server round trip.
+function filterLocal(list){ return localSorted(localVisible(list, false)); }
 function homeFeedUrl(cursor){
   const p=new URLSearchParams(); p.set('limit',PAGE);
   const solo=soloChannel(); if(solo) p.set('channel',solo); // one zone => same query as /zone/:id
@@ -5869,13 +6116,314 @@ function zoneSeg(){
   const opts=[['all','All','all tracked channels'],['rc','rc','LEZ sequencer zones only'],['data','data','raw data channels only (inscriptions are not LEZ sequencer blocks)']];
   return `<span class="zseg">${opts.map(([k,l,t])=>`<button type="button" class="${zoneFilter===k?'on':''}" data-zf="${k}" onclick="setZoneFilter('${k}')" title="${t}">${l}</button>`).join('')}</span>`;
 }
+// The local zone is a different KIND of thing from the All/rc/data filters — those narrow the
+// tracked list, this adds a zone only you can see — so it gets its own button under them
+// rather than a fourth segment that would imply it filters the same list.
+// Sits under the All/rc/data row inside the same header. It is the ENTRY POINT to the local
+// view; the action button lives in the panel below, so the two never say the same thing.
+function zoneLocalBtn(){
+  const on=zoneFilter==='local';
+  const label = LOCAL.status==='ok' ? 'Local sequencer · connected' : 'Add your local sequencer';
+  return `<button type="button" class="zlbtn${on?' on':''}${LOCAL.status==='ok'?' live':''}" data-zf="local"
+    onclick="setZoneFilter('local')"
+    title="read a sequencer running on your own machine, straight from this browser">${label}</button>`;
+}
+
+// ---- local zone ----------------------------------------------------------------
+// Reads a sequencer running on the VIEWER's machine and renders it here. Two constraints
+// shape this and are worth stating, because neither is obvious:
+//
+//  1. It speaks WebSocket, not HTTP. A cross-origin HTTP POST to loopback is blocked — the
+//     sequencer sends no CORS headers and answers OPTIONS with 405, so the preflight fails.
+//     WebSockets are exempt from the same-origin policy, and jsonrpsee serves JSON-RPC over
+//     WS on the same port, so this path needs no change to the sequencer at all.
+//  2. Blocks come back as base64 Borsh, so they are decoded by POSTing them to /api/decode
+//     (this server, same origin). Re-implementing the LEZ block decoder in JS would mean
+//     maintaining a second decoder that has to track every rc3/rc4/rc5/v0.2 wire change.
+//
+// Nothing about the local chain is stored server-side: /api/decode is pure, and this state
+// lives only in the tab.
+// Reserved pseudo-zone id for the viewer's own sequencer. Real channels are 64-hex, so this
+// can never collide with one. Rows link under it and the router renders those pages from
+// LOCAL.txs in memory — the server has never seen this chain and would 404 on any lookup.
+const LOCAL_ZONE='localhost';
+const LOCAL_DEFAULT_URL='ws://127.0.0.1:3070';
+// How far back from the tip to read. A sequencer mints a block on a timer whether or not
+// anyone transacted, so a shallow window on an idle chain shows nothing but clock ticks and
+// a transaction sent minutes ago appears to have vanished. 200 blocks is ~16 min at a 5s
+// block time. Read in chunks because /api/decode caps a single request at 64 blocks.
+const LOCAL_WALK=200;
+const LOCAL_CHUNK=50;
+let LOCAL={status:'idle', url:'', channel:'', tip:0, txs:[], blocks:0, error:''};
+// Which feed the Latest Transactions panel shows: the tracked network, or the local zone.
+let feedTab='network';
+// Every in-page link is a real navigation (full page load), so in-memory state would be gone
+// by the time the target page renders — and the user would be asked to reconnect on every
+// click. Persist the decoded chain for the tab's lifetime instead.
+function localSave(){
+  try{
+    if(LOCAL.status==='ok') sessionStorage.setItem('zs_local', JSON.stringify(
+      {url:LOCAL.url, channel:LOCAL.channel, tip:LOCAL.tip, blocks:LOCAL.blocks, txs:LOCAL.txs,
+       scanned:LOCAL.scanned, reachedGenesis:LOCAL.reachedGenesis}));
+    else sessionStorage.removeItem('zs_local');
+  }catch(e){}   // quota or a privacy mode that blocks storage: degrade to in-memory only
+}
+function localRestore(){
+  try{
+    const raw=sessionStorage.getItem('zs_local'); if(!raw) return;
+    const d=JSON.parse(raw);
+    if(d&&Array.isArray(d.txs)&&d.txs.length){
+      LOCAL={status:'ok', url:d.url||LOCAL_DEFAULT_URL, channel:d.channel||'', tip:d.tip||0,
+             txs:d.txs, blocks:d.blocks||0, error:'', scanned:d.scanned||0,
+             reachedGenesis:!!d.reachedGenesis};
+    }
+  }catch(e){}
+}
+try{ LOCAL.url=localStorage.getItem('zs_local_url')||LOCAL_DEFAULT_URL; }catch(e){ LOCAL.url=LOCAL_DEFAULT_URL; }
+localRestore();
+
+// One JSON-RPC round trip over an open socket, keyed by id so replies can't be mismatched.
+function localRpc(ws, id, method, params){
+  return new Promise((resolve,reject)=>{
+    const to=setTimeout(()=>{ ws.removeEventListener('message',on); reject(new Error('timeout on '+method)); }, 10000);
+    function on(ev){
+      let m; try{ m=JSON.parse(ev.data); }catch(e){ return; }
+      if(m.id!==id) return;                       // not ours; another in-flight call
+      clearTimeout(to); ws.removeEventListener('message',on);
+      if(m.error) reject(new Error(method+': '+(m.error.message||JSON.stringify(m.error))));
+      else resolve(m.result);
+    }
+    ws.addEventListener('message',on);
+    ws.send(JSON.stringify({jsonrpc:'2.0', id, method, params:params||[]}));
+  });
+}
+
+async function localConnect(){
+  const input=$('localurl');
+  const url=(input&&input.value.trim())||LOCAL_DEFAULT_URL;
+  LOCAL={status:'connecting', url, channel:'', tip:0, txs:[], blocks:0, error:'', scanned:0, reachedGenesis:false};
+  try{ localStorage.setItem('zs_local_url', url); }catch(e){}
+  renderSeqs();
+  let ws;
+  try{ ws=new WebSocket(url); }
+  catch(err){ LOCAL.status='error'; LOCAL.error='could not open '+url+' ('+err.message+')'; return renderSeqs(); }
+  const opened=new Promise((res,rej)=>{
+    ws.onopen=res;
+    // A blocked or refused socket surfaces only as a generic error event — the browser
+    // deliberately withholds the reason from script, so we cannot be more specific here.
+    ws.onerror=()=>rej(new Error('connection failed (is the sequencer running, and is that the right port?)'));
+    setTimeout(()=>rej(new Error('connection timed out')), 8000);
+  });
+  try{
+    await opened;
+    LOCAL.status='reading'; renderSeqs();
+    const [channel, tip] = await Promise.all([
+      localRpc(ws,1,'getChannelId'), localRpc(ws,2,'getLastBlockId')
+    ]);
+    LOCAL.channel=String(channel||''); LOCAL.tip=Number(tip)||0;
+
+    // Walk backwards a batch at a time, newest first, stopping as soon as enough real
+    // transactions are in hand. On a busy chain that is the first batch; on an idle one it
+    // keeps going until it finds them instead of reporting an empty zone.
+    const ok=[]; let real=0, scanned=0, low=LOCAL.tip+1, batchIdx=0, rpcId=100;
+    while(low>1 && real<LOCAL_TARGET_TXS && scanned<LOCAL_MAX_BLOCKS){
+      const hi=low-1, lo=Math.max(1, hi-LOCAL_BATCH+1);
+      let batch;
+      try{ batch=await localRpc(ws, rpcId++, 'getBlockRange', [lo, hi]); }
+      catch(err){ if(!ok.length) throw err; break; }      // partial history beats none
+      if(!Array.isArray(batch)||!batch.length) break;
+      const blocks=batch.filter(b=>typeof b==='string');
+      if(!blocks.length) break;
+      scanned+=blocks.length; low=lo; LOCAL.scanned=scanned; renderSeqs();
+      const r=await fetch('/api/decode',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({blocks, channel:LOCAL.channel})});
+      if(!r.ok){
+        if(ok.length) break;                             // keep whatever already decoded
+        LOCAL.status='error';
+        LOCAL.error='decode failed: HTTP '+r.status+(r.status===429?' (rate limited, wait a minute)':'');
+        return renderSeqs();
+      }
+      const got=((await r.json()).blocks||[]).filter(b=>b&&b.ok);
+      // Clock ticks are dropped outside the newest batch: they are ~99% of an idle chain and
+      // cannot be displayed from further back anyway, but they would dominate memory.
+      const keepClock = batchIdx<LOCAL_CLOCK_BATCHES;
+      for(const b of got){
+        real += (b.txs||[]).filter(t=>progName(t.program)!=='clock').length;
+        const txs=(b.txs||[]).filter(t=>keepClock||progName(t.program)!=='clock');
+        if(txs.length) ok.push(Object.assign({}, b, {txs}));
+      }
+      batchIdx++;
+    }
+    ws.close();
+    LOCAL.scanned=scanned; LOCAL.reachedGenesis=(low<=1);
+    if(!scanned){ LOCAL.status='error'; LOCAL.error='connected, but no blocks were returned'; return renderSeqs(); }
+    LOCAL.blocks=ok.length;
+    // Re-tag onto the pseudo-zone: txRows/txAction and the account, program and token
+    // renderers all build links from t.channel, so this alone makes every link on a local row
+    // point at /zone/localhost/... instead of a real channel the server would 404 on.
+    LOCAL.txs=ok.flatMap(b=>(b.txs||[]).map(t=>Object.assign({}, t,
+      {block_id:b.block_id, timestamp:b.timestamp, channel:LOCAL_ZONE, channel_short:'local', local_channel:LOCAL.channel})));
+    LOCAL.txs.sort((a,b)=>(b.block_id||0)-(a.block_id||0));
+    LOCAL.status = ok.length ? 'ok' : 'error';
+    if(!ok.length) LOCAL.error='blocks were read but none decoded as LEZ blocks';
+    localSave();
+    if(LOCAL.status==='ok'){ feedTab='local'; renderFeedTabs(); showLocalFeed(); }
+  }catch(err){
+    try{ ws.close(); }catch(e){}
+    LOCAL.status='error'; LOCAL.error=err.message||String(err);
+  }
+  renderSeqs();
+}
+
+function localDisconnect(){
+  LOCAL={status:'idle', url:LOCAL.url, channel:'', tip:0, txs:[], blocks:0, error:''};
+  localSave(); feedTab='network'; renderSeqs(); renderFeedTabs();
+  if($('rows')) txFeed(homeFeedUrl);
+}
+
+// Local rows link under the reserved LOCAL_ZONE id; those pages render from LOCAL.txs
+
+// Any local page opened without a connected chain — a fresh tab, or a link shared to
+// someone else. Offers the action rather than an unexplained empty page.
+function renderLocalCold(){
+  $('view').innerHTML=crumb([{t:'Home',href:'/'},{t:'Local sequencer'}])+localColdPanel();
+}
+function localColdPanel(){
+  return `<div class="panel"><div class="empty" style="padding:18px">
+    This is a zone on <b>your</b> machine - zonescan reads it directly from your browser and stores nothing about it.
+    <div style="margin-top:10px"><button type="button" class="lzbtn primary" onclick="location.href='/'">Add your local sequencer</button></div></div></div>`;
+}
+
+
+// The local zone answers the SAME endpoints the real renderers already call, from the chain
+// held in this browser. Intercepting at the data layer — rather than writing parallel local
+// versions of the tx/program/token/wallet pages — is what makes those pages IDENTICAL to any
+// other zone's: there is only ever one renderer, and it cannot drift.
+function localMatchTx(hash){
+  const h=String(hash||'').toLowerCase();
+  return (LOCAL.txs||[]).find(t=>String(t.hash).toLowerCase()===h);
+}
+// Same clock rule as the server: hidden unless ?clock=1 or the Clock type chip is on.
+function localVisible(list, clockOk){
+  return (list||[]).filter(t=>{
+    if(!clockOk && !FLT.types.has('clock') && progName(t.program)==='clock') return false;
+    return filterMatches(t);
+  });
+}
+function localSorted(list){
+  const out=list.slice();
+  out.sort((a,b)=>FLT.sort==='oldest'?(a.block_id||0)-(b.block_id||0):(b.block_id||0)-(a.block_id||0));
+  return out;
+}
+// A snapshot entry shaped like any tracked zone, so the zone page renders normally.
+function localZoneSnap(){
+  const blocks=[...new Set(LOCAL.txs.map(t=>t.block_id))];
+  return {channel:LOCAL_ZONE, channel_short:'local sequencer', alive:LOCAL.status==='ok',
+    latest_block_id:LOCAL.tip, first_block_id:blocks.length?Math.min(...blocks):0,
+    l1_balance:null, l1_signers:0, version:null, data_channel:false,
+    tx_mix:null, tip_change_unix:0, consistency:null, consistent:null};
+}
+// Build the response the real endpoint would have returned.
+function localApiResponse(path, q){
+  const chan=q.get('channel')||'';
+  let m;
+  if(m=path.match(/^\/api\/tx\/(.+)$/)) return localMatchTx(decodeURIComponent(m[1]))||null;
+  if(path==='/api/txs'){
+    const prog=q.get('program'), clockOk=q.get('clock')==='1';
+    let list=localVisible(LOCAL.txs, clockOk);
+    if(prog) list=list.filter(t=>String(t.program||'')===prog);
+    const needle=(q.get('q')||'').toLowerCase();
+    if(needle) list=list.filter(t=>JSON.stringify(t).toLowerCase().includes(needle));
+    // one finite page: the window is already bounded, so there is nothing to paginate into
+    return q.get('before_block')?[]:localSorted(list).slice(0, Number(q.get('limit'))||150);
+  }
+  if(m=path.match(/^\/api\/program\/(.+)$/)){
+    const prog=decodeURIComponent(m[1]);
+    return {tx_count:(LOCAL.txs||[]).filter(t=>String(t.program||'')===prog).length};
+  }
+  if(m=path.match(/^\/api\/account\/(.+)$/)){
+    const addr=decodeURIComponent(m[1]);
+    const list=localSorted(localVisible(LOCAL.txs.filter(t=>(t.accounts||[]).includes(addr)), q.get('clock')==='1'));
+    return {address:addr, txs:q.get('before_block')?[]:list, total:list.length,
+      l1_balance:null, l2_balance:null, sequencer_rpc:false, holdings:[],
+      channels:[{channel:LOCAL_ZONE, channel_short:'local sequencer', tx_count:list.length}]};
+  }
+  if(m=path.match(/^\/api\/token\/(.+)$/)){
+    const tid=decodeURIComponent(m[1]);
+    const of=(LOCAL.txs||[]).filter(t=>String(t.token||'')===tid ||
+      (t.token_accounts||[]).some(x=>String(x.definition||'')===tid));
+    const named=of.find(t=>t.token);
+    return {id:tid, name:named?named.token:'', kind:'fungible', supply:'0',
+      channel:LOCAL_ZONE, tx_count:of.length, txs:q.get('before_block')?[]:localSorted(of), holders:[]};
+  }
+  if(path==='/api/token_of') return null;
+  if(path==='/api/whatis') return null;
+  return null;
+}
+// Route a request to the shim only when it is explicitly scoped to the local zone; every
+// other call goes to the network untouched.
+function isLocalReq(path, q){
+  if(LOCAL.status!=='ok') return false;
+  if(q.get('channel')===LOCAL_ZONE) return true;
+  // the tx endpoint is the one the tx page calls with ?channel=, but a bare hash lookup for
+  // a tx we hold locally should also resolve here rather than 404 against the server.
+  const bare=path.match(/^\/api\/tx\/(.+)$/);
+  if(bare && !q.get('channel')) return !!localMatchTx(decodeURIComponent(bare[1]));
+  return false;
+}
+(function(){
+  const real=window.fetch.bind(window);
+  window.fetch=function(input, init){
+    try{
+      const raw=(typeof input==='string')?input:(input&&input.url)||'';
+      const url=new URL(raw, location.origin);
+      if(url.origin===location.origin && isLocalReq(url.pathname, url.searchParams)){
+        const body=localApiResponse(url.pathname, url.searchParams);
+        if(body===null && /^\/api\/(tx|account|token)\//.test(url.pathname))
+          return Promise.resolve(new Response('null', {status:404, headers:{'Content-Type':'application/json'}}));
+        return Promise.resolve(new Response(JSON.stringify(body), {status:200, headers:{'Content-Type':'application/json'}}));
+      }
+    }catch(e){}      // never let the shim break a real request
+    return real(input, init);
+  };
+})();
+
+function localPanel(){
+  const st=LOCAL.status;
+  const busy = st==='connecting'||st==='reading';
+  const head=`<div class="lz">
+    <div class="lzlbl">Sequencer address</div>
+    <div class="lzrow">
+      <input id="localurl" class="lzin" value="${esc(LOCAL.url)}" placeholder="${LOCAL_DEFAULT_URL}" spellcheck="false" ${busy?'disabled':''}
+        onkeydown="if(event.key==='Enter'&&!this.disabled)localConnect()">
+      <button type="button" class="lzbtn${st==='ok'?' danger':' primary'}" onclick="${st==='ok'?'localDisconnect()':'localConnect()'}" ${busy?'disabled':''}>${st==='ok'?'Disconnect':(busy?'Reading…':'Connect')}</button>
+    </div>
+    <div class="lznote">
+      <div class="lznrow"><span class="lzni">↔</span><span>Connects from <b>your browser</b> to <b>your machine</b> over WebSocket - this server never reaches your sequencer.</span></div>
+      <div class="lznrow"><span class="lzni">⌗</span><span>Blocks are binary, so they are sent here <b>only to be decoded</b>. Nothing about your chain is stored.</span></div>
+    </div>`;
+  if(st==='error') return head+`<div class="lzerr">${esc(LOCAL.error)}</div></div>`;
+  if(busy) return head+`<div class="lzbusy">${st==='connecting'?'opening socket…':('reading blocks… '+(LOCAL.scanned?num(LOCAL.scanned)+' scanned':''))}</div></div>`;
+  if(st!=='ok') return head+'</div>';
+  const depth = LOCAL.reachedGenesis ? 'whole chain' : num(LOCAL.scanned||0)+' blocks back';
+  return head+`<div class="lzok">connected · channel <span class="chex">${esc(sh(LOCAL.channel,8,6))}</span> · tip <b>#${num(LOCAL.tip)}</b> · scanned <b>${depth}</b> · <b>${num(LOCAL.txs.length)}</b> tx(s)</div></div>`;
+}
 function setZoneFilter(k){
   zoneFilter=k; cur.seqShown=60;
-  document.querySelectorAll('.zseg button').forEach(b=>b.classList.toggle('on',b.dataset.zf===k));
+  document.querySelectorAll('.zseg button,.zlbtn').forEach(b=>b.classList.toggle('on',b.dataset.zf===k));
   renderSeqs();
 }
 function renderSeqs(){
   const all=(state&&state.sequencers)||[]; const el=$('seqs'); if(!el) return;
+  // The local tab is a different data source entirely (this browser, not the snapshot), so it
+  // renders its own panel instead of filtering the tracked list.
+  if(zoneFilter==='local'){
+    // connection state only — transactions render in Latest Transactions, like every other
+    // zone's, instead of a second table inside the Zones panel.
+    el.innerHTML = localPanel();
+    el.onscroll=null;
+    return;
+  }
   const seqs=zoneFilter==='rc'?all.filter(s=>!s.data_channel):zoneFilter==='data'?all.filter(s=>s.data_channel):all;
   if(!cur.seqShown) cur.seqShown=60;
   const slice=seqs.slice(0,cur.seqShown);
@@ -5893,14 +6441,14 @@ function renderSeqs(){
 
 // The L2 tip to display: a real height, else an em dash for a channel with activity but no
 // L2 block height (e.g. only raw inscriptions), else block zero (a genesis-only channel).
-function l2Tip(s){ return (s&&s.latest_block_id>0)?'#'+num(s.latest_block_id):(s&&s.activity_state?'—':'#0'); }
+function l2Tip(s){ return (s&&s.latest_block_id>0)?'#'+num(s.latest_block_id):(s&&s.activity_state?'-':'#0'); }
 
 // Small zones-list chip mirroring the activity_state (honest, never implies user txs).
 function activityChip(s){
   const st=s&&s.activity_state; if(!st) return '';
   const m={finalizing:['safe','finalizing','on-L1 inscriptions awaiting finality'],
-           'clock-only':['pend','clock-only','idle — clock heartbeats only'],
-           raw:['safe','raw','raw text/data inscriptions (not sequencer blocks) — shown as rows']}[st];
+           'clock-only':['pend','clock-only','idle - clock heartbeats only'],
+           raw:['safe','raw','raw text/data inscriptions (not sequencer blocks) - shown as rows']}[st];
   if(!m) return '';
   return ` · <span class="fbadge ${m[0]}" style="font-size:9px;padding:0 5px" title="${esc(m[2])}">${esc(m[1])}</span>`;
 }
@@ -5924,16 +6472,16 @@ function activityPanel(s){
     const eta=gap>0?`${num(gap)} slot${gap===1?'':'s'} to finalize (~${Math.max(1,Math.round(gap/60))} min)`:'finalizing now';
     badge='<span class="fbadge safe" title="settled on the L1, awaiting finality">on L1 · finalizing</span>';
     headline=`${nS}inscription${n===1?'':'s'} · finalizing`;
-    note='Recent inscriptions are settled on the L1 but not yet finalized. Their contents become visible once finalized — they may be clock heartbeats or user transactions; unknown until then. New inscriptions appear live.';
+    note='Recent inscriptions are settled on the L1 but not yet finalized. Their contents become visible once finalized - they may be clock heartbeats or user transactions; unknown until then. New inscriptions appear live.';
     extra=`<div class="k">Finality</div><div class="v">${esc(eta)} <span class="mut" style="font-size:11px">(tip slot ${num(tip)} vs last-final ${num(lib)})</span></div>`;
   } else if(st==='clock-only'){
     badge='<span class="fbadge pend" title="settling only clock heartbeats">idle · clock-only</span>';
     headline=`clock-only · ${nS}heartbeat inscription${n===1?'':'s'} · no user txs`;
-    note='This channel has settled only clock heartbeats in the scanned window — no user transactions. Clock ticks are hidden from the feed.';
+    note='This channel has settled only clock heartbeats in the scanned window - no user transactions. Clock ticks are hidden from the feed.';
   } else {
     badge='<span class="fbadge safe" title="raw text/data inscriptions - not sequencer blocks">raw inscriptions</span>';
     headline=`${nS}raw inscription${n===1?'':'s'} · not a sequencer block`;
-    note='This channel settles raw text/data inscriptions rather than sequencer blocks. Each is listed below as its own inscription row — open one to read its content (decoded UTF-8 text, or a hex dump). New inscriptions appear live.';
+    note='This channel settles raw text/data inscriptions rather than sequencer blocks. Each is listed below as its own inscription row - open one to read its content (decoded UTF-8 text, or a hex dump). New inscriptions appear live.';
   }
   return `<div class="panel" style="margin-bottom:16px">
     <div class="phead">Channel activity ${badge}</div>
@@ -5951,7 +6499,8 @@ function activityPanel(s){
 
 async function renderZone(seq){
   cur={kind:'zone',seq};
-  const s=((state&&state.sequencers)||[]).find(x=>x.channel===seq)||{channel:seq,channel_short:sh(seq)};
+  const s=(seq===LOCAL_ZONE)?localZoneSnap()
+    :(((state&&state.sequencers)||[]).find(x=>x.channel===seq)||{channel:seq,channel_short:sh(seq)});
   $('view').innerHTML=`${crumb([{t:'Home',href:'/'},{t:'Zone '+sh(seq)}])}
   <div class="panel" style="margin-bottom:16px"><div class="phead">${s.data_channel?'Channel':'Sequencer'} ${chanLabel(s.channel, s.channel_short)} ${dataBadge(s)}${verBadge(s)}${consBadge(s)}</div>
     <div class="ovw">
@@ -5986,7 +6535,7 @@ async function renderZone(seq){
 function fmtHex(h){ h=(h||'').replace(/[^0-9a-fA-F]/g,''); const bytes=h.match(/.{1,2}/g)||[]; let out='';
   for(let i=0;i<bytes.length;i+=32){ out+=bytes.slice(i,i+32).join(' ')+'\n'; } return out.replace(/\n$/,''); }
 // bytes -> human size for pinned-content totals
-function fmtBytes(n){ if(n==null||isNaN(n)) return '—'; const un=['B','KB','MB','GB','TB']; let i=0,v=Number(n); while(v>=1024&&i<un.length-1){v/=1024;i++;} return (i?v.toFixed(1):String(v))+' '+un[i]; }
+function fmtBytes(n){ if(n==null||isNaN(n)) return '-'; const un=['B','KB','MB','GB','TB']; let i=0,v=Number(n); while(v>=1024&&i<un.length-1){v/=1024;i++;} return (i?v.toFixed(1):String(v))+' '+un[i]; }
 // Parse a raw inscription that is a keeper `cid_pin` record; null => not one.
 // Shape: {v,type:'cid_pin',cid,label:'<json string>',source,ts} where label carries
 // {files:[{cid,name}],id,module,source,title,totalSize}.
@@ -6013,7 +6562,7 @@ function cidPinPanel(p){
   const title=(lab.title&&String(lab.title).trim())||j.cid||'(untitled)';
   const iaId=lab.source==='internet_archive'?(lab.id||String(j.cid||'').replace(/^ia:/,'')):null;
   const srcCell=iaId?`<a class="lnk" href="https://archive.org/details/${u(iaId)}" target="_blank" rel="noopener">archive.org/details/${esc(iaId)}</a>`
-                    :(lab.source?esc(lab.source):'—');
+                    :(lab.source?esc(lab.source):'-');
   const gwHref=(f)=>`${gw}/ipfs/${u(f.cid||'')}?filename=${u(f.name||'')}`;
   const rows=files.map(f=>`<tr>
     <td>${esc(f.name||'?')}</td>
@@ -6030,7 +6579,7 @@ function cidPinPanel(p){
     </div>
     ${files.length?`<div class="tscroll" style="padding:0 18px 8px"><table class="ttbl"><thead><tr><th>File (${files.length})</th><th>CID</th><th>IPFS</th></tr></thead><tbody>${rows}</tbody></table></div>`
                   :'<div class="mut" style="padding:0 18px 8px;font-size:12px">no files listed</div>'}
-    <div class="mut" style="padding:6px 18px 16px;font-size:12px;line-height:1.5">File links resolve through the IPFS gateway <span style="font-family:var(--mono)">${gw}</span> — content is served by the IPFS network, not by this explorer${state&&state.ipfs_gateway?'':' (operators can set ZONE_SCAN_IPFS_GATEWAY to use their own gateway)'}.</div>
+    <div class="mut" style="padding:6px 18px 16px;font-size:12px;line-height:1.5">File links resolve through the IPFS gateway <span style="font-family:var(--mono)">${gw}</span> - content is served by the IPFS network, not by this explorer${state&&state.ipfs_gateway?'':' (operators can set ZONE_SCAN_IPFS_GATEWAY to use their own gateway)'}.</div>
   </div>`;
 }
 // All content panels for a raw inscription: a structured view for recognized formats
@@ -6049,7 +6598,7 @@ function rawPayloadPanel(t){
                     :`<pre class="rawhex">${esc(fmtHex(t.raw_hex||''))}</pre>`;
   return `<div class="panel" style="margin-top:16px"><div class="phead">Raw inscription payload <span class="mut" style="font-weight:400;font-size:12px">${t.raw_len?num(t.raw_len)+' bytes · ':''}${hasText?'UTF-8 text':'binary (hex)'}</span></div>
     <div style="padding:14px 18px 18px">
-      <div class="mut" style="font-size:12px;margin-bottom:9px;line-height:1.5">A raw text/data inscription — not a sequencer block. The bytes below are its on-chain content, shown ${hasText?'as decoded UTF-8 text':'as a hex dump'}.</div>
+      <div class="mut" style="font-size:12px;margin-bottom:9px;line-height:1.5">A raw text/data inscription - not a sequencer block. The bytes below are its on-chain content, shown ${hasText?'as decoded UTF-8 text':'as a hex dump'}.</div>
       ${body}
     </div></div>`;
 }
@@ -6079,7 +6628,7 @@ async function renderTx(seq,hash){
     ${t.program?`<div class="k">Program</div><div class="v"><a class="lnk" href="/zone/${u(z)}/program/${u(t.program)}" title="${esc(t.program)}">${(()=>{const g=guessFor(t.program,t);return (g&&!g.generic)?guessHtml(g)+` <span class="mut mono" style="font-size:11px">${esc(sh(t.program,6,5))}</span>`:esc(progShort(t.program));})()}</a></div>`:''}
     <div class="k">${t.kind==='raw'?'Channel':'Sequencer'}</div><div class="v"><a class="lnk" href="/zone/${u(z)}">${esc(z)}</a></div>
     ${t.kind==='raw'
-      ?`<div class="k">L1 slot</div><div class="v">${t.slot?num(t.slot):'—'}</div>`
+      ?`<div class="k">L1 slot</div><div class="v">${t.slot?num(t.slot):'-'}</div>`
       :`<div class="k">L2 Block</div><div class="v">#${num(t.block_id)}${t.slot?'  ·  L1 slot '+num(t.slot):''}</div>
     <div class="k">Accounts (${(t.accounts||[]).length})</div><div class="v">${accLinks(t.accounts)}</div>`}
     ${t.instruction_data&&t.instruction_data.length?`<div class="k">Instruction</div><div class="v" id="instrval">${instrText(t,null)}</div>`:''}
@@ -6124,7 +6673,7 @@ async function renderProgram(seq,prog){
       <div><div class="k">Sequencer</div><div class="v" style="font-size:13px"><a class="lnk" href="/zone/${u(seq)}">${esc(sh(seq))}</a></div></div>
       <div><div class="k">Transactions</div><div class="v" id="progtxcount">…</div></div>
     </div>
-    ${g?`<div class="kv" style="padding:0 16px 4px"><div class="k">${g.generic?'Shape':'Name'}</div><div class="v"><span class="pguess">≈ ${esc(g.name)}</span>${g.token?` · defines <span class="pguess" title="token symbol read from this program's on-chain NewFungibleDefinition — unverified">≈ ${esc(g.token)}</span>`:''} <span class="mut" style="font-size:12px">${esc(guessTip(g))}</span></div></div>`:''}
+    ${g?`<div class="kv" style="padding:0 16px 4px"><div class="k">${g.generic?'Shape':'Name'}</div><div class="v"><span class="pguess">≈ ${esc(g.name)}</span>${g.token?` · defines <span class="pguess" title="token symbol read from this program's on-chain NewFungibleDefinition - unverified">≈ ${esc(g.token)}</span>`:''} <span class="mut" style="font-size:12px">${esc(guessTip(g))}</span></div></div>`:''}
     <div class="kv" style="padding:16px"><div class="k">Program id</div><div class="v">${esc(prog)}</div></div>
    </div>
    ${schemaPanel(seq,prog)}
@@ -6148,7 +6697,7 @@ function schemaPanel(seq,prog){
   return `<div class="panel" style="margin-bottom:16px"><div class="phead">Instruction schema (ABI) <span class="count">propose</span></div>
     <div style="padding:16px">
       <div class="hint" style="margin-bottom:8px">No schema yet, so instructions show as raw words. Anyone can propose one - paste the program's <b>instruction type</b>. It's accepted only if it decodes this program's <b>real on-chain instructions exactly</b>. Examples: <code>{"struct":[{"name":"message","type":"bytes"}]}</code> · <code>{"enum":[{"name":"Greet","fields":[{"name":"msg","type":"string"}]}]}</code></div>
-      ${!PROGS[prog] ? `<input id="schemaname" type="text" maxlength="32" placeholder="program name alias (optional) — e.g. my_token" title="registered alongside the schema only if it validates and this program is still unnamed" style="width:100%;box-sizing:border-box;font-size:13px;padding:8px;border:1px solid var(--line2);border-radius:6px;margin-bottom:8px">` : ''}
+      ${!PROGS[prog] ? `<input id="schemaname" type="text" maxlength="32" placeholder="program name alias (optional) - e.g. my_token" title="registered alongside the schema only if it validates and this program is still unnamed" style="width:100%;box-sizing:border-box;font-size:13px;padding:8px;border:1px solid var(--line2);border-radius:6px;margin-bottom:8px">` : ''}
       <textarea id="schemainput" rows="3" placeholder='{"struct":[{"name":"message","type":"bytes"}]}' style="width:100%;box-sizing:border-box;font-family:var(--mono);font-size:12px;padding:9px;border:1px solid var(--line2);border-radius:6px"></textarea>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="kbtn" onclick="previewSchema('${esc(seq)}','${esc(prog)}')">Preview</button>
@@ -6235,7 +6784,7 @@ async function loadHolders(){
   const hs=r.holders||[];
   el.insertAdjacentHTML('beforeend', hs.map(h=>`<tr>
     <td><a class="lnk" href="/zone/${u(HOLD.seq||HOLD.tid)}/wallet/${u(h.account)}">${esc(sh(h.account,8,6))}</a></td>
-    <td style="text-align:right">${h.balance!=null?`<b>${grp(h.balance)}</b>`:'<span class="mut">—</span>'}</td></tr>`).join(''));
+    <td style="text-align:right">${h.balance!=null?`<b>${grp(h.balance)}</b>`:'<span class="mut">-</span>'}</td></tr>`).join(''));
   const cnt=$('holdercount'); if(cnt) cnt.textContent=el.children.length;
   HOLD.next=(hs.length>=50 && r.next)?r.next:false;
   HOLD.loading=false;
@@ -6278,7 +6827,7 @@ async function renderWallet(addr,seq){
     <div class="tscroll"><table class="ttbl"><thead><tr><th style="text-align:left">Token</th><th style="text-align:right">Balance</th><th style="text-align:left">Holding account (ATA)</th></tr></thead>
     <tbody>${a.holdings.map(h=>`<tr>
       <td>${h.name?`<a class="lnk" href="/zone/${u(seq||a.channel)}/token/${u(h.definition)}">${esc(h.name)}</a>`:`<span class="mut" title="${esc(h.definition)}">${esc(sh(h.definition,6,4))}</span>`}</td>
-      <td style="text-align:right">${h.balance!=null?`<b>${grp(h.balance)}</b>`:'<span class="mut">—</span>'}</td>
+      <td style="text-align:right">${h.balance!=null?`<b>${grp(h.balance)}</b>`:'<span class="mut">-</span>'}</td>
       <td><a class="lnk" href="/zone/${u(seq||a.channel)}/wallet/${u(h.account)}">${esc(sh(h.account,6,4))}</a></td>
     </tr>`).join('')}</tbody></table></div></div>`:''}
    <div class="panel"><div class="phead">Transactions <span class="count" id="count">${num(a.tx_count)}</span></div>
@@ -6295,6 +6844,10 @@ function route(){
   window.onscroll=null; cur.feed=null;   // drop any prior infinite-scroll handler
   const p=location.pathname; let m;
   if(p==='/'||p===''){ renderHome(); return; }
+  // The reserved local zone is served entirely from memory — never fetched from this server.
+  // The local zone uses the ordinary routes and the ordinary renderers; the fetch shim
+  // supplies their data. Only "nothing connected yet" needs special handling.
+  if(p.startsWith('/zone/'+LOCAL_ZONE) && LOCAL.status!=='ok'){ renderLocalCold(); return; }
   if(m=p.match(/^\/zone\/([^\/]+)\/tx\/([^\/]+)\/?$/)){ renderTx(decodeURIComponent(m[1]),decodeURIComponent(m[2])); return; }
   if(m=p.match(/^\/zone\/([^\/]+)\/wallet\/([^\/]+)\/?$/)){ renderWallet(decodeURIComponent(m[2]),decodeURIComponent(m[1])); return; }
   if(m=p.match(/^\/zone\/([^\/]+)\/program\/([^\/]+)\/?$/)){ renderProgram(decodeURIComponent(m[1]),decodeURIComponent(m[2])); return; }
@@ -6537,6 +7090,39 @@ load();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `/api/decode` feeds caller-supplied base64 straight into the block decoder, so the
+    // base64 step must reject junk rather than silently yield truncated bytes that then
+    // mis-parse into a plausible-looking block.
+    #[test]
+    fn b64_decode_handles_padding_whitespace_and_rejects_junk() {
+        assert_eq!(b64_decode("aGVsbG8gd29ybGQ=").unwrap(), b"hello world");
+        // every padding length: 0, 1 and 2 '=' characters
+        assert_eq!(b64_decode("YQ==").unwrap(), b"a");
+        assert_eq!(b64_decode("YWI=").unwrap(), b"ab");
+        assert_eq!(b64_decode("YWJj").unwrap(), b"abc");
+        // sequencers may wrap long payloads; ASCII whitespace is ignored, not an error
+        assert_eq!(b64_decode("aGVs\nbG8g\t d29ybGQ=").unwrap(), b"hello world");
+        assert_eq!(b64_decode("").unwrap(), b"");
+        // full alphabet incl. the +/ pair round-trips to the expected bytes
+        assert_eq!(b64_decode("+/8=").unwrap(), vec![0xfb, 0xff]);
+        // anything outside the alphabet is a hard error (NOT skipped): silently dropping a
+        // stray character would shift every subsequent byte and corrupt the decode.
+        assert!(b64_decode("aGVsbG8*d29ybGQ=").is_none());
+        assert!(b64_decode("not base64!!").is_none());
+        assert!(b64_decode("YQ-=").is_none()); // url-safe alphabet is deliberately not accepted
+    }
+
+    // A short or non-block payload must return None rather than reading past the buffer.
+    #[test]
+    fn decode_block_bytes_rejects_short_and_non_block_input() {
+        assert!(decode_block_bytes(&[]).is_none());
+        assert!(decode_block_bytes(&[0u8; 7]).is_none(), "under the 8-byte block_id read");
+        // 8 bytes parses a block_id but nothing else; an absurd id marks it undecodable
+        // rather than surfacing a bogus block (what /api/decode reports as an error).
+        let d = decode_block_bytes(&[0xff; 8]).expect("8 bytes yields a Decoded");
+        assert!(d.undecodable, "a nonsense block_id must be flagged, not rendered");
+    }
 
     // The footer build tag is what an operator reads to confirm which binary a box runs, so
     // it must always render something and must never leak the raw `{{BUILD_TAG}}` template.

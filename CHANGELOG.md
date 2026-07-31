@@ -3,39 +3,81 @@
 Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a minor bump
 (`0.x`) carries new features, a patch bump (`0.x.y`) carries fixes.
 
-## [0.5.0] — 2026-07-31
+## [0.6.0] - 2026-07-31
+
+### Added
+- **Local zone** - "Add your local sequencer" on the Zones panel reads a sequencer running on
+  **your own machine** and shows it in the dashboard, with nothing tracked server-side and no
+  local zonescan install. Its transactions appear in Latest Transactions under a
+  **Local sequencer** tab, and its transaction, program, token, account and zone pages are the
+  ordinary pages: a fetch shim answers the same endpoints those renderers already call from the
+  chain held in the browser, so the local views cannot drift from the rest of the explorer.
+  The chain is kept in `sessionStorage` for the tab's lifetime, so navigating between pages
+  never asks you to reconnect, and rows live under a reserved `localhost` zone id.
+
+  Two things make it possible without touching the sequencer. It speaks JSON-RPC over
+  **WebSocket** (`ws://127.0.0.1:3070` by default, editable and remembered), because a
+  cross-origin HTTP POST to loopback is blocked - the sequencer sends no CORS headers and
+  answers `OPTIONS` with 405, so the preflight fails - whereas WebSockets are exempt from the
+  same-origin policy and jsonrpsee already serves JSON-RPC over WS on the same port. And blocks
+  arrive as base64 Borsh, so they are decoded server-side rather than by a second decoder in
+  the browser that would have to track every rc3/rc4/rc5/v0.2 wire change.
+
+  Loopback only: `ws://` to a LAN address is blocked as mixed content from an HTTPS page, since
+  the trustworthy-origin exemption covers `127.0.0.1`, `localhost` and `::1` but nothing else.
+- **`POST /api/decode`** - decodes caller-supplied sequencer blocks (base64, as `getBlock` and
+  `getBlockRange` return them) into transaction rows. Deliberately pure: it never writes to the
+  store or touches tracked-zone state, so an open compute endpoint cannot inject rows into the
+  shared index. Bounded by a 512-block cap, a 2 MB body limit pinned to the route (so an
+  oversized post gets a clean 413 rather than a severed connection), and 60 requests per minute
+  per IP.
+
+### Changed
+- The local zone reads as deep as it needs to rather than a fixed number of blocks. A sequencer
+  mints a block on a timer whether or not anyone transacted, so a window measured in blocks is
+  really a window measured in minutes, and a transaction sent earlier silently fell out of
+  view. It now walks back in batches until it has enough real transactions, using
+  `getBlockRange` (one round trip per batch, ~15x cheaper per block than one `getBlock` each),
+  which reaches genesis on a small chain in a couple of requests. Clock ticks are retained only
+  for the newest batch: they are the overwhelming majority of an idle chain and would dominate
+  memory without adding anything displayable.
+- Clock ticks in the local view follow the same rule as the rest of the explorer: hidden unless
+  `?clock=1` or the Clock type filter is selected.
+- The em dash is gone from user-visible copy.
+
+## [0.5.0] - 2026-07-31
 
 ### Added
 - The dashboard footer now names the build serving the page: `zonescan v<version> · <git rev>`
   (a `-dirty` suffix when the binary contains uncommitted work). A new `build.rs` captures the
   revision at compile time and degrades to the bare version when git isn't available (release
   tarball, vendored crate, npm package), so nothing depends on it being present.
-- **LEZ v0.2.0 (final)** — the decoder now links the official `v0.2.0` release (was
+- **LEZ v0.2.0 (final)** - the decoder now links the official `v0.2.0` release (was
   `v0.2.0-rc5`). The on-chain wire format is identical (verified byte-for-byte: block
   layout, header-hash preimage, transaction encodings, instruction shapes), so decoding
   and chain verification of rc4/rc5 zones is unchanged; the port is API-level only
   (built-in program constructors moved to the new `programs` crate). Zones running the
   stock v0.2.0 build are now named natively and badge **v0.2**, and the three new
-  built-ins — **vault, faucet, bridge** — resolve by name offline.
-- **Data-channel discovery** — auto-discovery now also adopts channels whose inscriptions
+  built-ins - **vault, faucet, bridge** - resolve by name offline.
+- **Data-channel discovery** - auto-discovery now also adopts channels whose inscriptions
   are **not** valid LEZ sequencer blocks (raw text/JSON/data payloads, e.g. cid-pin
-  registries). They are tracked and indexed like any channel — each inscription renders as
-  a raw row with its content — and carry an explicit amber **`data`** badge on the zones
+  registries). They are tracked and indexed like any channel - each inscription renders as
+  a raw row with its content - and carry an explicit amber **`data`** badge on the zones
   list and zone page (whose header says *Channel*, not *Sequencer*) so they are never
   mistaken for a sequencer. Sequencers are admitted to the discovery cap first; opt out
   with `ZONE_SCAN_DISCOVER_DATA=0` (config: `discover_data: false`).
 - The setup page now preserves the `discovered`/`data_channel` flags of already-tracked
   channels across a form save (previously a save silently reset them to hand-configured).
-- **Zones filter** — an **All | rc | data** segmented control on the zones list.
-- **Observed data-channel classification** — a channel whose observed content is only raw
+- **Zones filter** - an **All | rc | data** segmented control on the zones list.
+- **Observed data-channel classification** - a channel whose observed content is only raw
   inscriptions (never a valid LEZ block) now badges `data` even when hand-configured, so
   e.g. a guest text channel no longer shows under the `rc` filter as a "sequencer".
-- **Token names resolve without an ATA link** — a transfer on a (fingerprinted) token
+- **Token names resolve without an ATA link** - a transfer on a (fingerprinted) token
   program whose accounts have no learned ATA/holding link now falls back to the program's
   own definitions, when they carry exactly one distinct token name (a new `prog_def`
   index, populated on ingest and by the token-map re-learn). Fixes transfers showing an
   amount but no token symbol when the ATA-create predates the scan window.
-- **cid_pin viewer** — a raw inscription recognized as a keeper `cid_pin` record renders a
+- **cid_pin viewer** - a raw inscription recognized as a keeper `cid_pin` record renders a
   structured "Pinned content" panel on its transaction page: title, source (linked to
   archive.org for Internet Archive items), pinner, pin time, total size, and a per-file
   table with **view/download links through an IPFS gateway** (`ZONE_SCAN_IPFS_GATEWAY`,
@@ -59,7 +101,7 @@ Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a m
 
 ### Fixed
 - **Transactions shared between zones no longer overwrite each other.** Tx rows were keyed by
-  hash alone, but a hash covers program + accounts + instruction data and *not* the channel —
+  hash alone, but a hash covers program + accounts + instruction data and *not* the channel -
   so two zones bootstrapped from the same genesis config produce byte-identical genesis txs
   with identical hashes, and the second zone's copy deduped into the first zone's record. The
   effect was silent: a whole zone's genesis disappeared, its transactions rendered under the
@@ -69,35 +111,35 @@ Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a m
   and in every derived index and pagination cursor; `/api/tx/<hash>` takes an optional
   `?channel=` and the dashboard passes the zone from the URL, falling back to whichever zone
   carries the hash so unscoped links still resolve. Existing stores are re-keyed in place on
-  first open — no data loss, and the indexes are rebuilt from the tx rows so a half-migrated
+  first open - no data loss, and the indexes are rebuilt from the tx rows so a half-migrated
   mix is impossible. Rows that were already lost to the old key return on the next scan of
   their L1 slots (`/api/rescan`).
-- The "finalizing" tooltip claimed finality takes "~1h" — a hardcoded constant that was
+- The "finalizing" tooltip claimed finality takes "~1h" - a hardcoded constant that was
   never computed from anything. Time-to-finality is now **measured**: zonescan samples the
   L1 tip slot alongside the existing finality-lag samples, derives seconds-per-slot from
   the observed rate, and reports `lag × rate`. When the rate hasn't been observed for long
   enough to trust (< 2 min of samples, a stalled tip, or a rewound one) it states the lag
   in slots rather than inventing a duration. Measured live on 2026-07-31: 1.28 s/slot and
-  3425 slots of lag = ~73 min, so the old constant was both fabricated *and* wrong — and
+  3425 slots of lag = ~73 min, so the old constant was both fabricated *and* wrong - and
   wrong by an amount that drifts, which is exactly why a constant could never work.
 - Channel balances lost precision above 2^53: they were rendered with `num()`
   (`Number(n).toLocaleString()`) even though the server sends `l1_balance` as a u128 string.
   `u128::MAX` displayed as `340,282,366,920,938,500,000,…`. All three surfaces (zone list,
   zone panel, zone page) now use the bigint-safe `grp()` already used for transfer amounts.
-- Zone version badges now re-tag when a zone **upgrades its build** — the version was set
+- Zone version badges now re-tag when a zone **upgrades its build** - the version was set
   once and persisted, so a zone that moved from a fork build to stock v0.2.0 (e.g. the
   `0101` dev channel) kept showing the stale `rc5` badge forever. It now tracks the latest
   build-distinctive program signal; shared/neutral programs (clock) never clobber a tag.
 - The transaction page no longer visibly reloads on every live snapshot (it re-fetched and
-  rebuilt the whole page every few seconds, losing scroll position). The finality badge —
-  the only live-updating element there — now refreshes in place.
+  rebuilt the whole page every few seconds, losing scroll position). The finality badge -
+  the only live-updating element there - now refreshes in place.
 - Foreign-token-program transfers showed "(token unresolved)" on the tx page even when the
   server had resolved the token: the raw-id render branches only consulted the fingerprint
   guess (`token_guess`), never the resolved `token` field. Resolved beats guess now.
 - The Instruction row now decodes semantically for **fingerprinted** programs: a program
   the classifier confidently recognizes (e.g. `≈ token`) renders through the same typed
-  branch as the named built-in — `≈ token · Transfer 10,000,000,000 RLNTOK` instead of a
-  generic inferred-field dump — and the async layout-inference no longer overwrites a
+  branch as the named built-in - `≈ token · Transfer 10,000,000,000 RLNTOK` instead of a
+  generic inferred-field dump - and the async layout-inference no longer overwrites a
   semantic decode. The server-resolved token symbol labels the transfer when no linked
   definition is available.
 - The tx-page headline mis-decoded rc5 native (authenticated_transfer) amounts: it read the
@@ -106,16 +148,16 @@ Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a m
   shapes), and the 1-word rc5 CreateAccount renders as "Register native account" instead of
   an empty transfer.
 
-## [0.4.0] — 2026-07-06
+## [0.4.0] - 2026-07-06
 
 ### Added
-- **Per-program index** — program-page lookups are now O(limit) with an **exact** per-program
+- **Per-program index** - program-page lookups are now O(limit) with an **exact** per-program
   transaction total, replacing an up-to-50k channel scan; the program page shows that exact count.
-- **Live updates on every page** — the SSE feed appends new transactions on account, token, and
+- **Live updates on every page** - the SSE feed appends new transactions on account, token, and
   program pages (not just the main feed), and the transaction page's finality badge advances live.
-- **Zone throughput + tx mix** — blocks/min and the public / private / deploy transaction mix on
+- **Zone throughput + tx mix** - blocks/min and the public / private / deploy transaction mix on
   the zones list and the zone page.
-- **Finality-lag sparkline** — a bounded time series of L1 finality lag on the dashboard.
+- **Finality-lag sparkline** - a bounded time series of L1 finality lag on the dashboard.
 - **Token holders** list with infinite scroll on the token page, and a **token-holdings** panel on
   account pages (owner → ATA index; balances via the sequencer RPC).
 - **Search a token definition** routes straight to its token page.
@@ -136,18 +178,19 @@ Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a m
   filter resolves program id → name; removed a dead write-amplifying index.
 
 ### Changed
-- **Decode dependency ported to the official LEZ `v0.2.0-rc5`** — the version the live sequencers
+- **Decode dependency ported to the official LEZ `v0.2.0-rc5`** - the version the live sequencers
   run. rc5 restructured the workspace, so the decoder now depends on `common` + `lee` (the `nssa`
   crate was folded into `lee`). Decoding of the live rc5 chain is verified: block hashes recompute
   with zero mismatches.
 - README decoding section updated (fingerprint classifier, program naming across rebuilds, ABI/alias
   registration).
 
-## [0.3.0] — 2026-06-26
+## [0.3.0] - 2026-06-26
 
 - First public release: dual Logos L1 `0.1.x` / `0.2.x` support, per-transaction decoding, the
   structural fingerprint classifier, and the multi-zone dashboard.
 
+[0.6.0]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.0
 [0.5.0]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.5.0
 [0.4.0]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.4.0
 [0.3.0]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.3.0

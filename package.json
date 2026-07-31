@@ -1,6 +1,6 @@
 {
   "name": "@paradoxcomputer/zonescan",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Transaction explorer for Logos Execution Zone (LEZ) sequencers: a live web dashboard over public on-chain settlement data. Reads from a Logos L1 node, or directly from a local sequencer with no L1. Run `zonescan setup` for a token-gated setup page, or configure headlessly via env/.env.",
   "bin": {
     "zonescan": "bin/zone-scan.js"

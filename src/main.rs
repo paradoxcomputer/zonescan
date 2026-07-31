@@ -728,7 +728,14 @@ pub fn inscription_bytes(ins: &Value) -> Option<Vec<u8>> {
 /// are read without a full decode. The Public/Private/Deploy split needs the
 /// real `decode` feature.
 pub fn decode_inscription(ins: &Value) -> Option<Decoded> {
-    let bytes = inscription_bytes(ins)?;
+    decode_block_bytes(&inscription_bytes(ins)?)
+}
+
+/// Decode raw block BYTES (the same payload an L1 inscription carries), independent of how
+/// they were transported. `decode_inscription` gets them out of an L1 inscription JSON; the
+/// `/api/decode` endpoint gets them base64 from a sequencer's `getBlock` over WebSocket.
+/// Header field offsets are documented on `decode_inscription`.
+pub fn decode_block_bytes(bytes: &[u8]) -> Option<Decoded> {
     if bytes.len() < 8 {
         return None;
     }
@@ -739,7 +746,7 @@ pub fn decode_inscription(ins: &Value) -> Option<Decoded> {
     let tx_count = (bytes.len() >= 148)
         .then(|| u32::from_le_bytes(bytes[144..148].try_into().unwrap()))
         .unwrap_or(0);
-    let (tx_mix, txs, chk, bedrock_final, bedrock_safe) = decode_block_detail(&bytes);
+    let (tx_mix, txs, chk, bedrock_final, bedrock_safe) = decode_block_detail(bytes);
     let (hash, prev_hash, hash_ok) = chk.unwrap_or_else(|| (String::new(), String::new(), true));
     // A non-rc5 block body mis-parses: the id offset lands on unrelated bytes, so a huge
     // `block_id` means "we detected an inscription but can't decode it".
