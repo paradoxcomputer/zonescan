@@ -3,6 +3,23 @@
 Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a minor bump
 (`0.x`) carries new features, a patch bump (`0.x.y`) carries fixes.
 
+## [0.6.1] - 2026-07-31
+
+### Fixed
+- **Connecting a local zone failed outright** with `LOCAL_TARGET_TXS is not defined`. The walk
+  was rewritten to use new constants in 0.6.0 while the change that declared them was dropped,
+  so the code shipped referencing identifiers that did not exist. Nothing caught it: the Rust
+  compiler does not read the dashboard script, and a JS syntax check accepts an undefined
+  identifier happily. A test now asserts that every `LOCAL_*` constant the script references is
+  declared, and it was confirmed to fail on the exact omission before being accepted.
+- The local zone's status line could report a nonsense depth, e.g. "scanned 0 blocks back"
+  beside a full transaction list. The chain kept in `sessionStorage` was restored whatever
+  shape it had, so a chain saved by an earlier build came back missing the fields that build
+  never wrote, and the missing values rendered as zero. The stored payload now carries a
+  version and a mismatch is discarded and re-read rather than half-understood, which also
+  prevents the same class of bug on future changes to that structure. The status line no
+  longer invents a depth either: when it genuinely does not know, it says so.
+
 ## [0.6.0] - 2026-07-31
 
 ### Added
@@ -190,6 +207,7 @@ Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a m
 - First public release: dual Logos L1 `0.1.x` / `0.2.x` support, per-transaction decoding, the
   structural fingerprint classifier, and the multi-zone dashboard.
 
+[0.6.1]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.1
 [0.6.0]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.0
 [0.5.0]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.5.0
 [0.4.0]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.4.0

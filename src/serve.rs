@@ -6148,23 +6148,38 @@ function zoneLocalBtn(){
 // LOCAL.txs in memory — the server has never seen this chain and would 404 on any lookup.
 const LOCAL_ZONE='localhost';
 const LOCAL_DEFAULT_URL='ws://127.0.0.1:3070';
-// How far back from the tip to read. A sequencer mints a block on a timer whether or not
-// anyone transacted, so a shallow window on an idle chain shows nothing but clock ticks and
-// a transaction sent minutes ago appears to have vanished. 200 blocks is ~16 min at a 5s
-// block time. Read in chunks because /api/decode caps a single request at 64 blocks.
-const LOCAL_WALK=200;
-const LOCAL_CHUNK=50;
+// How much history to read. A fixed block window was the wrong shape: a sequencer mints a
+// block on a timer whether or not anyone transacted, so on an idle chain a window measured in
+// BLOCKS is really a window measured in minutes, and a transaction sent a while ago silently
+// falls out of view. Scan back until enough real (non-clock) transactions have been found
+// instead, so the depth follows activity rather than the clock.
+//
+// Fetching is not the expensive part: getBlockRange returns a whole batch in one round trip
+// (measured at 0.003 ms/block against a local sequencer, ~15x cheaper than one getBlock per
+// block). The remaining cost is decode requests against the rate limit, which is why the walk
+// stops as soon as it has enough.
+const LOCAL_TARGET_TXS=200;    // stop once this many non-clock txs are in hand
+const LOCAL_BATCH=500;         // blocks per getBlockRange and per decode call (server caps 512)
+const LOCAL_MAX_BLOCKS=20000;  // hard stop, so a huge chain cannot spin forever
+// Clock ticks are kept only for the newest batch: they are the overwhelming majority of an
+// idle chain and would dominate memory on a long walk without adding anything displayable.
+const LOCAL_CLOCK_BATCHES=1;
 let LOCAL={status:'idle', url:'', channel:'', tip:0, txs:[], blocks:0, error:''};
 // Which feed the Latest Transactions panel shows: the tracked network, or the local zone.
 let feedTab='network';
 // Every in-page link is a real navigation (full page load), so in-memory state would be gone
 // by the time the target page renders — and the user would be asked to reconnect on every
 // click. Persist the decoded chain for the tab's lifetime instead.
+// Bump whenever the persisted shape changes. A payload written by an older build restores
+// with its newer fields missing, which silently renders as nonsense (a chain saved before
+// `scanned` existed reported "scanned 0 blocks back" next to a full transaction list). Version
+// it so a mismatch is discarded and re-read instead of half-understood.
+const LOCAL_SAVE_V=2;
 function localSave(){
   try{
     if(LOCAL.status==='ok') sessionStorage.setItem('zs_local', JSON.stringify(
-      {url:LOCAL.url, channel:LOCAL.channel, tip:LOCAL.tip, blocks:LOCAL.blocks, txs:LOCAL.txs,
-       scanned:LOCAL.scanned, reachedGenesis:LOCAL.reachedGenesis}));
+      {v:LOCAL_SAVE_V, url:LOCAL.url, channel:LOCAL.channel, tip:LOCAL.tip, blocks:LOCAL.blocks,
+       txs:LOCAL.txs, scanned:LOCAL.scanned, reachedGenesis:LOCAL.reachedGenesis}));
     else sessionStorage.removeItem('zs_local');
   }catch(e){}   // quota or a privacy mode that blocks storage: degrade to in-memory only
 }
@@ -6172,7 +6187,8 @@ function localRestore(){
   try{
     const raw=sessionStorage.getItem('zs_local'); if(!raw) return;
     const d=JSON.parse(raw);
-    if(d&&Array.isArray(d.txs)&&d.txs.length){
+    if(!d || d.v!==LOCAL_SAVE_V){ sessionStorage.removeItem('zs_local'); return; }
+    if(Array.isArray(d.txs)&&d.txs.length){
       LOCAL={status:'ok', url:d.url||LOCAL_DEFAULT_URL, channel:d.channel||'', tip:d.tip||0,
              txs:d.txs, blocks:d.blocks||0, error:'', scanned:d.scanned||0,
              reachedGenesis:!!d.reachedGenesis};
@@ -6405,7 +6421,8 @@ function localPanel(){
   if(st==='error') return head+`<div class="lzerr">${esc(LOCAL.error)}</div></div>`;
   if(busy) return head+`<div class="lzbusy">${st==='connecting'?'opening socket…':('reading blocks… '+(LOCAL.scanned?num(LOCAL.scanned)+' scanned':''))}</div></div>`;
   if(st!=='ok') return head+'</div>';
-  const depth = LOCAL.reachedGenesis ? 'whole chain' : num(LOCAL.scanned||0)+' blocks back';
+  const depth = LOCAL.reachedGenesis ? 'whole chain'
+    : (LOCAL.scanned>0 ? num(LOCAL.scanned)+' blocks back' : 'unknown depth');
   return head+`<div class="lzok">connected · channel <span class="chex">${esc(sh(LOCAL.channel,8,6))}</span> · tip <b>#${num(LOCAL.tip)}</b> · scanned <b>${depth}</b> · <b>${num(LOCAL.txs.length)}</b> tx(s)</div></div>`;
 }
 function setZoneFilter(k){
@@ -7140,6 +7157,52 @@ mod tests {
             assert!(tag.contains(git), "tag must name the revision: {tag}");
             assert!(tag.contains(" · "), "version and revision should be separated: {tag}");
         }
+    }
+
+    // A `LOCAL_*` constant referenced by the dashboard script but never declared is a
+    // ReferenceError the moment that code path runs, and NOTHING else catches it: the Rust
+    // compiler does not read the script, and a JS syntax check happily accepts an undefined
+    // identifier. This shipped once - the walk was rewritten to use new constants while the
+    // edit that declared them was silently dropped, so connecting a local zone threw
+    // "LOCAL_TARGET_TXS is not defined". Narrow on purpose (only this project's own UI
+    // constants), so it has no false positives on prose in comments.
+    #[test]
+    fn dashboard_ui_constants_are_all_declared() {
+        let js: String = DASH_HTML
+            .split("<script")
+            .skip(1)
+            .filter_map(|b| b.split_once('>').and_then(|(_, r)| r.split("</script>").next()))
+            .collect();
+        let ident = |after: &str, hay: &str| -> Vec<String> {
+            let mut out = Vec::new();
+            for (i, _) in hay.match_indices(after) {
+                let rest = &hay[i + after.len()..];
+                let name: String =
+                    rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                if !name.is_empty() {
+                    out.push(format!("{}{}", after.trim_start(), name));
+                }
+            }
+            out
+        };
+        let declared: std::collections::HashSet<String> = ["const ", "let ", "var "]
+            .iter()
+            .flat_map(|kw| {
+                ident("LOCAL_", &js)
+                    .into_iter()
+                    .filter(|n| {
+                        js.contains(&format!("{kw}{n}=")) || js.contains(&format!("{kw}{n} ="))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut missing: Vec<String> = ident("LOCAL_", &js)
+            .into_iter()
+            .filter(|n| !declared.contains(n))
+            .collect();
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "referenced but never declared in the dashboard script: {missing:?}");
     }
 
     // The dashboard is assembled by string replacement, so a placeholder added to the HTML
