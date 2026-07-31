@@ -3,6 +3,26 @@
 Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a minor bump
 (`0.x`) carries new features, a patch bump (`0.x.y`) carries fixes.
 
+## [0.6.2] - 2026-07-31
+
+### Changed
+- The local zone loads progressively instead of scanning everything before showing anything.
+  Reading blocks is nearly free, but each batch is a ~200 KB upload to this server to be
+  decoded, measured at ~3.3s round trip over the internet against ~0.1s on loopback - and on a
+  chain with little activity the walk never reached its transaction target, so every connect
+  scanned the entire history. After a day of uptime that is ~35 round trips and around two
+  minutes with nothing on screen. Each batch now renders as it lands, a run stops after two
+  batches, and a "load older" control resumes from exactly where it paused.
+
+### Fixed
+- The connection error now names browser localhost blocking as a likely cause, and the panel
+  says so before you try. Brave Shields refuses connections to loopback by default, so this
+  feature fails with the sequencer running perfectly and nothing whatsoever reaching it, which
+  is impossible to guess from "is the sequencer running?".
+- A resume that walked a stretch of clock-only history reported "blocks were read but none
+  decoded as LEZ blocks" and tore down a working connection, because it judged the run by what
+  that batch alone produced rather than by what the zone already held.
+
 ## [0.6.1] - 2026-07-31
 
 ### Fixed
@@ -207,6 +227,7 @@ Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a m
 - First public release: dual Logos L1 `0.1.x` / `0.2.x` support, per-transaction decoding, the
   structural fingerprint classifier, and the multi-zone dashboard.
 
+[0.6.2]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.2
 [0.6.1]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.1
 [0.6.0]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.0
 [0.5.0]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.5.0

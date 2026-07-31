@@ -5311,6 +5311,9 @@ const DASH_HTML: &str = r#"<!doctype html>
   .lznrow b{color:var(--fg);font-weight:600}
   .lzni{flex:0 0 16px;text-align:center;font-family:var(--mono);color:var(--soft)}
   .lzbusy{margin-top:12px;font-size:12px;color:var(--muted)}
+  .lzmore{border:0;background:none;padding:0;font:inherit;color:var(--navy);font-weight:600;
+    cursor:pointer;text-decoration:underline}
+  .lzmore:hover{opacity:.75}
   /* Latest Transactions source tabs (network | local sequencer) */
   .ftabs{display:inline-flex;gap:4px;padding:8px 12px 0}
   .ftabs button{padding:5px 12px;border:1px solid var(--line);border-radius:6px;background:var(--panel);
@@ -6161,6 +6164,13 @@ const LOCAL_DEFAULT_URL='ws://127.0.0.1:3070';
 const LOCAL_TARGET_TXS=200;    // stop once this many non-clock txs are in hand
 const LOCAL_BATCH=500;         // blocks per getBlockRange and per decode call (server caps 512)
 const LOCAL_MAX_BLOCKS=20000;  // hard stop, so a huge chain cannot spin forever
+// Batches to read per run before pausing and offering "load more". Reading the chain is
+// nearly free, but each batch is a ~200 KB upload to THIS server to be decoded, measured at
+// ~3.3s round trip over the internet against ~0.1s on loopback. On a chain with little
+// activity the tx target is never reached, so without this bound every connect would walk the
+// whole history and show nothing until it finished - two minutes of blank screen after a day
+// of uptime. Results render as each batch lands instead.
+const LOCAL_RUN_BATCHES=2;
 // Clock ticks are kept only for the newest batch: they are the overwhelming majority of an
 // idle chain and would dominate memory on a long walk without adding anything displayable.
 const LOCAL_CLOCK_BATCHES=1;
@@ -6174,12 +6184,13 @@ let feedTab='network';
 // with its newer fields missing, which silently renders as nonsense (a chain saved before
 // `scanned` existed reported "scanned 0 blocks back" next to a full transaction list). Version
 // it so a mismatch is discarded and re-read instead of half-understood.
-const LOCAL_SAVE_V=2;
+const LOCAL_SAVE_V=3;
 function localSave(){
   try{
     if(LOCAL.status==='ok') sessionStorage.setItem('zs_local', JSON.stringify(
       {v:LOCAL_SAVE_V, url:LOCAL.url, channel:LOCAL.channel, tip:LOCAL.tip, blocks:LOCAL.blocks,
-       txs:LOCAL.txs, scanned:LOCAL.scanned, reachedGenesis:LOCAL.reachedGenesis}));
+       txs:LOCAL.txs, scanned:LOCAL.scanned, reachedGenesis:LOCAL.reachedGenesis,
+       low:LOCAL.low, batchIdx:LOCAL.batchIdx, realTxs:LOCAL.realTxs, more:LOCAL.more}));
     else sessionStorage.removeItem('zs_local');
   }catch(e){}   // quota or a privacy mode that blocks storage: degrade to in-memory only
 }
@@ -6191,7 +6202,8 @@ function localRestore(){
     if(Array.isArray(d.txs)&&d.txs.length){
       LOCAL={status:'ok', url:d.url||LOCAL_DEFAULT_URL, channel:d.channel||'', tip:d.tip||0,
              txs:d.txs, blocks:d.blocks||0, error:'', scanned:d.scanned||0,
-             reachedGenesis:!!d.reachedGenesis};
+             reachedGenesis:!!d.reachedGenesis, low:d.low||0, batchIdx:d.batchIdx||0,
+             realTxs:d.realTxs||0, more:!!d.more};
     }
   }catch(e){}
 }
@@ -6214,10 +6226,24 @@ function localRpc(ws, id, method, params){
   });
 }
 
-async function localConnect(){
+// Re-tag decoded blocks onto the pseudo-zone: txRows/txAction and the account, program and
+// token renderers all build links from t.channel, so this alone makes every link on a local
+// row point at /zone/localhost/... instead of a real channel the server would 404 on.
+function localTag(blocks, chan){
+  return blocks.flatMap(b=>(b.txs||[]).map(t=>Object.assign({}, t,
+    {block_id:b.block_id, timestamp:b.timestamp, channel:LOCAL_ZONE, channel_short:'local',
+     local_channel:chan})));
+}
+// Continue a walk that paused at its batch budget, from where it stopped. Returns the promise
+// so a caller can await the run; the UI fires it and forgets, rendering as batches land.
+function localMore(){ return localConnect(true); }
+
+async function localConnect(more){
   const input=$('localurl');
-  const url=(input&&input.value.trim())||LOCAL_DEFAULT_URL;
-  LOCAL={status:'connecting', url, channel:'', tip:0, txs:[], blocks:0, error:'', scanned:0, reachedGenesis:false};
+  const url=(more&&LOCAL.url)?LOCAL.url:((input&&input.value.trim())||LOCAL_DEFAULT_URL);
+  if(more) LOCAL=Object.assign({}, LOCAL, {status:'reading', error:''});
+  else LOCAL={status:'connecting', url, channel:'', tip:0, txs:[], blocks:0, error:'', scanned:0,
+              reachedGenesis:false, low:0, batchIdx:0, realTxs:0, more:false};
   try{ localStorage.setItem('zs_local_url', url); }catch(e){}
   renderSeqs();
   let ws;
@@ -6227,7 +6253,11 @@ async function localConnect(){
     ws.onopen=res;
     // A blocked or refused socket surfaces only as a generic error event — the browser
     // deliberately withholds the reason from script, so we cannot be more specific here.
-    ws.onerror=()=>rej(new Error('connection failed (is the sequencer running, and is that the right port?)'));
+    // The browser withholds the reason from script, so the message has to cover the likely
+    // causes. Browser localhost blocking is one of them and is easy to miss: Brave Shields
+    // refuses connections to loopback by default, so this fails with the sequencer running
+    // perfectly and nothing at all reaching it.
+    ws.onerror=()=>rej(new Error('connection failed. Check the sequencer is running on that port, and that your browser is not blocking localhost access (Brave blocks it by default: Shields > allow localhost connections).'));
     setTimeout(()=>rej(new Error('connection timed out')), 8000);
   });
   try{
@@ -6236,13 +6266,18 @@ async function localConnect(){
     const [channel, tip] = await Promise.all([
       localRpc(ws,1,'getChannelId'), localRpc(ws,2,'getLastBlockId')
     ]);
-    LOCAL.channel=String(channel||''); LOCAL.tip=Number(tip)||0;
+    LOCAL.channel=String(channel||''); if(!more) LOCAL.tip=Number(tip)||0;
 
     // Walk backwards a batch at a time, newest first, stopping as soon as enough real
     // transactions are in hand. On a busy chain that is the first batch; on an idle one it
     // keeps going until it finds them instead of reporting an empty zone.
-    const ok=[]; let real=0, scanned=0, low=LOCAL.tip+1, batchIdx=0, rpcId=100;
-    while(low>1 && real<LOCAL_TARGET_TXS && scanned<LOCAL_MAX_BLOCKS){
+    // `more` resumes a previous run from where it stopped instead of restarting at the tip.
+    const ok=[]; let real=LOCAL.realTxs||0, scanned=LOCAL.scanned||0, rpcId=100;
+    let low=(more&&LOCAL.low)?LOCAL.low:LOCAL.tip+1;
+    let batchIdx=(more&&LOCAL.batchIdx)?LOCAL.batchIdx:0;
+    const startedBatches=batchIdx;
+    while(low>1 && real<LOCAL_TARGET_TXS && scanned<LOCAL_MAX_BLOCKS
+          && (batchIdx-startedBatches)<LOCAL_RUN_BATCHES){
       const hi=low-1, lo=Math.max(1, hi-LOCAL_BATCH+1);
       let batch;
       try{ batch=await localRpc(ws, rpcId++, 'getBlockRange', [lo, hi]); }
@@ -6250,7 +6285,7 @@ async function localConnect(){
       if(!Array.isArray(batch)||!batch.length) break;
       const blocks=batch.filter(b=>typeof b==='string');
       if(!blocks.length) break;
-      scanned+=blocks.length; low=lo; LOCAL.scanned=scanned; renderSeqs();
+      scanned+=blocks.length; low=lo; LOCAL.scanned=scanned; LOCAL.low=low; renderSeqs();
       const r=await fetch('/api/decode',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({blocks, channel:LOCAL.channel})});
       if(!r.ok){
@@ -6263,25 +6298,32 @@ async function localConnect(){
       // Clock ticks are dropped outside the newest batch: they are ~99% of an idle chain and
       // cannot be displayed from further back anyway, but they would dominate memory.
       const keepClock = batchIdx<LOCAL_CLOCK_BATCHES;
+      const fresh=[];
       for(const b of got){
         real += (b.txs||[]).filter(t=>progName(t.program)!=='clock').length;
         const txs=(b.txs||[]).filter(t=>keepClock||progName(t.program)!=='clock');
-        if(txs.length) ok.push(Object.assign({}, b, {txs}));
+        if(txs.length){ ok.push(Object.assign({}, b, {txs})); fresh.push(Object.assign({}, b, {txs})); }
       }
       batchIdx++;
+      // Publish this batch before fetching the next one, so the first results appear after one
+      // round trip rather than after the whole walk.
+      LOCAL.blocks=(LOCAL.blocks||0)+fresh.length;
+      LOCAL.txs=(LOCAL.txs||[]).concat(localTag(fresh, LOCAL.channel));
+      LOCAL.txs.sort((a,b)=>(b.block_id||0)-(a.block_id||0));
+      LOCAL.realTxs=real; LOCAL.batchIdx=batchIdx; LOCAL.status='ok';
+      renderSeqs(); renderFeedTabs(); if(feedTab==='local') showLocalFeed();
     }
     ws.close();
-    LOCAL.scanned=scanned; LOCAL.reachedGenesis=(low<=1);
+    LOCAL.scanned=scanned; LOCAL.low=low; LOCAL.realTxs=real; LOCAL.batchIdx=batchIdx;
+    LOCAL.reachedGenesis=(low<=1);
+    // more history remains AND we stopped because this run's batch budget ran out
+    LOCAL.more = low>1 && real<LOCAL_TARGET_TXS && scanned<LOCAL_MAX_BLOCKS;
     if(!scanned){ LOCAL.status='error'; LOCAL.error='connected, but no blocks were returned'; return renderSeqs(); }
-    LOCAL.blocks=ok.length;
-    // Re-tag onto the pseudo-zone: txRows/txAction and the account, program and token
-    // renderers all build links from t.channel, so this alone makes every link on a local row
-    // point at /zone/localhost/... instead of a real channel the server would 404 on.
-    LOCAL.txs=ok.flatMap(b=>(b.txs||[]).map(t=>Object.assign({}, t,
-      {block_id:b.block_id, timestamp:b.timestamp, channel:LOCAL_ZONE, channel_short:'local', local_channel:LOCAL.channel})));
-    LOCAL.txs.sort((a,b)=>(b.block_id||0)-(a.block_id||0));
-    LOCAL.status = ok.length ? 'ok' : 'error';
-    if(!ok.length) LOCAL.error='blocks were read but none decoded as LEZ blocks';
+    // `ok` holds only what THIS run decoded. A resume that walks a stretch of clock-only
+    // history legitimately produces nothing to show, and must not tear down a connection that
+    // is already working - so only a first run with nothing at all is an error.
+    if(ok.length || LOCAL.txs.length) LOCAL.status='ok';
+    else { LOCAL.status='error'; LOCAL.error='blocks were read but none decoded as LEZ blocks'; }
     localSave();
     if(LOCAL.status==='ok'){ feedTab='local'; renderFeedTabs(); showLocalFeed(); }
   }catch(err){
@@ -6415,7 +6457,7 @@ function localPanel(){
       <button type="button" class="lzbtn${st==='ok'?' danger':' primary'}" onclick="${st==='ok'?'localDisconnect()':'localConnect()'}" ${busy?'disabled':''}>${st==='ok'?'Disconnect':(busy?'Reading…':'Connect')}</button>
     </div>
     <div class="lznote">
-      <div class="lznrow"><span class="lzni">↔</span><span>Connects from <b>your browser</b> to <b>your machine</b> over WebSocket - this server never reaches your sequencer.</span></div>
+      <div class="lznrow"><span class="lzni">↔</span><span>Connects from <b>your browser</b> to <b>your machine</b> over WebSocket - this server never reaches your sequencer. Some browsers block localhost by default (Brave: Shields &gt; allow localhost connections).</span></div>
       <div class="lznrow"><span class="lzni">⌗</span><span>Blocks are binary, so they are sent here <b>only to be decoded</b>. Nothing about your chain is stored.</span></div>
     </div>`;
   if(st==='error') return head+`<div class="lzerr">${esc(LOCAL.error)}</div></div>`;
@@ -6423,7 +6465,13 @@ function localPanel(){
   if(st!=='ok') return head+'</div>';
   const depth = LOCAL.reachedGenesis ? 'whole chain'
     : (LOCAL.scanned>0 ? num(LOCAL.scanned)+' blocks back' : 'unknown depth');
-  return head+`<div class="lzok">connected · channel <span class="chex">${esc(sh(LOCAL.channel,8,6))}</span> · tip <b>#${num(LOCAL.tip)}</b> · scanned <b>${depth}</b> · <b>${num(LOCAL.txs.length)}</b> tx(s)</div></div>`;
+  // A button, not an anchor. Two reasons: a bare hash href would terminate the Rust raw
+  // string this page lives in (quote followed by hash ends r-hash), and a button is the right
+  // element for an action that does not navigate.
+  const more = LOCAL.more
+    ? ` · <button type="button" class="lzmore" onclick="localMore()" title="read a further ${num(LOCAL_BATCH*LOCAL_RUN_BATCHES)} blocks">load older</button>`
+    : '';
+  return head+`<div class="lzok">connected · channel <span class="chex">${esc(sh(LOCAL.channel,8,6))}</span> · tip <b>#${num(LOCAL.tip)}</b> · scanned <b>${depth}</b> · <b>${num(LOCAL.txs.length)}</b> tx(s)${more}</div></div>`;
 }
 function setZoneFilter(k){
   zoneFilter=k; cur.seqShown=60;
