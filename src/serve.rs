@@ -6869,6 +6869,17 @@ async function renderWallet(addr,seq){
   let a; try{ const p=new URLSearchParams(); if(seq) p.set('channel',seq); filterParams(p); const qs=p.toString();
     a=await (await fetch('/api/account/'+u(addr)+(qs?'?'+qs:''))).json(); }catch(e){}
   if(!a){ $('view').innerHTML=crumb(base)+'<div class="panel"><div class="empty">account not found</div></div>'; return; }
+  // The endpoint answers for any well-formed id, so an unknown address arrives as an empty
+  // record. Say that plainly instead of rendering a page of zeroes that reads as a bug.
+  const empty = !(a.tx_count||0) && !(a.txs||[]).length && a.l1_balance==null && a.l2_balance==null
+                && !(a.channels||[]).length && !(a.holdings||[]).length;
+  if(empty){
+    $('view').innerHTML=crumb(base)+`<div class="panel"><div class="empty" style="padding:20px;line-height:1.6">
+      No activity for <span class="mono">${esc(addr)}</span>${seq?' on this zone':''}.<br>
+      <span class="mut">This address has no transactions, balance or token holdings in the scanned window. Check the address, or that its zone is tracked here.</span>
+    </div></div>`;
+    return;
+  }
   const muted=(t)=>`<span class="mut" style="font-size:14px;font-weight:400">${t}</span>`;
   const l2 = a.l2_balance!=null
     ? grp(a.l2_balance)+' <span class="mut" style="font-size:11px;font-weight:400">sequencer RPC</span>'
@@ -6923,12 +6934,41 @@ function route(){
 }
 
 // ---- search (route to the right page) ----
+// A 32-byte value written as hex is the SAME key an account id spells in base58, so a public
+// key pasted in hex form has to be offered as an account. Returns '' for anything that is not
+// 64 hex chars.
+function hexToB58(h){
+  if(!/^[0-9a-f]{64}$/.test(h)) return '';
+  const AL='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  let n=BigInt('0x'+h), out='';
+  while(n>0n){ out=AL[Number(n%58n)]+out; n/=58n; }
+  for(let i=0;i+1<h.length && h[i]==='0' && h[i+1]==='0'; i+=2) out='1'+out;  // leading zero bytes
+  return out||'1';
+}
+// True when the account has anything worth showing, so a hex string is only treated as an
+// account when it actually resolves to one.
+async function accountHasActivity(id){
+  try{
+    const a=await (await fetch('/api/account/'+u(id))).json();
+    return !!(a && ((a.tx_count||0)>0 || (a.txs||[]).length || a.l1_balance!=null
+                    || a.l2_balance!=null || (a.channels||[]).length));
+  }catch(e){ return false; }
+}
+
 async function doSearch(){
   const v=$('q').value.trim(); if(!v) return;
   if(/^(0x)?[0-9a-fA-F]{64}$/.test(v)){
+    // 64 hex chars is ambiguous: a tx hash, a channel id, or a public key in hex. Resolve in
+    // order of certainty and only then guess. Previously this fell straight through to the
+    // zone page, so pasting a public key produced a zone that does not exist: HTTP 200, no
+    // data, no error.
     const h=v.replace(/^0x/,'').toLowerCase();
     try{ const r=await fetch('/api/tx/'+u(h)); if(r.ok){ const t=await r.json(); location.href='/zone/'+u(t.channel)+'/tx/'+u(h); return; } }catch(e){}
-    location.href='/zone/'+u(h); return;       // treat as a channel id
+    // a channel we actually track is an exact, local check
+    if(((state&&state.sequencers)||[]).some(x=>x.channel===h)){ location.href='/zone/'+u(h); return; }
+    const b58=hexToB58(h);
+    if(b58 && await accountHasActivity(b58)){ location.href='/wallet/'+u(b58); return; }
+    location.href='/zone/'+u(h); return;       // nothing matched: keep the old behaviour
   }
   // non-hex id: a token DEFINITION -> the token page (its home channel), else an account.
   try{ const r=await (await fetch('/api/whatis/'+u(v))).json();

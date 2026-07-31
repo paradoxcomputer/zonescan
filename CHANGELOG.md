@@ -3,6 +3,20 @@
 Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a minor bump
 (`0.x`) carries new features, a patch bump (`0.x.y`) carries fixes.
 
+## [0.6.3] - 2026-07-31
+
+### Fixed
+- **Searching by a public key in hex form returned nothing** (issue #11). Any 64-character hex
+  string was treated as a transaction hash and then, failing that, as a channel id, so a public
+  key pasted in hex navigated to a zone that does not exist: HTTP 200, an empty page, no error.
+  A 32-byte value written in hex is the same key an account id spells in base58, so hex input
+  is now resolved in order of certainty: transaction hash, then a channel actually tracked
+  here, then the account it decodes to, and only then the previous zone fallback. Base58
+  addresses were never affected and behave exactly as before.
+- An address with no activity rendered a page of zeroes, which reads as a failure. The account
+  endpoint answers for any well-formed id, so an unknown address now says plainly that it has
+  no transactions, balance or holdings in the scanned window.
+
 ## [0.6.2] - 2026-07-31
 
 ### Changed
@@ -227,6 +241,7 @@ Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a m
 - First public release: dual Logos L1 `0.1.x` / `0.2.x` support, per-transaction decoding, the
   structural fingerprint classifier, and the multi-zone dashboard.
 
+[0.6.3]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.3
 [0.6.2]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.2
 [0.6.1]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.1
 [0.6.0]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.0
