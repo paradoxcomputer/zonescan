@@ -4190,11 +4190,12 @@ async fn api_txs(State(app): State<AppState>, Query(q): Query<TxQuery>) -> Json<
 
 /// Max blocks accepted in one `/api/decode` call. This is NOT the real cost bound - decode
 /// cost tracks bytes, which `DECODE_MAX_B64` already caps - it just bounds per-block overhead
-/// and response size. Measured: a mostly-clock block is ~0.4 KB of base64, so 64 blocks used
-/// barely 3% of the byte budget and forced a client walking any real history into hundreds of
-/// requests against the rate limit. 512 keeps one request's work modest (~0.13s measured)
-/// while letting the byte cap do the actual limiting.
-const DECODE_MAX_BLOCKS: usize = 512;
+/// and response size. A mostly-clock block is ~0.4 KB of base64, so 512 blocks came to ~200 KB,
+/// only a tenth of the byte budget, while every extra request cost the client a full network
+/// round trip (~1.1s measured to a remote server). Walking 2,200 blocks therefore took six
+/// requests and 18s, dominated by latency rather than work: the decode itself is ~0.26 ms per
+/// block, so even 2,048 blocks is ~0.5s of server time and still under the byte cap.
+const DECODE_MAX_BLOCKS: usize = 2048;
 /// Max total base64 accepted in one `/api/decode` call. Independent of the block cap: a few
 /// enormous blobs cost as much as many small ones. Kept in lockstep with the route's
 /// `DefaultBodyLimit` below — axum enforces its own limit first, and if that were the smaller
@@ -6161,20 +6162,38 @@ const LOCAL_DEFAULT_URL='ws://127.0.0.1:3070';
 // (measured at 0.003 ms/block against a local sequencer, ~15x cheaper than one getBlock per
 // block). The remaining cost is decode requests against the rate limit, which is why the walk
 // stops as soon as it has enough.
-const LOCAL_TARGET_TXS=200;    // stop once this many non-clock txs are in hand
-const LOCAL_BATCH=500;         // blocks per getBlockRange and per decode call (server caps 512)
+// Keep reading AUTOMATICALLY until this many real (non-clock) transactions are in hand. The
+// stop condition has to be "found something", not "read some blocks": a sequencer mints a
+// block on a timer whether or not anyone transacted, so a budget counted in blocks stops in
+// the middle of empty history and leaves the user clicking "load older" repeatedly to reach
+// their own transactions. Genesis or the safety cap also end the walk.
+const LOCAL_MIN_TXS=25;
+// Blocks per getBlockRange and per decode call (the server caps a request at 512). The first
+// batch is deliberately small: each batch is a ~200 KB upload to THIS server to be decoded,
+// measured at ~3.3s round trip over the internet against ~0.1s on loopback, so a small first
+// read puts the newest transactions on screen quickly, then later batches go wide.
+const LOCAL_FIRST_BATCH=150;
+const LOCAL_BATCH=2000;
 const LOCAL_MAX_BLOCKS=20000;  // hard stop, so a huge chain cannot spin forever
-// Batches to read per run before pausing and offering "load more". Reading the chain is
-// nearly free, but each batch is a ~200 KB upload to THIS server to be decoded, measured at
-// ~3.3s round trip over the internet against ~0.1s on loopback. On a chain with little
-// activity the tx target is never reached, so without this bound every connect would walk the
-// whole history and show nothing until it finished - two minutes of blank screen after a day
-// of uptime. Results render as each batch lands instead.
-const LOCAL_RUN_BATCHES=2;
+// "load older" is for going FURTHER back once something is already shown. It looks for this
+// many additional transactions, bounded so one click cannot run away.
+const LOCAL_MORE_TXS=25;
+const LOCAL_MORE_BATCHES=6;
 // Clock ticks are kept only for the newest batch: they are the overwhelming majority of an
 // idle chain and would dominate memory on a long walk without adding anything displayable.
 const LOCAL_CLOCK_BATCHES=1;
 let LOCAL={status:'idle', url:'', channel:'', tip:0, txs:[], blocks:0, error:''};
+// Names and ABIs the user attached to programs on THEIR OWN sequencer. These live in this
+// browser, never on the server: the server has never seen that chain, cannot validate against
+// it, and a private dev program has no business entering the shared registry. Kept as an
+// overlay on PROGS/SCHEMAS so every renderer picks them up without knowing they exist.
+//
+// Declared HERE, above the boot call to localProgsLoad() further down this block. `let` is
+// hoisted but not initialised, so a call that runs before this line throws
+// "Cannot access 'LOCAL_PROGS' before initialization" and takes the whole page with it - the
+// functions are hoisted safely, the binding is not.
+const LOCAL_PROGS_KEY='zs_local_progs';
+let LOCAL_PROGS={};
 // Which feed the Latest Transactions panel shows: the tracked network, or the local zone.
 let feedTab='network';
 // Every in-page link is a real navigation (full page load), so in-memory state would be gone
@@ -6209,6 +6228,7 @@ function localRestore(){
 }
 try{ LOCAL.url=localStorage.getItem('zs_local_url')||LOCAL_DEFAULT_URL; }catch(e){ LOCAL.url=LOCAL_DEFAULT_URL; }
 localRestore();
+localProgsLoad();
 
 // One JSON-RPC round trip over an open socket, keyed by id so replies can't be mismatched.
 function localRpc(ws, id, method, params){
@@ -6224,6 +6244,39 @@ function localRpc(ws, id, method, params){
     ws.addEventListener('message',on);
     ws.send(JSON.stringify({jsonrpc:'2.0', id, method, params:params||[]}));
   });
+}
+
+// A block's transaction count without decoding it. Borsh lays the header out at a fixed size
+// (block_id u64, two 32-byte hashes, timestamp u64, 64-byte signature = 144 bytes), and the
+// body's Vec length follows as a u32 LE at byte 144. So the first ~148 bytes answer "could
+// this block hold anything but a clock tick?", which is what decides whether it is worth
+// uploading. Returns null if the prefix cannot be read, and callers treat null as "send it".
+function blockTxCount(b64){
+  try{
+    const head = b64.length>200 ? b64.slice(0,200) : b64;   // 148 bytes needs 198 base64 chars
+    const bin = atob(head);
+    if(bin.length<148) return null;
+    return ((bin.charCodeAt(144)) | (bin.charCodeAt(145)<<8) |
+            (bin.charCodeAt(146)<<16) | (bin.charCodeAt(147)<<24)) >>> 0;
+  }catch(e){ return null; }
+}
+
+// Whether skipping single-transaction blocks is SAFE on this chain, established by observation
+// rather than assumption. Both conditions are checked against a batch that was uploaded in
+// full and decoded by the server:
+//   1. the header offset above really does yield each block's transaction count on this build;
+//   2. every block carries exactly one clock tick, so tx_count == 1 means clock-only.
+// A chain without a per-block clock, or a build whose header differs, fails this and keeps
+// uploading everything. Getting it wrong would silently hide transactions, so it has to be
+// earned on the evidence of a full batch.
+function clockOnlyIsSkippable(sentB64, decoded){
+  if(!sentB64.length || sentB64.length!==decoded.length) return false;
+  for(let i=0;i<decoded.length;i++){
+    const txs=decoded[i].txs||[];
+    if(blockTxCount(sentB64[i])!==txs.length) return false;          // offset does not hold
+    if(txs.filter(t=>progName(t.program)==='clock').length!==1) return false;  // no clock tick
+  }
+  return true;
 }
 
 // Re-tag decoded blocks onto the pseudo-zone: txRows/txAction and the account, program and
@@ -6243,7 +6296,8 @@ async function localConnect(more){
   const url=(more&&LOCAL.url)?LOCAL.url:((input&&input.value.trim())||LOCAL_DEFAULT_URL);
   if(more) LOCAL=Object.assign({}, LOCAL, {status:'reading', error:''});
   else LOCAL={status:'connecting', url, channel:'', tip:0, txs:[], blocks:0, error:'', scanned:0,
-              reachedGenesis:false, low:0, batchIdx:0, realTxs:0, more:false};
+              reachedGenesis:false, low:0, batchIdx:0, realTxs:0, more:false,
+              skipClockOnly:false, skipped:0, sentKB:0};
   try{ localStorage.setItem('zs_local_url', url); }catch(e){}
   renderSeqs();
   let ws;
@@ -6276,18 +6330,36 @@ async function localConnect(more){
     let low=(more&&LOCAL.low)?LOCAL.low:LOCAL.tip+1;
     let batchIdx=(more&&LOCAL.batchIdx)?LOCAL.batchIdx:0;
     const startedBatches=batchIdx;
-    while(low>1 && real<LOCAL_TARGET_TXS && scanned<LOCAL_MAX_BLOCKS
-          && (batchIdx-startedBatches)<LOCAL_RUN_BATCHES){
-      const hi=low-1, lo=Math.max(1, hi-LOCAL_BATCH+1);
+    // A first connect keeps going until it has found transactions; "load older" looks for a
+    // further slice and is bounded so a click cannot run away.
+    const want = more ? real+LOCAL_MORE_TXS : LOCAL_MIN_TXS;
+    while(low>1 && real<want && scanned<LOCAL_MAX_BLOCKS
+          && (!more || (batchIdx-startedBatches)<LOCAL_MORE_BATCHES)){
+      const size = batchIdx===0 ? LOCAL_FIRST_BATCH : LOCAL_BATCH;
+      const hi=low-1, lo=Math.max(1, hi-size+1);
       let batch;
       try{ batch=await localRpc(ws, rpcId++, 'getBlockRange', [lo, hi]); }
       catch(err){ if(!ok.length) throw err; break; }      // partial history beats none
       if(!Array.isArray(batch)||!batch.length) break;
-      const blocks=batch.filter(b=>typeof b==='string');
-      if(!blocks.length) break;
-      scanned+=blocks.length; low=lo; LOCAL.scanned=scanned; LOCAL.low=low; renderSeqs();
+      const all=batch.filter(b=>typeof b==='string');
+      if(!all.length) break;
+      scanned+=all.length; low=lo; LOCAL.scanned=scanned; LOCAL.low=low; renderSeqs();
+
+      // Upload only what could carry something displayable. On a chain proven to tick a clock
+      // every block, a single-transaction block is that tick and nothing else, so sending it
+      // costs bandwidth to learn what we already know. This is the difference between pushing
+      // the whole chain and pushing the handful of blocks that matter: ~800 KB versus a few,
+      // over an uplink measured at ~80-100 KB/s.
+      const blocks = LOCAL.skipClockOnly
+        ? all.filter(b=>{ const n=blockTxCount(b); return n===null || n>1; })
+        : all;
+      LOCAL.skipped=(LOCAL.skipped||0)+(all.length-blocks.length);
+      if(!blocks.length){ batchIdx++; continue; }        // nothing worth a round trip
+
+      const body=JSON.stringify({blocks, channel:LOCAL.channel});
+      LOCAL.sentKB=(LOCAL.sentKB||0)+Math.round(body.length/1024);
       const r=await fetch('/api/decode',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({blocks, channel:LOCAL.channel})});
+        body});
       if(!r.ok){
         if(ok.length) break;                             // keep whatever already decoded
         LOCAL.status='error';
@@ -6295,6 +6367,8 @@ async function localConnect(more){
         return renderSeqs();
       }
       const got=((await r.json()).blocks||[]).filter(b=>b&&b.ok);
+      // Calibrate on the FIRST batch, which is always sent in full and so is a fair sample.
+      if(batchIdx===0 && !more) LOCAL.skipClockOnly=clockOnlyIsSkippable(blocks, got);
       // Clock ticks are dropped outside the newest batch: they are ~99% of an idle chain and
       // cannot be displayed from further back anyway, but they would dominate memory.
       const keepClock = batchIdx<LOCAL_CLOCK_BATCHES;
@@ -6316,8 +6390,9 @@ async function localConnect(more){
     ws.close();
     LOCAL.scanned=scanned; LOCAL.low=low; LOCAL.realTxs=real; LOCAL.batchIdx=batchIdx;
     LOCAL.reachedGenesis=(low<=1);
-    // more history remains AND we stopped because this run's batch budget ran out
-    LOCAL.more = low>1 && real<LOCAL_TARGET_TXS && scanned<LOCAL_MAX_BLOCKS;
+    // "load older" is offered whenever older history exists at all, since the automatic walk
+    // stops on finding transactions rather than on exhausting the chain.
+    LOCAL.more = low>1 && scanned<LOCAL_MAX_BLOCKS;
     if(!scanned){ LOCAL.status='error'; LOCAL.error='connected, but no blocks were returned'; return renderSeqs(); }
     // `ok` holds only what THIS run decoded. A resume that walks a stretch of clock-only
     // history legitimately produces nothing to show, and must not tear down a connection that
@@ -6469,7 +6544,7 @@ function localPanel(){
   // string this page lives in (quote followed by hash ends r-hash), and a button is the right
   // element for an action that does not navigate.
   const more = LOCAL.more
-    ? ` · <button type="button" class="lzmore" onclick="localMore()" title="read a further ${num(LOCAL_BATCH*LOCAL_RUN_BATCHES)} blocks">load older</button>`
+    ? ` · <button type="button" class="lzmore" onclick="localMore()" title="keep reading back through older blocks for more transactions">load older</button>`
     : '';
   return head+`<div class="lzok">connected · channel <span class="chex">${esc(sh(LOCAL.channel,8,6))}</span> · tip <b>#${num(LOCAL.tip)}</b> · scanned <b>${depth}</b> · <b>${num(LOCAL.txs.length)}</b> tx(s)${more}</div></div>`;
 }
@@ -6755,21 +6830,34 @@ async function renderProgram(seq,prog){
 function schemaPanel(seq,prog){
   const isCustom = prog && /^[0-9a-f]{64}$/i.test(prog);
   const have = SCHEMAS[prog];
-  if(have) return `<div class="panel" style="margin-bottom:16px"><div class="phead">Instruction schema</div>
-    <div style="padding:16px"><div class="mut" style="font-size:12px;margin-bottom:8px">A schema is registered - instructions decode into typed fields.</div>
+  const mine = seq===LOCAL_ZONE;                 // a program on the viewer's own sequencer
+  const local = !!(LOCAL_PROGS[prog] && (LOCAL_PROGS[prog].instruction||LOCAL_PROGS[prog].name));
+  if(have) return `<div class="panel" style="margin-bottom:16px"><div class="phead">Instruction schema${local?' <span class="count">saved in this browser</span>':''}</div>
+    <div style="padding:16px"><div class="mut" style="font-size:12px;margin-bottom:8px">${local
+      ? 'You set this schema for your local program. It is stored in this browser only, never sent to the server.'
+      : 'A schema is registered - instructions decode into typed fields.'}</div>
     <pre class="mono" style="font-size:12px;background:var(--panel2,#f4f4f5);padding:10px;border-radius:6px;overflow:auto;margin:0;white-space:pre-wrap;word-break:break-all">${esc(JSON.stringify(have))}</pre></div></div>`;
   if(!isCustom) return '';
-  return `<div class="panel" style="margin-bottom:16px"><div class="phead">Instruction schema (ABI) <span class="count">propose</span></div>
+  return `<div class="panel" style="margin-bottom:16px"><div class="phead">${mine?'Name this program (ABI)':'Instruction schema (ABI)'} <span class="count">${mine?'your sequencer':'propose'}</span></div>
     <div style="padding:16px">
-      <div class="hint" style="margin-bottom:8px">No schema yet, so instructions show as raw words. Anyone can propose one - paste the program's <b>instruction type</b>. It's accepted only if it decodes this program's <b>real on-chain instructions exactly</b>. Examples: <code>{"struct":[{"name":"message","type":"bytes"}]}</code> · <code>{"enum":[{"name":"Greet","fields":[{"name":"msg","type":"string"}]}]}</code></div>
-      ${!PROGS[prog] ? `<input id="schemaname" type="text" maxlength="32" placeholder="program name alias (optional) - e.g. my_token" title="registered alongside the schema only if it validates and this program is still unnamed" style="width:100%;box-sizing:border-box;font-size:13px;padding:8px;border:1px solid var(--line2);border-radius:6px;margin-bottom:8px">` : ''}
+      <div class="hint" style="margin-bottom:8px">${mine
+        ? 'This program is on <b>your</b> sequencer, so give it a name and, if you like, its instruction type. A name alone is enough. Anything you add is checked against your own chain and <b>saved in this browser</b> - it is never sent to the server, which has never seen this chain.'
+        : 'No schema yet, so instructions show as raw words. Anyone can propose one - paste the program\'s <b>instruction type</b>. It\'s accepted only if it decodes this program\'s <b>real on-chain instructions exactly</b>.'} Examples: <code>{"struct":[{"name":"message","type":"bytes"}]}</code> · <code>{"enum":[{"name":"Greet","fields":[{"name":"msg","type":"string"}]}]}</code></div>
+      ${(mine || !PROGS[prog]) ? `<input id="schemaname" type="text" maxlength="32" value="${esc((LOCAL_PROGS[prog]&&LOCAL_PROGS[prog].name)||'')}" placeholder="program name${mine?'':' alias (optional)'} - e.g. my_token" title="${mine?'the name you want to see for this program':'registered alongside the schema only if it validates and this program is still unnamed'}" style="width:100%;box-sizing:border-box;font-size:13px;padding:8px;border:1px solid var(--line2);border-radius:6px;margin-bottom:8px">` : ''}
       <textarea id="schemainput" rows="3" placeholder='{"struct":[{"name":"message","type":"bytes"}]}' style="width:100%;box-sizing:border-box;font-family:var(--mono);font-size:12px;padding:9px;border:1px solid var(--line2);border-radius:6px"></textarea>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="kbtn" onclick="previewSchema('${esc(seq)}','${esc(prog)}')">Preview</button>
-        <button class="kbtn sel" onclick="submitSchema('${esc(seq)}','${esc(prog)}')">Validate &amp; submit</button>
+        <button class="kbtn sel" onclick="submitSchema('${esc(seq)}','${esc(prog)}')">${mine?'Save':'Validate &amp; submit'}</button>
+        ${mine&&local?`<button class="kbtn" onclick="forgetLocalProg('${esc(prog)}')">Forget</button>`:''}
         <span id="schemamsg" style="font-size:12px"></span></div>
       <div id="schemapreview" style="margin-top:8px"></div>
     </div></div>`;
+}
+// Drop a local program's name/ABI. Only ever touches this browser's own store.
+function forgetLocalProg(prog){
+  delete LOCAL_PROGS[prog]; localProgsSave();
+  delete PROGS[prog]; delete SCHEMAS[prog];       // clear the overlay copies too
+  loadProgs().then(loadSchemas).then(()=>renderProgram(LOCAL_ZONE,prog));
 }
 function getSchemaInput(){ try{ const v=$('schemainput').value.trim(); return v?JSON.parse(v):null; }catch(e){ return undefined; } }
 async function previewSchema(seq,prog){
@@ -6786,7 +6874,42 @@ async function previewSchema(seq,prog){
     el.innerHTML=rows||'<span class="mut">no instructions to preview</span>';
   }catch(e){ el.innerHTML='<span class="mut">preview failed</span>'; }
 }
+// Saving a name/ABI for a program on the viewer's OWN sequencer. The server cannot help:
+// it has never seen this chain, so it has nothing to validate against. Validate here instead,
+// against the instructions already decoded in this browser, using the very same decoder the
+// Preview button uses - so "accepted" means exactly what it means for a tracked zone: the
+// schema consumes every word of every real instruction.
+async function submitLocalSchema(prog){
+  const msg=$('schemamsg'), nameEl=$('schemaname');
+  const name=nameEl?nameEl.value.trim().slice(0,32):'';
+  const sc=getSchemaInput();
+  if(sc===undefined){ msg.innerHTML='<span style="color:var(--red)">invalid JSON</span>'; return; }
+  if(sc===null && !name){ msg.innerHTML='<span class="mut">paste a schema, or type a name</span>'; return; }
+  let passed=0, tested=0;
+  if(sc){
+    msg.textContent='validating against your chain…';
+    let txs=[];
+    try{ txs=await (await fetch('/api/txs?channel='+u(LOCAL_ZONE)+'&program='+u(prog)+'&clock=1&limit=40')).json(); }catch(e){}
+    const samples=[...new Set(txs.filter(t=>t.instruction_data&&t.instruction_data.length)
+                                 .map(t=>JSON.stringify(t.instruction_data)))].map(JSON.parse);
+    if(!samples.length){ msg.innerHTML='<span style="color:var(--red)">no instructions from this program in the blocks read, so there is nothing to validate against</span>'; return; }
+    tested=samples.length;
+    passed=samples.filter(w=>{ try{ return r0dec(w,sc,0).p===w.length; }catch(e){ return false; } }).length;
+    if(passed!==tested){
+      msg.innerHTML='<span style="color:var(--red)">rejected: decodes '+passed+' of '+tested+' real instructions</span>';
+      return;
+    }
+  }
+  const prev=LOCAL_PROGS[prog]||{};
+  LOCAL_PROGS[prog]={name:name||prev.name||'', instruction:sc||prev.instruction||null};
+  localProgsSave(); localProgsApply();
+  const bits=[]; if(sc) bits.push('schema accepted ('+passed+'/'+tested+')'); if(name) bits.push('named &ldquo;'+esc(name)+'&rdquo;');
+  msg.innerHTML='<span style="color:var(--green)">✓ '+bits.join(' · ')+' - saved in this browser</span>';
+  setTimeout(()=>renderProgram(LOCAL_ZONE,prog),900);
+}
+
 async function submitSchema(seq,prog){
+  if(seq===LOCAL_ZONE) return submitLocalSchema(prog);
   const sc=getSchemaInput(), msg=$('schemamsg');
   if(sc===undefined){ msg.innerHTML='<span style="color:var(--red)">invalid JSON</span>'; return; }
   if(sc===null){ msg.innerHTML='<span class="mut">paste a schema first</span>'; return; }
@@ -6980,9 +7103,24 @@ $('q').addEventListener('keydown',e=>{ if(e.key==='Enter') doSearch(); });
 
 // ---- init + live ----
 async function loadState(){ try{ state=await (await fetch('/api/state')).json(); renderHeader(); }catch(e){} }
-async function loadProgs(){ try{ PROGS=await (await fetch('/api/programs')).json()||{}; }catch(e){} }
+function localProgsLoad(){
+  try{ LOCAL_PROGS=JSON.parse(localStorage.getItem(LOCAL_PROGS_KEY)||'{}')||{}; }catch(e){ LOCAL_PROGS={}; }
+}
+function localProgsSave(){
+  try{ localStorage.setItem(LOCAL_PROGS_KEY, JSON.stringify(LOCAL_PROGS)); }catch(e){}
+}
+// Fill gaps only: a program the sequencer registry already names keeps that name, so a local
+// label can never shadow a real one.
+function localProgsApply(){
+  for(const id in LOCAL_PROGS){
+    const v=LOCAL_PROGS[id]||{};
+    if(v.name && !PROGS[id]) PROGS[id]=v.name;
+    if(v.instruction && !SCHEMAS[id]) SCHEMAS[id]=v.instruction;
+  }
+}
+async function loadProgs(){ try{ PROGS=await (await fetch('/api/programs')).json()||{}; }catch(e){} localProgsApply(); }
 async function loadGuesses(){ try{ GUESS=await (await fetch('/api/program_guesses')).json()||{}; }catch(e){} }
-async function loadSchemas(){ try{ SCHEMAS=await (await fetch('/api/schemas')).json()||{}; }catch(e){} }
+async function loadSchemas(){ try{ SCHEMAS=await (await fetch('/api/schemas')).json()||{}; }catch(e){} localProgsApply(); }
 const es=new EventSource('/events');
 es.onmessage=(e)=>{ try{ const m=JSON.parse(e.data);
   if(m.t==='snap'){ state=m.d; renderHeader();

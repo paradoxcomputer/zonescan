@@ -3,6 +3,42 @@
 Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a minor bump
 (`0.x`) carries new features, a patch bump (`0.x.y`) carries fixes.
 
+## [0.7.0] - 2026-08-03
+
+### Added
+- **Name your own programs, and give them an ABI.** A program on your local sequencer can now
+  be given a name and an instruction schema from its program page, so its transactions read as
+  something meaningful instead of a raw 64-hex id. A name alone is enough; the schema is
+  optional. Both are validated against your own chain using the same decoder the Preview button
+  uses, so "accepted" means the same thing it does for a tracked zone: the schema consumes
+  every word of every real instruction. Anything you add is **stored in this browser only** and
+  never sent to the server, which has never seen that chain and could not validate it anyway.
+  Local entries fill gaps only, so they can never shadow a name the sequencer registry already
+  provides, and a "Forget" button removes them.
+
+### Changed
+- The local zone keeps reading until it actually finds transactions, instead of stopping after
+  a fixed number of blocks and leaving you to press "load older" repeatedly. A sequencer mints
+  a block on a timer whether or not anyone transacted, so a budget counted in blocks stops in
+  the middle of empty history: on an idle chain the newest ~2,150 blocks held nothing, so every
+  click bought another stretch of clock ticks. The walk now ends on finding transactions,
+  reaching genesis, or the safety cap. "load older" remains for going further back by choice.
+- The local zone now uploads only the blocks that could hold something displayable, cutting
+  what crosses the network by ~93% (measured: 950 KB down to 68 KB for a 2,373-block chain,
+  2,214 blocks skipped). A block's transaction count sits at a fixed header offset, so the
+  client reads it from the first ~148 bytes without decoding anything; on a chain that ticks a
+  clock every block, a single-transaction block is that tick and nothing else. Both conditions
+  are established by observation, never assumed: the first batch is uploaded in full, and the
+  skip is enabled only if the header offset really did yield each block's count AND every block
+  carried exactly one clock tick. A chain without a per-block clock, or a build with a
+  different header, keeps uploading everything. Verified to find an identical set of
+  transactions with the filter on and off.
+- Fewer, larger decode requests. A 512-block batch came to ~200 KB, a tenth of the 2 MB byte
+  budget, while each extra request cost a full network round trip (~1.1s measured to a remote
+  server): walking 2,200 blocks took six requests and 18s, dominated by latency rather than
+  work. The cap is now 2,048 blocks, which is ~0.5s of server time and still inside the byte
+  cap. The first batch stays small so the newest transactions appear quickly.
+
 ## [0.6.3] - 2026-07-31
 
 ### Fixed
@@ -241,6 +277,7 @@ Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a m
 - First public release: dual Logos L1 `0.1.x` / `0.2.x` support, per-transaction decoding, the
   structural fingerprint classifier, and the multi-zone dashboard.
 
+[0.7.0]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.7.0
 [0.6.3]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.3
 [0.6.2]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.2
 [0.6.1]: https://github.com/paradoxcomputer/zonescan/releases/tag/v0.6.1
