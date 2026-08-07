@@ -222,6 +222,7 @@ async fn main() -> Result<()> {
                     channel_id: c.to_string(),
                     rpc_url: String::new(),
                     full: false,
+                    funding_key: String::new(),
                     discovered: false,
                     data_channel: false,
                 })
@@ -838,7 +839,12 @@ fn decode_block_detail(
                 // later by relabel_privacy() from the balance delta. Tentative here: no
                 // public account => private send; otherwise default to shield (the first
                 // public-touching op must be a deposit), refined once a prior balance is known.
-                let subtype = if pp.message.public_account_ids.is_empty() {
+                // LEZ v0.2.2 bundled the flat parallel vectors into action structs: the public
+                // side is `public_actions` (account_id + post_state, so id and balance no longer
+                // have to be zipped by position), and the private side is `private_actions`,
+                // each carrying its own nullifier / commitment / encrypted_post_state.
+                // `public_account_ids` is a method now, not a field.
+                let subtype = if pp.message.public_actions.is_empty() {
                     "private-send"
                 } else {
                     "shield"
@@ -847,18 +853,33 @@ fn decode_block_detail(
                     hash: hex::encode(pp.hash()),
                     kind: "private".into(),
                     subtype: subtype.into(),
-                    accounts: pp.message.public_account_ids.iter().map(|a| format!("{a:?}")).collect(),
-                    nullifiers: pp.message.new_nullifiers.iter().map(|(n, _)| format!("{n:?}")).collect(),
-                    commitments: pp.message.new_commitments.iter().map(|c| format!("{c:?}")).collect(),
-                    encrypted_outputs: Some(pp.message.encrypted_private_post_states.len()),
+                    accounts: pp
+                        .message
+                        .public_actions
+                        .iter()
+                        .map(|a| format!("{:?}", a.account_id))
+                        .collect(),
+                    nullifiers: pp
+                        .message
+                        .private_actions
+                        .iter()
+                        .map(|a| format!("{:?}", a.nullifier))
+                        .collect(),
+                    commitments: pp
+                        .message
+                        .private_actions
+                        .iter()
+                        .map(|a| format!("{:?}", a.commitment))
+                        .collect(),
+                    // one encrypted post-state per private action
+                    encrypted_outputs: Some(pp.message.private_actions.len()),
                     post_states: pp
                         .message
-                        .public_account_ids
+                        .public_actions
                         .iter()
-                        .zip(pp.message.public_post_states.iter())
-                        .map(|(id, acc)| AcctState {
-                            id: format!("{id:?}"),
-                            balance: acc.balance.to_string(),
+                        .map(|a| AcctState {
+                            id: format!("{:?}", a.account_id),
+                            balance: a.post_state.balance.to_string(),
                         })
                         .collect(),
                     ..Default::default()
@@ -961,7 +982,17 @@ fn builtin_program_ids_raw() -> Vec<([u32; 8], &'static str)> {
     ]
 }
 
-/// The built-in program ids (hex) -> name, computed from our (v0.2.0) build. Lets the
+/// The LEZ release whose crates this binary links its decoder against, and therefore the
+/// exact version a zone is running when its deployed program image ids match the built-ins
+/// below. Image ids are content hashes of the guest binaries, so an id match is an exact
+/// release match, not a family match - which is why this is the full `vX.Y.Z` and not a
+/// `v0.2`-style prefix.
+///
+/// MUST equal the `tag = "…"` pinned on the LEZ git dependencies in Cargo.toml;
+/// `linked_lez_version_matches_the_cargo_pin` fails the build if a retag forgets this.
+pub const LINKED_LEZ_VERSION: &str = "v0.2.4";
+
+/// The built-in program ids (hex) -> name, computed from our linked LEZ build. Lets the
 /// server name programs without a reachable sequencer `getProgramIds` RPC, and resolve
 /// ids stored as raw hex by an older build (e.g. the clock `625e7b…`). Unfiltered: the
 /// serve-side name map layers deployment tables OVER this (see program_name_map).
@@ -1169,14 +1200,27 @@ pub fn info_mode(v: &Value) -> Option<String> {
     }
 }
 
-/// Detect the L1 node's REST API version family from a `/cryptarchia/info` response.
-/// v0.2.x wraps the fields in a nested `cryptarchia_info` object and/or carries a `mode`
-/// field; 0.1.x returned them flat (`{lib,lib_slot,tip,slot,height}`) with no `mode`.
-/// Pure + version-agnostic: defaults to "0.1.x" for the flat/legacy shape.
+/// Detect the L1 node's REST API version from a `/cryptarchia/info` response.
+///
+/// The node exposes no version endpoint and no version field, so this is inferred from the
+/// response SHAPE. Each step below is a field that a specific bedrock revision added, checked
+/// against the two revisions themselves:
+///   * `0.2.1+` - the response became `ChainServiceInfo { cryptarchia_info, phase }` and
+///     `CryptarchiaInfo` gained `state`. Both exist only from bedrock `0dc34e2c` (2026-07-30),
+///     which is what blockchain_module 0.2.1 ships; neither exists in `d8711bbc` (0.2.0).
+///   * `0.2.0` - nested `cryptarchia_info`, or a `mode` field, but no `phase`/`state`.
+///   * `0.1.x` - the legacy flat shape (`{lib,lib_slot,tip,slot,height}`), the default.
+///
+/// The "+" on 0.2.1 is deliberate and load-bearing: 0.2.1 and any later release sharing this
+/// shape are indistinguishable over HTTP, so claiming a bare "0.2.1" would be asserting more
+/// than the response actually proves.
 pub fn info_l1_version(v: &Value) -> &'static str {
-    let nested = v.get("cryptarchia_info").is_some_and(Value::is_object);
-    if nested || v.get("mode").is_some() {
-        "0.2.x"
+    let info = v.get("cryptarchia_info");
+    let nested = info.is_some_and(Value::is_object);
+    if v.get("phase").is_some() || info.and_then(|i| i.get("state")).is_some() {
+        "0.2.1+"
+    } else if nested || v.get("mode").is_some() {
+        "0.2.0"
     } else {
         "0.1.x"
     }
@@ -1290,16 +1334,23 @@ mod tests {
 
     #[test]
     fn info_l1_version_detects_v01_flat_and_v02_nested() {
-        // v0.2.x: nested `cryptarchia_info` object and/or a `mode` field.
-        let v02 = json!({
-            "cryptarchia_info": {"lib":"ab","lib_slot":40,"tip":"cd","slot":42,"height":7},
-            "mode": {"Started":"Online"}
-        });
-        assert_eq!(info_l1_version(&v02), "0.2.x");
-        // the `mode` field alone (any shape) is enough to detect v0.2.x.
-        assert_eq!(info_l1_version(&json!({"mode":"AwaitingStart"})), "0.2.x");
-        // 0.1.x: flat fields, no wrapper, no `mode` => the legacy default.
-        let v01 = json!({"lib":"ab","lib_slot":40,"tip":"cd","slot":42,"height":7});
+        // 0.2.1+: the response gained the `phase` wrapper and `cryptarchia_info.state`.
+        // Both are real fields from bedrock 0dc34e2c, which blockchain_module 0.2.1 ships.
+        let v021 = json!({"cryptarchia_info":{"lib":"a","lib_slot":1,"tip":"b","slot":2,"height":3,"state":"Online"},"phase":"Following"});
+        assert_eq!(info_l1_version(&v021), "0.2.1+");
+        // `phase` alone is enough, and so is `state` alone.
+        assert_eq!(info_l1_version(&json!({"phase":"Following"})), "0.2.1+");
+        assert_eq!(
+            info_l1_version(&json!({"cryptarchia_info":{"state":"Bootstrapping"}})),
+            "0.2.1+"
+        );
+        // 0.2.0: nested, but neither of those fields.
+        let v02 = json!({"cryptarchia_info":{"lib":"a","lib_slot":1,"tip":"b","slot":2,"height":3}});
+        assert_eq!(info_l1_version(&v02), "0.2.0");
+        // the `mode` field alone (any shape) still reads as 0.2.0, not 0.1.x.
+        assert_eq!(info_l1_version(&json!({"mode":"AwaitingStart"})), "0.2.0");
+        // 0.1.x: the legacy flat shape.
+        let v01 = json!({"lib":"a","lib_slot":1,"tip":"b","slot":2,"height":3});
         assert_eq!(info_l1_version(&v01), "0.1.x");
     }
 
@@ -1463,19 +1514,127 @@ mod tests {
     }
 
     // A real settled clock block from the netcup L1 (rc5). Its single tx is the clock
-    // invocation. Under the v0.2.0-linked build this id (`884e693a…`) IS the stock
-    // clock image id (the clock guest is byte-identical across builds), so decode now
-    // resolves it to the NAME "clock" — which also proves the LE-byte id computation:
-    // a `{w:08x}` word-form regression would miss the map and fall back to hex.
+    // invocation, whose image id is `884e693a…`.
+    //
+    // This used to assert the NAME "clock", because the rc5 clock guest happened to be
+    // byte-identical to the stock v0.2.0 one. LEZ v0.2.1/v0.2.2 rebuilt the guests, so
+    // that coincidence is gone and an rc5 id now falls back to hex here - the serve-side
+    // RC5_PROGRAMS table is what names it for the frozen rc5 zones. What this fixture
+    // still guards is the LE-byte id computation: a `{w:08x}` word-form regression would
+    // render a DIFFERENT string, so pinning the exact hex keeps that covered.
     #[cfg(feature = "decode")]
     #[test]
     fn decodes_live_rc5_clock_program_id_as_le_bytes() {
         let fixture = "a205000000000000c397231c0f850a31916dc58702b1e10d434d1c8626905aa462bac626d2705621931180c4e7eac93beaa51ec66ff8f11a413c876b02f5bba161e7300c457353e66f3fc11d9f0100009df1300f0f147dd0e518116563d052d157901f1fbaab01f5293712eeb3b829399e67037055062e92dde94ce714b713a7db0db6458b0231189fc3f2dbcc1d8e620100000000884e693a302d57de1ac4c405ca5bea1df707d1de11d9f87de51b78845aa98e63030000002f4c455a2f436c6f636b50726f6772616d4163636f756e742f303030303030312f4c455a2f436c6f636b50726f6772616d4163636f756e742f303030303031302f4c455a2f436c6f636b50726f6772616d4163636f756e742f3030303030353000000000020000006f3fc11d9f0100000000000000";
         let d = decode_inscription(&Value::String(fixture.into())).expect("rc5 clock block decodes");
         let progs: Vec<Option<String>> = d.txs.iter().map(|t| t.program.clone()).collect();
+        const LIVE_CLOCK_ID: &str =
+            "884e693a302d57de1ac4c405ca5bea1df707d1de11d9f87de51b78845aa98e63";
         assert!(
-            d.txs.iter().any(|t| t.program.as_deref() == Some("clock")),
-            "live clock id must resolve to the linked build's 'clock'; got {progs:?}"
+            d.txs.iter().any(|t| t.program.as_deref() == Some(LIVE_CLOCK_ID)
+                || t.program.as_deref() == Some("clock")),
+            "live clock id must render as the LE-byte hex {LIVE_CLOCK_ID} (or resolve to \
+             'clock' if a future retag makes the guest byte-identical again); got {progs:?}"
+        );
+    }
+
+    // The v0.2.2 privacy-preserving decode path, exercised end to end over borsh.
+    //
+    // v0.2.2 replaced the message's flat parallel vectors (public_account_ids /
+    // public_post_states / new_nullifiers / new_commitments / encrypted_private_post_states)
+    // with two action vectors, so the decoder no longer zips ids to balances by POSITION -
+    // each PublicActionWithID carries its own account_id and post_state. A regression that
+    // reintroduced positional pairing would still compile, so this builds a block whose two
+    // public actions have deliberately MISMATCHED orderings of id and balance and asserts
+    // each id keeps its own balance.
+    //
+    // The chain's own clock traffic is all Public, so nothing in production exercises this
+    // branch until someone shields or deshields - hence a constructed fixture.
+    // The version badge is only honest if the constant tracks the crates actually linked.
+    // A retag that updates Cargo.toml but forgets LINKED_LEZ_VERSION would silently label
+    // every zone with the previous release, so read the pin back out of the manifest.
+    #[test]
+    fn linked_lez_version_matches_the_cargo_pin() {
+        let manifest = include_str!("../Cargo.toml");
+        let pins: Vec<&str> = manifest
+            .lines()
+            .filter(|l| l.contains("logos-execution-zone.git"))
+            .filter_map(|l| l.split("tag = \"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert!(!pins.is_empty(), "no LEZ git dependency found in Cargo.toml");
+        for tag in &pins {
+            assert_eq!(
+                *tag, LINKED_LEZ_VERSION,
+                "Cargo.toml pins LEZ {tag} but LINKED_LEZ_VERSION says {LINKED_LEZ_VERSION}"
+            );
+        }
+    }
+
+    #[cfg(feature = "decode")]
+    #[test]
+    fn decodes_v022_privacy_preserving_actions() {
+        use borsh::BorshSerialize as _;
+        use common::transaction::LeeTransaction;
+        use lee::privacy_preserving_transaction::message::PublicActionWithID;
+        use lee::privacy_preserving_transaction::{Message, PrivacyPreservingTransaction};
+
+        // two public accounts, distinct balances, so a positional mix-up is visible
+        let mk_public = |id_byte: u8, balance: lee::Balance| {
+            let acct = lee::Account { balance, ..Default::default() };
+            PublicActionWithID { account_id: lee::AccountId::new([id_byte; 32]), post_state: acct }
+        };
+        let message = Message {
+            public_actions: vec![mk_public(0xAA, 111), mk_public(0xBB, 222)],
+            private_actions: vec![
+                lee_core::PrivateAction::default(),
+                lee_core::PrivateAction::default(),
+                lee_core::PrivateAction::default(),
+            ],
+            ..Default::default()
+        };
+        // WitnessSet's fields are pub(crate) and it has no Default, but its borsh layout is
+        // an empty signature vec + an empty proof vec = eight zero bytes. The decoder never
+        // reads it; it only has to round-trip.
+        let witness = <lee::privacy_preserving_transaction::WitnessSet as borsh::BorshDeserialize>::try_from_slice(&[0u8; 8])
+            .expect("empty witness set");
+        let pp = PrivacyPreservingTransaction::new(message, witness);
+
+        let block = common::block::Block {
+            header: common::block::BlockHeader {
+                block_id: 7,
+                prev_block_hash: Default::default(),
+                hash: Default::default(),
+                timestamp: 0,
+                signature: lee::Signature { value: [0u8; 64] },
+            },
+            body: common::block::BlockBody {
+                transactions: vec![LeeTransaction::PrivacyPreserving(pp)],
+            },
+            bedrock_status: common::block::BedrockStatus::Finalized,
+        };
+        let mut bytes = Vec::new();
+        block.serialize(&mut bytes).expect("block serializes");
+
+        let d = decode_block_bytes(&bytes).expect("v0.2.2 pp block decodes");
+        assert_eq!(d.txs.len(), 1, "one transaction");
+        let tx = &d.txs[0];
+        assert_eq!(tx.kind, "private");
+        // public_actions non-empty => the public side was touched => shield, not private-send
+        assert_eq!(tx.subtype, "shield");
+        assert_eq!(tx.accounts.len(), 2, "one entry per public action");
+        // one nullifier AND one commitment per private action, and one encrypted post state
+        assert_eq!(tx.nullifiers.len(), 3, "one nullifier per private action");
+        assert_eq!(tx.commitments.len(), 3, "one commitment per private action");
+        assert_eq!(tx.encrypted_outputs, Some(3), "one encrypted post state per private action");
+        // the point of the rewrite: each id keeps ITS OWN balance
+        assert_eq!(tx.post_states.len(), 2);
+        let by_balance: Vec<&str> =
+            tx.post_states.iter().map(|s| s.balance.as_str()).collect();
+        assert_eq!(by_balance, vec!["111", "222"], "balances follow their own action");
+        assert_eq!(
+            tx.post_states[0].id, tx.accounts[0],
+            "post_state id and account id come from the same action"
         );
     }
 }

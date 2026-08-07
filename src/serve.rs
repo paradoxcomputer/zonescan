@@ -69,6 +69,14 @@ pub struct SeqCfg {
     /// discovery cap counts only auto-added ones.
     #[serde(default, skip_serializing_if = "is_false")]
     pub discovered: bool,
+    /// The sequencer's L1 funding account (zk public key, hex). This is the account that pays
+    /// for inscriptions, so its balance is what decides whether the zone can keep producing -
+    /// and it is the only balance the L1 still publishes. The per-channel collateral that used
+    /// to fill `l1_balance` was removed from `ChannelState` in blockchain_module 0.2.1, and
+    /// channels hold no deposits on this chain anyway (a scan of 2500+ L1 blocks found zero
+    /// ChannelDeposit ops), so this is the meaningful figure. Read via `/wallet/:pk/balance`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub funding_key: String,
     /// A raw DATA channel: its sampled inscriptions do not decode as valid LEZ sequencer
     /// blocks (e.g. text/JSON payloads inscribed directly on the L1). Tracked and indexed
     /// like any channel, but badged explicitly in the UI so it's never mistaken for a
@@ -220,7 +228,7 @@ pub fn default_config_path() -> PathBuf {
     default_data_dir().join("config.json")
 }
 
-/// Parse `ZONE_SCAN_SEQUENCERS` - comma-separated `channel|rpc_url|label|full`
+/// Parse `ZONE_SCAN_SEQUENCERS` - comma-separated `channel|rpc_url|label|full|funding_key`
 /// entries (only `channel` required; `rpc_url` enables the no-L1 sequencer source;
 /// a trailing `full`/`true`/`1` deep-walks that channel's history).
 fn parse_sequencers_env(s: &str) -> Vec<SeqCfg> {
@@ -233,7 +241,16 @@ fn parse_sequencers_env(s: &str) -> Vec<SeqCfg> {
             let rpc_url = p.next().unwrap_or("").to_string();
             let label = p.next().unwrap_or("").to_string();
             let full = matches!(p.next(), Some("full") | Some("true") | Some("1"));
-            SeqCfg { label, channel_id, rpc_url, full, discovered: false, data_channel: false }
+            let funding_key = p.next().unwrap_or("").to_string();
+            SeqCfg {
+                label,
+                channel_id,
+                rpc_url,
+                full,
+                funding_key,
+                discovered: false,
+                data_channel: false,
+            }
         })
         .filter(|s| !s.channel_id.is_empty())
         .collect()
@@ -253,6 +270,15 @@ pub fn overlay_env(cfg: &mut Config) {
     }
     if let Some(v) = env_bool("ZONE_SCAN_SKIP_CLOCK") {
         cfg.skip_clock = v;
+    }
+    if let Some(v) = env_nonempty("ZONE_SCAN_IGNORE_CHANNELS") {
+        let set: std::collections::HashSet<String> = v
+            .split(',')
+            .map(|c| c.trim().to_ascii_lowercase())
+            .filter(|c| !c.is_empty())
+            .collect();
+        cfg.sequencers.retain(|sc| !set.contains(&sc.channel_id.to_ascii_lowercase()));
+        let _ = IGNORED_CHANNELS.set(set);
     }
     if let Some(v) = env_nonempty("ZONE_SCAN_DISCOVER_SLOTS").and_then(|s| s.parse::<u64>().ok()) {
         cfg.discover_slots = Some(v);
@@ -576,26 +602,49 @@ impl Consistency {
 /// builds (empty `hash`) yield an all-zero verdict (`checked == 0`, "not verified").
 fn verify_chain<'a>(blocks_ascending: impl Iterator<Item = &'a Decoded>) -> Consistency {
     let mut c = Consistency::default();
-    let mut prev: Option<&Decoded> = None;
+    // block_id -> the hashes seen at that height. More than one means the zone reset and the
+    // L1 carries several generations of its chain.
+    let mut seen: BTreeMap<u64, BTreeSet<String>> = BTreeMap::new();
     for d in blocks_ascending {
         if d.hash.is_empty() {
-            prev = Some(d);
             continue; // light build: chain not verifiable
         }
         c.checked += 1;
         if !d.hash_ok {
             c.hash_failures += 1;
         }
-        if let Some(p) = prev {
-            if d.block_id == p.block_id + 1 {
-                if !p.hash.is_empty() && d.prev_hash != p.hash {
-                    c.chain_breaks += 1;
+        // Link each block to the blocks that actually claim its parent HEIGHT, rather than to
+        // whichever block happened to precede it in the walk. A zone that resets restarts its
+        // block ids, so a walk ordered by id interleaves the old and new chains: the immediate
+        // predecessor is usually the other generation's block at the same height, and comparing
+        // against it reports a break for every single pair. Zone 0101…01 showed 985 breaks and
+        // 71 gaps with ZERO hash failures - every block individually valid, only the
+        // cross-generation links failing. Checking membership at height-1 verifies each
+        // generation on its own terms while still catching a genuine break, which is a block
+        // whose parent hash matches NOTHING at that height.
+        if !seen.is_empty() {
+            match seen.get(&(d.block_id.wrapping_sub(1))) {
+                Some(parents) => {
+                    // Only an UNAMBIGUOUS mismatch is a break. More than one hash at the parent
+                    // height means several generations are present, and each is usually only
+                    // partially scanned, so this block's real parent may simply not have been
+                    // read while another generation's block at that height was - which is
+                    // missing coverage, not a broken chain. Counting those left zone 0101…01
+                    // at 41 phantom breaks even after linking by height.
+                    if parents.len() == 1 && !parents.contains(&d.prev_hash) {
+                        c.chain_breaks += 1;
+                    }
                 }
-            } else if d.block_id > p.block_id + 1 {
-                c.id_gaps += 1;
+                // nothing at the parent height: a real gap, unless this block is at or below a
+                // height we already have, which is a generation restarting rather than a hole.
+                None => {
+                    if !seen.contains_key(&d.block_id) {
+                        c.id_gaps += 1;
+                    }
+                }
             }
         }
-        prev = Some(d);
+        seen.entry(d.block_id).or_default().insert(d.hash.clone());
     }
     c
 }
@@ -622,6 +671,16 @@ struct SeqTrack {
     tx_mix: Option<TxMix>,
     seeded: bool,
     inited: bool,
+    /// Whether the L1 still has a channel record for this id. `None` until asked.
+    ///
+    /// The chain accepts inscription ops addressed to a channel that was never registered (or
+    /// was wiped by a chain reset): they land in blocks as data but update no channel state,
+    /// so `/channel/:id` answers "channel not found" while blocks keep arriving. Observed live
+    /// on 8888… and 8201…, which are still being inscribed by sequencers left over from before
+    /// the reset. Those are not zones anyone can settle to, so the UI says so rather than
+    /// presenting them as ordinary sequencers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    l1_registered: Option<bool>,
     /// The channel's balance on the Logos L1 (collateral), from `/channel/:id`.
     l1_balance: Option<String>,
     /// Number of authorized signer keys on the L1 channel.
@@ -697,6 +756,11 @@ impl SeqTrack {
             self.consistency.hash_failures += 1;
         }
         if let Some((pid, ph)) = self.verify_cursor.clone() {
+            // Only verify the link when this block really follows the cursor. A zone that
+            // resets replays low ids, and this path keeps a single cursor, so it cannot tell
+            // the new generation's block N from the old one's - see verify_chain, which has
+            // the full window and links by parent height instead. Re-anchoring silently is
+            // right here: counting would report a break for every block after a reset.
             if d.block_id == pid + 1 {
                 if d.prev_hash != ph {
                     self.consistency.chain_breaks += 1;
@@ -704,6 +768,7 @@ impl SeqTrack {
             } else if d.block_id > pid + 1 {
                 self.consistency.id_gaps += 1;
             }
+            // a lower-or-equal id is a generation restart: fall through and re-anchor below
         }
         if self.verify_cursor.as_ref().map_or(true, |(p, _)| d.block_id >= *p) {
             self.verify_cursor = Some((d.block_id, d.hash.clone()));
@@ -899,6 +964,9 @@ fn push_tx(s: &mut ServerState, rec: TxRecord) {
 /// Ingest one decoded inscription: push its txs to the feed and update the
 /// account balance index from any public post-states the txs carry.
 fn ingest(s: &mut ServerState, channel: &str, slot: Option<u64>, d: &Decoded, now: u64) {
+    if is_ignored_channel(channel) {
+        return;
+    }
     for rec in records_from(channel, slot, d, now) {
         push_tx(s, rec);
     }
@@ -1133,6 +1201,10 @@ struct SeqSnap {
     alive: bool,
     seeded: bool,
     l1_balance: Option<String>,
+    /// False when the L1 has no channel record: inscriptions still land as data but settle
+    /// nothing, so the UI badges it rather than showing an ordinary sequencer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    l1_registered: Option<bool>,
     l1_signers: usize,
     consistency: Consistency,
     /// None = not verified (no decode / no blocks); Some(true/false) = chain verdict.
@@ -1246,6 +1318,7 @@ fn build_snapshot(
                 alive,
                 seeded: t.seeded,
                 l1_balance: t.l1_balance.clone(),
+                l1_registered: t.l1_registered,
                 l1_signers: t.l1_signers,
                 consistency: t.consistency.clone(),
                 consistent: (t.consistency.checked > 0).then(|| t.consistency.ok()),
@@ -1908,21 +1981,29 @@ async fn discover_compatible(app: &AppState, total_cap: usize) -> Result<Vec<Str
         {
             let mut c = app.config.lock().unwrap();
             for ch in &found_seq {
+                if is_ignored_channel(ch) {
+                    continue;
+                }
                 c.sequencers.push(SeqCfg {
                     label: format!("seq-{}", &ch[..ch.len().min(6)]),
                     channel_id: ch.clone(),
                     rpc_url: String::new(),
                     full: true,
+                    funding_key: String::new(),
                     discovered: true,
                     data_channel: false,
                 });
             }
             for ch in &found_data {
+                if is_ignored_channel(ch) {
+                    continue;
+                }
                 c.sequencers.push(SeqCfg {
                     label: format!("data-{}", &ch[..ch.len().min(6)]),
                     channel_id: ch.clone(),
                     rpc_url: String::new(),
                     full: true,
+                    funding_key: String::new(),
                     discovered: true,
                     data_channel: true,
                 });
@@ -2569,13 +2650,74 @@ async fn refresh_channels(client: &Client, base: &str, app: &AppState) {
             })
             .collect()
     };
+    // resolved channel id -> the sequencer's L1 funding account
+    let funding_for: HashMap<String, String> = {
+        let cfg = app.config.lock().unwrap();
+        cfg.sequencers
+            .iter()
+            .filter_map(|sc| {
+                let k = sc.funding_key.trim();
+                (!k.is_empty())
+                    .then(|| resolve_channel(&sc.channel_id).ok().map(|c| (c, k.to_string())))
+                    .flatten()
+            })
+            .collect()
+    };
     for ch in channels {
-        if let EndpointResult::Ok(v) = get_json(client, &format!("{base}/channel/{ch}")).await {
-            let balance = v.get("balance").map(|b| match b {
-                Value::Number(n) => n.to_string(),
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            });
+        // The account that pays for this zone's inscriptions. `/channel/:id` no longer carries
+        // a balance and channels hold no deposits on this chain, so this is the balance that
+        // actually decides whether the zone keeps producing - when it runs dry the sequencer
+        // stops settling, which is exactly the failure this surfaces.
+        if let Some(fk) = funding_for.get(&ch) {
+            if let EndpointResult::Ok(w) =
+                get_json(client, &format!("{base}/wallet/{fk}/balance")).await
+            {
+                let bal = w.get("balance").map(|b| match b {
+                    Value::Number(n) => n.to_string(),
+                    Value::String(x) => x.clone(),
+                    other => other.to_string(),
+                });
+                if bal.is_some() {
+                    let mut s = app.inner.lock().unwrap();
+                    if let Some(t) = s.seqs.get_mut(&ch) {
+                        t.l1_balance = bal;
+                    }
+                }
+            }
+        }
+        let chan_resp = get_json(client, &format!("{base}/channel/{ch}")).await;
+        // A 4xx/5xx here is the node saying it has no record of this channel, which is a real
+        // answer; only a transport failure leaves it unknown, so don't overwrite on that.
+        match &chan_resp {
+            EndpointResult::Ok(_) => {
+                let mut s = app.inner.lock().unwrap();
+                if let Some(t) = s.seqs.get_mut(&ch) {
+                    t.l1_registered = Some(true);
+                }
+            }
+            EndpointResult::Status(_) => {
+                let mut s = app.inner.lock().unwrap();
+                if let Some(t) = s.seqs.get_mut(&ch) {
+                    t.l1_registered = Some(false);
+                }
+            }
+            EndpointResult::Unreachable(_) => {}
+        }
+        if let EndpointResult::Ok(v) = chan_resp {
+            // Bedrock 0dc34e2c (shipped in blockchain_module 0.2.1) dropped the per-channel
+            // balance: `ChannelState` no longer has the field, and `/channel/:id` no longer
+            // returns it, so on a current node this is always None and the UI hides the row
+            // rather than showing a permanently blank one. Still read it so a pre-0.2.1 node,
+            // or a later release that reintroduces it, keeps working.
+            let balance = v
+                .get("balance")
+                .or_else(|| v.get("channel_balance"))
+                .filter(|b| !b.is_null())
+                .map(|b| match b {
+                    Value::Number(n) => n.to_string(),
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                });
             // v0.2.0 renamed `keys` -> `accredited_keys` and `tip` -> `tip_message`.
             let keys: Vec<String> = v
                 .get("accredited_keys")
@@ -2589,11 +2731,16 @@ async fn refresh_channels(client: &Client, base: &str, app: &AppState) {
             let tip_slot = jget_u64(&v, "tip_slot");
             let tip_start_slot = jget_u64(&v, "tip_sequencer_starting_slot");
             let config_threshold = jget_u64(&v, "configuration_threshold");
-            let withdraw_threshold = jget_u64(&v, "withdraw_threshold");
+            // renamed in the same release; accept both so old and new nodes read alike
+            let withdraw_threshold = jget_u64(&v, "transfer_threshold")
+                .or_else(|| jget_u64(&v, "withdraw_threshold"));
             let now = now_unix();
             let mut s = app.inner.lock().unwrap();
             if let Some(t) = s.seqs.get_mut(&ch) {
-                t.l1_balance = balance;
+                // never clobber a funding balance just read above with the absent channel one
+                if balance.is_some() {
+                    t.l1_balance = balance;
+                }
                 t.l1_signers = signers;
                 t.l1_accredited_keys = keys;
                 t.l1_tip_slot = tip_slot;
@@ -3418,6 +3565,17 @@ pub(crate) const RC5_PROGRAMS: &[(&str, &str)] = &[
 /// Set from `Config.skip_clock`; when true, clock-program txs aren't stored/indexed.
 static SKIP_CLOCK: AtomicBool = AtomicBool::new(false);
 
+/// Channels to drop entirely, from `ZONE_SCAN_IGNORE_CHANNELS` (comma-separated ids). A channel
+/// from a superseded chain keeps being re-found by discovery every time the L1 walk reaches its
+/// old inscriptions, so removing it from the config alone does not make it stay gone - it has to
+/// be refused at ingest. Ignored channels are never tracked, indexed or reported.
+static IGNORED_CHANNELS: std::sync::OnceLock<std::collections::HashSet<String>> =
+    std::sync::OnceLock::new();
+
+fn is_ignored_channel(ch: &str) -> bool {
+    IGNORED_CHANNELS.get().is_some_and(|s| s.contains(ch))
+}
+
 /// Whether a program label/id is the clock (across builds), so it can be skipped/hidden.
 fn is_clock_program(p: &str) -> bool {
     p == "clock"
@@ -3443,9 +3601,25 @@ const SHARED_GUEST_IDS: &[&str] = &[
     "c316e2bed1d90687b35b80d460d35e7fe40130bbd2563cf19ee12e0e06c74508", // faucet / genesis_supply_bridge
 ];
 
+/// Ids from the tail of RC5_PROGRAMS that were named from their on-chain instruction
+/// FINGERPRINT, not by matching a build artifact. That table's own comment records why: the
+/// deployed zone rebuilt those guests, so the ids match no upstream source build. A rebuilt
+/// guest identifies a DEPLOYMENT, not a release, so these must never drive lez_version -
+/// naming them is a genuine improvement, versioning from them is a guess.
+///
+/// This bit for real: `validity_window` is the single most common program on zone 0101…01, so
+/// every block carrying it re-tagged that zone "rc5" and clobbered the true v0.2.2 signal its
+/// faucet / authenticated_transfer / pinata transactions carry. The two ids above it in that
+/// tail (genesis_supply, genesis_supply_bridge) never had the bug only because they are
+/// already listed in SHARED_GUEST_IDS.
+const FINGERPRINTED_PROGRAM_IDS: &[&str] = &[
+    "2ac6039da4df524ac8448f5b41b56887934f6d7081279a70042b072625bc67e1", // time_locked_transfer
+    "df89eefa733d4e4b26ec2094b593c1a719a7ff99885f5a4f69c4a9e89a888d05", // validity_window
+];
+
 fn lez_version(program: &str) -> Option<&'static str> {
-    if SHARED_GUEST_IDS.contains(&program) {
-        return None; // shared guest: version-ambiguous by construction
+    if SHARED_GUEST_IDS.contains(&program) || FINGERPRINTED_PROGRAM_IDS.contains(&program) {
+        return None; // shared guest / fingerprint-named: version-ambiguous by construction
     }
     if matches!(
         program,
@@ -3459,7 +3633,9 @@ fn lez_version(program: &str) -> Option<&'static str> {
             | "faucet"
             | "bridge"
     ) {
-        return Some("v0.2");
+        // An image id is a content hash of the guest, so matching a linked built-in pins the
+        // EXACT release, not a family - report the full version rather than a "v0.2" prefix.
+        return Some(crate::LINKED_LEZ_VERSION);
     }
     if RC5_PROGRAMS.iter().any(|(id, _)| *id == program) {
         return Some("rc5");
@@ -4537,6 +4713,38 @@ async fn api_account(
                 }
             }
         }
+        // No RPC (or it answered nothing): a token balance is account state and the L1 carries
+        // only the calls, so derive it by replaying the holding's own token history. Exact or
+        // absent - derive_holding_balance returns None unless it saw the account created.
+        // Most zones here are L1-only, so without this every holding renders a bare "-".
+        if holdings.iter().any(|h| h.balance.is_none()) {
+            if let Some(db) = app.db.clone() {
+                let pending: Vec<String> = holdings
+                    .iter()
+                    .filter(|h| h.balance.is_none())
+                    .map(|h| h.account.clone())
+                    .collect();
+                // scope to the zone being viewed: the same account id can exist on several
+                // zones, and summing them would be a confident wrong number
+                let bch = balance_channel.clone();
+                let derived = tokio::task::spawn_blocking(move || {
+                    pending
+                        .into_iter()
+                        .map(|a| {
+                            let b = db.derive_holding_balance(&a, &bch);
+                            (a, b)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+                for (acct, bal) in derived {
+                    if let Some(h) = holdings.iter_mut().find(|h| h.account == acct) {
+                        h.balance = bal;
+                    }
+                }
+            }
+        }
     }
 
     Json(json!({
@@ -4815,6 +5023,12 @@ async fn api_program(
             Some(g)
         })
     };
+
+    // Fall back to the channel this program's own transactions are on. A program page is
+    // reached as /zone/:channel/program/:id, so a null channel leaves the UI with no zone to
+    // link to and search cannot route to the page at all - which is how a program id ended up
+    // opening an empty ZONE page instead.
+    let channel = channel.or_else(|| txs.first().map(|t| t.channel.clone()));
 
     Json(json!({
         "id": id,
@@ -5268,10 +5482,15 @@ const DASH_HTML: &str = r#"<!doctype html>
     margin-left:6px;vertical-align:middle;letter-spacing:.3px;text-transform:uppercase}
   .v-rc4{background:#dcfce7;color:#166534}
   .v-rc5{background:#e0e7ff;color:#3730a3} .v-rc3{background:#fef3c7;color:#92400e}
-  /* stock v0.2.0 build (named natively by the linked crate); dot escaped in the selector */
-  .v-v0\.2{background:#ccfbf1;color:#0f766e}
+  /* Stock v0.x build (named natively by the linked crate). The badge class is built from the
+     version string, which is now a full vX.Y.Z, so an exact `.v-v0\.2` selector stopped
+     matching the moment the tag gained a patch component. Match the prefix instead, so every
+     future patch release keeps the palette without needing its own selector. */
+  [class*="v-v0."]{background:#ccfbf1;color:#0f766e}
   /* raw data channel (not LEZ sequencer blocks): the amber "raw" palette */
   .v-data{background:#fef9c3;color:#854d0e}
+  /* a channel the L1 has no record of: inscriptions land as data but settle nothing */
+  .v-unreg{background:#fee2e2;color:#991b1b}
   /* L1-finality badge: green "final" > blue "on L1 · finalizing" > grey "pending" */
   .fbadge{display:inline-block;font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;vertical-align:middle}
   .fbadge.fin{background:rgba(19,169,123,.14);color:var(--green)}
@@ -5423,8 +5642,31 @@ function chanLabel(ch, shortHex){
 }
 const fmtAge=(u)=>{ if(!u) return '-'; let s=Math.max(0,Math.floor(Date.now()/1000)-u);
   if(s<60) return s+' secs ago'; if(s<3600) return Math.floor(s/60)+' mins ago'; if(s<86400) return Math.floor(s/3600)+' hrs ago'; return Math.floor(s/86400)+' days ago'; };
-function ageOf(t){ let ts=t.timestamp||0; if(ts>1e12) ts=Math.floor(ts/1000);
-  if(ts>1e9 && ts<2e10) return fmtAge(ts); if(t.seen_unix) return fmtAge(t.seen_unix); return '-'; }
+// Seconds per L1 slot, derived from the two figures the API already publishes. Null until
+// the server has measured a rate (it withholds the eta until it has a long enough sample).
+function slotSecs(){ const l1=(state&&state.l1)||{};
+  return (l1.finality_eta_secs && l1.finality_lag) ? l1.finality_eta_secs/l1.finality_lag : null; }
+// A row's age. `timestamp` is stamped by the ZONE's own sequencer clock, which is neither
+// trustworthy nor monotonic: zone 0101… stamps most of its blocks ~36 days behind wall clock
+// and a handful near it, so a list correctly ordered by chain position rendered ages that
+// jumped between "36 days ago" and "8 hrs ago" - which is what "not ordered by age" looks
+// like. The settlement slot is L1 CONSENSUS time, so prefer it whenever the row has settled
+// and the slot rate is known. seen_unix cannot rescue this alone: it is 0 on every row
+// backfilled from L1 history (only live-fed rows carry it).
+function ageOf(t){
+  // seen_unix is wall clock recorded when this row was indexed, so it is both trustworthy and
+  // unambiguous - prefer it. It is only absent on rows backfilled from L1 history.
+  if(t.seen_unix) return fmtAge(t.seen_unix);
+  // Then L1 consensus time. `slot` only means an L1 settlement slot on rows read from the L1;
+  // rows read from a sequencer's RPC carry its own BLOCK ID there instead, and treating that
+  // as a slot dated a fresh block 268 to "2 days ago" by subtracting it from the L1 tip. Those
+  // rows always have seen_unix, so they are handled above and never reach this.
+  const l1=(state&&state.l1)||{}; const rate=slotSecs();
+  if(t.slot && rate && l1.tip_slot && l1.tip_slot>=t.slot)
+    return fmtAge(Math.floor(Date.now()/1000) - Math.round((l1.tip_slot-t.slot)*rate));
+  // Last, the zone's own clock, which some sequencers set wrong by weeks.
+  let ts=t.timestamp||0; if(ts>1e12) ts=Math.floor(ts/1000);
+  if(ts>1e9 && ts<2e10) return fmtAge(ts); return '-'; }
 function badge(k){ return `<span class="badge b-${esc(k)}">${esc((k||'').charAt(0).toUpperCase()+(k||'').slice(1))}</span>`; }
 // a public tx that calls the token program is tagged "token" (its own color + filter)
 // resolve a tx's program to its name, whether stored as a raw id (rc3 -> PROGS) or as
@@ -5762,6 +6004,12 @@ function renderByLayout(w,layout,t){
 function verBadge(s){ return s.version?`<span class="vbadge v-${esc(s.version)}" title="LEZ build">${esc(s.version)}</span>`:''; }
 // explicit marker for a channel adopted as raw DATA - never to be read as a sequencer.
 function dataBadge(s){ return s&&s.data_channel?`<span class="vbadge v-data" title="data channel - its inscriptions do not decode as valid LEZ sequencer blocks">data</span>`:''; }
+// The L1 has no channel record for this id. It still accepts inscription ops addressed to it -
+// they land in blocks as data - but they settle nothing, so blocks keep arriving for a channel
+// that does not exist. That happens when a sequencer left over from before a chain reset keeps
+// publishing to its old channel. Only badge on an explicit false: undefined means not asked.
+function unregBadge(s){ return s&&s.l1_registered===false
+  ? `<span class="vbadge v-unreg" title="the L1 has no channel record for this id - its inscriptions are accepted as data but settle nothing. Usually a sequencer still publishing to a channel that a chain reset wiped.">unregistered</span>` : ''; }
 // a zone's display title: the friendly alias when known, else the short hex.
 function zoneTitle(s){ return aliasOf(s.channel) || s.channel_short || sh(s.channel); }
 // sequencer (LEZ/zone) version as a labeled value: the rc-family badge (rc3/rc4/rc5),
@@ -6570,9 +6818,9 @@ function renderSeqs(){
   const none={all:'sequencers',rc:'sequencer zones',data:'data channels'}[zoneFilter]||'sequencers';
   el.innerHTML = seqs.length ? slice.map(s=>`<a class="srow" href="/zone/${u(s.channel)}" style="text-decoration:none;color:inherit">
       <span class="dot ${s.alive?'on':'off'}"></span>
-      <div class="sm"><div class="a">${esc(zoneTitle(s))}${dataBadge(s)}${consBadge(s)}</div>
+      <div class="sm"><div class="a">${esc(zoneTitle(s))}${dataBadge(s)}${unregBadge(s)}${consBadge(s)}</div>
         <div class="zmeta"><span class="zf"><span class="zk">Channel ID</span> <span class="chex">${esc(s.channel_short)}</span></span><span class="zf"><span class="zk">Sequencer version</span> ${verValue(s)}</span></div>
-        <div class="b">L2 ${l2Tip(s)} · L1 bal ${s.l1_balance!=null?grp(s.l1_balance):'-'} · ${s.l1_signers||0} key(s)${bpmStr(s)?' · '+bpmStr(s):''}${tipNote(s)}${activityChip(s)}</div></div>
+        <div class="b">L2 ${l2Tip(s)} · funding ${s.l1_balance!=null?grp(s.l1_balance):'n/a'} · ${s.l1_signers||0} key(s)${bpmStr(s)?' · '+bpmStr(s):''}${tipNote(s)}${activityChip(s)}</div></div>
       <span class="st ${s.alive?'alive':'idle'}">${s.alive?'ALIVE':'IDLE'}</span></a>`).join('')
       + (seqs.length>cur.seqShown?`<div class="empty" style="padding:12px">scroll for ${seqs.length-cur.seqShown} more…</div>`:'')
     : `<div class="empty">${state&&state.discovering?'scanning the L1 for sequencers…':'no '+none+' found'}</div>`;
@@ -6631,7 +6879,7 @@ function activityPanel(s){
       ${extra}
       <div class="k">Inscriber</div><div class="v">${insc}${thr}</div>
       <div class="k">Tip hash</div><div class="v">${tiph}</div>
-      <div class="k">Channel balance</div><div class="v">${s.l1_balance!=null?grp(s.l1_balance):'-'}</div>
+      <div class="k" title="the sequencer&#39;s L1 funding account - what pays for inscriptions">Sequencer funding balance</div><div class="v">${s.l1_balance!=null?grp(s.l1_balance):`<span class="mut" title="set this zone's funding account as the 5th field of its ZONE_SCAN_SEQUENCERS entry to show it. The L1 stopped publishing per-channel collateral in blockchain_module 0.2.1, and channels hold no deposits on this chain.">n/a</span>`}</div>
     </div>
     <div class="mut" style="padding:6px 18px 16px;font-size:12px;line-height:1.55">${esc(note)}</div>
   </div>`;
@@ -6642,10 +6890,10 @@ async function renderZone(seq){
   const s=(seq===LOCAL_ZONE)?localZoneSnap()
     :(((state&&state.sequencers)||[]).find(x=>x.channel===seq)||{channel:seq,channel_short:sh(seq)});
   $('view').innerHTML=`${crumb([{t:'Home',href:'/'},{t:'Zone '+sh(seq)}])}
-  <div class="panel" style="margin-bottom:16px"><div class="phead">${s.data_channel?'Channel':'Sequencer'} ${chanLabel(s.channel, s.channel_short)} ${dataBadge(s)}${verBadge(s)}${consBadge(s)}</div>
+  <div class="panel" style="margin-bottom:16px"><div class="phead">${s.data_channel?'Channel':'Sequencer'} ${chanLabel(s.channel, s.channel_short)} ${dataBadge(s)}${unregBadge(s)}${verBadge(s)}${consBadge(s)}</div>
     <div class="ovw">
       <div><div class="k">Latest L2 Block</div><div class="v">${l2Tip(s)}</div></div>
-      <div><div class="k">L1 Channel Balance</div><div class="v">${s.l1_balance!=null?grp(s.l1_balance):'-'}</div></div>
+      <div><div class="k" title="the sequencer&#39;s L1 funding account - what pays for inscriptions">Sequencer Funding Balance</div><div class="v">${s.l1_balance!=null?grp(s.l1_balance):`<span class="mut" title="set this zone's funding account as the 5th field of its ZONE_SCAN_SEQUENCERS entry to show it. The L1 stopped publishing per-channel collateral in blockchain_module 0.2.1, and channels hold no deposits on this chain.">n/a</span>`}</div></div>
       <div><div class="k">Throughput</div><div class="v">${bpmStr(s)||'-'}</div></div>
       <div><div class="k">Status</div><div class="v" style="color:${s.alive?'var(--green)':'var(--soft)'}">${s.alive?'ALIVE':'IDLE'}</div></div>
     </div>
@@ -7091,6 +7339,11 @@ async function doSearch(){
     if(((state&&state.sequencers)||[]).some(x=>x.channel===h)){ location.href='/zone/'+u(h); return; }
     const b58=hexToB58(h);
     if(b58 && await accountHasActivity(b58)){ location.href='/wallet/'+u(b58); return; }
+    // a PROGRAM image id is also 64 hex. Check before giving up, or searching one lands on a
+    // zone page for a channel that does not exist: HTTP 200, no data, no error.
+    try{ const r=await fetch('/api/program/'+u(h));
+      if(r.ok){ const pg=await r.json();
+        if(pg && pg.tx_count>0 && pg.channel){ location.href='/zone/'+u(pg.channel)+'/program/'+u(h); return; } } }catch(e){}
     location.href='/zone/'+u(h); return;       // nothing matched: keep the old behaviour
   }
   // non-hex id: a token DEFINITION -> the token page (its home channel), else an account.
@@ -7433,6 +7686,26 @@ mod tests {
 
     // The dashboard is assembled by string replacement, so a placeholder added to the HTML
     // without a matching `.replace` ships as literal `{{...}}` to the browser. Cheap guard.
+    // The unregistered badge must key off an explicit false. l1_registered is None until the
+    // channel has actually been asked about, and a transport failure leaves it None too, so
+    // testing truthiness would badge every zone as unregistered for the first poll cycle and
+    // again whenever the node is briefly unreachable.
+    #[test]
+    fn unregistered_badge_needs_an_explicit_false() {
+        let js = DASH_HTML;
+        let f = js
+            .split("function unregBadge(s){")
+            .nth(1)
+            .expect("unregBadge is defined in the dashboard");
+        let body = &f[..f.find("\n}").unwrap_or(f.len().min(400))];
+        assert!(
+            body.contains("s.l1_registered===false"),
+            "must compare against false explicitly, not test truthiness: {body}"
+        );
+        // and it must actually be rendered somewhere
+        assert!(js.contains("${unregBadge(s)}"), "badge is defined but never rendered");
+    }
+
     #[test]
     fn dashboard_html_has_no_unreplaced_placeholders() {
         let page = DASH_HTML
@@ -7474,12 +7747,17 @@ mod tests {
         assert_eq!(measured_slot_secs(&series(&[(1_000, 500)])), None);
     }
 
-    // The linked (v0.2.0 stock) build's image ids alias ids already live on this
-    // deployment wherever a guest is byte-identical across builds. Every alias must be
-    // (a) version-neutral (in SHARED_GUEST_IDS, so lez_version never tags from it) and
-    // (b) named by the deployment tables, not the linked build, when the names differ.
-    // If this test fails after a dep retag, a new alias appeared: extend
-    // SHARED_GUEST_IDS and re-check the naming precedence.
+    // The linked build's image ids alias ids already live on this deployment wherever a
+    // guest is byte-identical across builds. Every alias must be (a) version-neutral (in
+    // SHARED_GUEST_IDS, so lez_version never tags from it) and (b) named by the deployment
+    // tables, not the linked build, when the names differ.
+    //
+    // Under v0.2.0 three guests aliased: clock, vault-as-genesis_supply and
+    // faucet-as-genesis_supply_bridge. LEZ v0.2.1/v0.2.2 rebuilt every guest, so no rc5 id
+    // aliases the linked build any more and the set is empty - the invariant then holds
+    // vacuously, and RC5_PROGRAMS is the sole authority for the frozen rc5 zones. The
+    // assertions below still run over whatever aliases exist, so if a future retag brings
+    // one back it is caught: extend SHARED_GUEST_IDS and re-check the naming precedence.
     #[cfg(feature = "decode")]
     #[test]
     fn linked_build_id_aliases_are_version_neutral() {
@@ -7493,12 +7771,9 @@ mod tests {
         let pairs: Vec<(&str, &str)> = aliased.iter().map(|(_, n, l)| (*n, *l)).collect();
         assert_eq!(
             pairs,
-            vec![
-                ("clock", "clock"),
-                ("genesis_supply", "vault"),
-                ("genesis_supply_bridge", "faucet"),
-            ],
-            "known shared guests between the deployment and the stock v0.2.0 build"
+            Vec::<(&str, &str)>::new(),
+            "no rc5 guest is byte-identical to the linked v0.2.2 build (all guests were \
+             rebuilt in v0.2.1); a new entry here means a retag reintroduced an alias"
         );
         for (id, name, _) in &aliased {
             assert!(SHARED_GUEST_IDS.contains(id), "alias {name} must be version-neutral");
@@ -7538,8 +7813,8 @@ mod tests {
     fn version_retags_on_build_upgrade() {
         let tx = |prog: &str| TxInfo { program: Some(prog.to_string()), ..Default::default() };
         // stock v0.2.0 natives resolve to their names (via the linked build) -> "v0.2"
-        assert_eq!(version_from_txs(&[tx("authenticated_transfer")]), Some("v0.2"));
-        assert_eq!(version_from_txs(&[tx("pinata")]), Some("v0.2"));
+        assert_eq!(version_from_txs(&[tx("authenticated_transfer")]), Some(crate::LINKED_LEZ_VERSION));
+        assert_eq!(version_from_txs(&[tx("pinata")]), Some(crate::LINKED_LEZ_VERSION));
         // a fork native only ever appears as its raw hex id -> resolves via RC5 table
         let fork_auth = "d9a19237236822b1f8100576ebd19a19f74178f99e284c983a4ac44acbd5b472";
         assert_eq!(version_from_txs(&[tx(fork_auth)]), Some("rc5"));
@@ -7553,7 +7828,38 @@ mod tests {
                 version = Some(v.to_string());
             }
         }
-        assert_eq!(version.as_deref(), Some("v0.2"), "upgrade must overwrite the stale tag");
+        assert_eq!(version.as_deref(), Some(crate::LINKED_LEZ_VERSION), "upgrade must overwrite the stale tag");
+    }
+
+    // A fingerprint-named program must not assert a version. These ids were matched from the
+    // shape of their instruction data, not from a build artifact, so they say which DEPLOYMENT
+    // a program belongs to and nothing about which release built it.
+    //
+    // Live regression: zone 0101…01 upgraded and its transactions do carry v0.2.2-native
+    // faucet / authenticated_transfer / pinata, but its most common program by far is the
+    // fingerprint-named `validity_window`, which sits in RC5_PROGRAMS. Every block carrying it
+    // re-tagged the zone "rc5", so the upgrade was invisible in the UI.
+    #[cfg(feature = "decode")]
+    #[test]
+    fn fingerprinted_programs_do_not_assert_a_version() {
+        let tx = |prog: &str| TxInfo { program: Some(prog.to_string()), ..Default::default() };
+        for id in FINGERPRINTED_PROGRAM_IDS {
+            assert_eq!(lez_version(id), None, "{id} is fingerprint-named, not build-matched");
+            assert_eq!(version_from_txs(&[tx(id)]), None, "{id} must not tag a zone");
+            // still named for display - dropping the version signal must not lose the name
+            assert!(
+                RC5_PROGRAMS.iter().any(|(rid, _)| rid == id),
+                "{id} should stay in the naming table"
+            );
+        }
+        // the real mix from that zone: the fingerprinted program must not out-vote the
+        // build-distinctive one, whichever order they arrive in
+        let vw = FINGERPRINTED_PROGRAM_IDS[1];
+        assert_eq!(
+            version_from_txs(&[tx(vw), tx("faucet")]),
+            Some(crate::LINKED_LEZ_VERSION),
+            "a fingerprinted program must not mask the real build signal"
+        );
     }
 
     // A hand-configured channel whose observed content is raw-only must classify as a
@@ -7859,6 +8165,40 @@ mod tests {
         let c = verify_chain(chain.iter());
         assert_eq!(c.checked, 3);
         assert!(c.ok());
+    }
+
+    // A zone that RESETS restarts its block ids, so a walk ordered by id interleaves the old
+    // and new chains. Every adjacent pair then straddles them, which used to be counted as a
+    // break: zone 0101…01 reported 985 chain breaks and 71 id gaps with ZERO hash failures -
+    // every block individually valid, only the cross-chain links failing - and the UI called
+    // the zone INCONSISTENT. A repeated block id is the giveaway (one chain cannot mint two
+    // blocks at the same height), so the verifier re-anchors there instead.
+    #[cfg(feature = "decode")]
+    #[test]
+    fn verify_chain_treats_a_restarted_chain_as_a_new_generation() {
+        // old chain 1..3, then the zone resets and mints its own 1..3 with unrelated hashes,
+        // sorted together by block id the way the index yields them
+        let interleaved = [
+            blk(1, "a1", "a0", true),
+            blk(1, "b1", "b0", true),
+            blk(2, "a2", "a1", true),
+            blk(2, "b2", "b1", true),
+            blk(3, "a3", "a2", true),
+            blk(3, "b3", "b2", true),
+        ];
+        let c = verify_chain(interleaved.iter());
+        assert_eq!(c.checked, 6, "every block is still verified");
+        assert_eq!(c.hash_failures, 0);
+        assert_eq!(c.chain_breaks, 0, "a generation boundary is not a chain break");
+        assert_eq!(c.id_gaps, 0, "nor an id gap");
+        assert!(c.ok(), "a cleanly reset zone must not read as INCONSISTENT");
+
+        // a REAL break inside one generation must still be caught
+        let broken = [
+            blk(1, "a1", "a0", true),
+            blk(2, "a2", "WRONG", true),
+        ];
+        assert_eq!(verify_chain(broken.iter()).chain_breaks, 1, "real breaks still count");
     }
 
     #[test]

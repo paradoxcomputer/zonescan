@@ -392,6 +392,12 @@ fn token_mappings(rec: &TxRecord) -> (Option<(String, String, u128)>, Option<(St
             return (Some((a[0].clone(), name, supply)), supply_map);
         }
     }
+    // token InitializeAccount (variant 3); accounts [definition, holding]. This is how a
+    // holding is opened when it is NOT an ATA - the ata Create below never runs for it - so
+    // without this the account is never linked to its token and never appears as a holder.
+    if is_token_program(prog) && w.first().copied() == Some(3) && a.len() >= 2 {
+        return (None, Some((a[1].clone(), a[0].clone())));
+    }
     // ata Create (variant 0); accounts [owner, definition, ata]
     if is_ata_program(prog) && w.first().copied() == Some(0) && a.len() >= 3 {
         return (None, Some((a[2].clone(), a[1].clone())));
@@ -499,6 +505,12 @@ impl Db {
                 }
                 if let Some((h, d)) = hold {
                     hdef.insert(h.as_str(), d.as_str())?;
+                    // DEF_HOLDER drives the token page's holder list, and it used to be written
+                    // only from an ata Create - so a token whose holdings were opened by
+                    // NewFungibleDefinition (the supply account) or InitializeAccount listed no
+                    // holders at all, however much of it was held. The value is the owner, which
+                    // only an ATA carries; the holder query ignores it, so leave it empty here.
+                    def_holder.insert(format!("{d}\0{h}").as_str(), "")?;
                 }
                 // owner->ATA + definition->holder links, from an ata Create (idempotent).
                 if let Some((owner, ata, def)) = ata_owner_link(r) {
@@ -1009,6 +1021,142 @@ impl Db {
     /// is itself an ATA, its own token. Each holding resolves its token name/supply + persisted
     /// balance via O(1) map lookups — no store scan, no per-holding RPC. Capped so a pathological
     /// owner can't blow up the response.
+    /// Every indexed transaction touching `id`, unpaginated and unfiltered. Only for the
+    /// balance replay, which is a fold over the account's whole history and cannot use the
+    /// paginated `account()` feed. Bounded by CAP so a hot account cannot stall a request.
+    fn account_all(&self, id: &str, channel: &str) -> Result<Vec<TxRecord>> {
+        const CAP: usize = 5000;
+        if channel.is_empty() {
+            return Ok(vec![]); // unscoped would mix zones; refuse rather than guess
+        }
+        let r = self.db.begin_read()?;
+        let (Ok(txs), Ok(idx)) = (r.open_table(TXS), r.open_table(IDX_ACCOUNT)) else {
+            return Ok(vec![]);
+        };
+        let mut lo = id.as_bytes().to_vec();
+        lo.push(0);
+        let mut hi = id.as_bytes().to_vec();
+        hi.push(1);
+        let mut out = Vec::new();
+        for item in idx.range::<&[u8]>(lo.as_slice()..hi.as_slice())? {
+            let (_, v) = item?;
+            if let Some(g) = txs.get(v.value())? {
+                let rec = de::<TxRecord>(g.value())?;
+                // IDX_ACCOUNT keys put the channel in the TAIL, after block_id, so one range
+                // walks EVERY zone's rows for this id interleaved. Account ids carry no zone
+                // component - an ATA id is a hash of owner+definition - so the same wallet or
+                // genesis on two zones yields byte-identical ids, and folding them together
+                // would sum unrelated balances into one confident wrong number.
+                if rec.channel == channel {
+                    out.push(rec);
+                }
+            }
+            if out.len() >= CAP {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Replay a token holding account's own transaction history to derive its balance,
+    /// for zones with no sequencer RPC (a token balance is account STATE, and without RPC
+    /// there is nothing to read it from - the L1 carries the CALLS, not the resulting state).
+    ///
+    /// Instruction semantics are taken from the token program itself
+    /// (`lez/programs/token/core/src/lib.rs`, enum `Instruction`), whose variant order is the
+    /// discriminant written as instruction word 0:
+    ///   0 Transfer{amount}            accounts [sender, recipient]
+    ///   1 NewFungibleDefinition{..}   accounts [definition, holding]  - holding is credited
+    ///                                 the whole supply, which is word 1's string then a u128
+    ///   2 NewDefinitionWithMetadata   accounts [definition, holding, metadata]
+    ///   3 InitializeAccount           accounts [definition, holding]  - starts at zero
+    ///   4 Burn{amount}                accounts [definition, holding]
+    ///   5 Mint{amount}                accounts [definition, holding]
+    ///   6 PrintNft
+    ///
+    /// Returns None unless the replay is EXACT, which requires seeing the instruction that
+    /// created this account (variant 1, 2 or 3). Without that the history is only a suffix and
+    /// any total would be understated, so the caller shows "-" rather than a confident wrong
+    /// number. Any unrecognised or malformed token instruction touching the account also
+    /// abandons the derivation, for the same reason.
+    pub fn derive_holding_balance(&self, ata: &str, channel: &str) -> Option<String> {
+        // u128 little-endian over four instruction words.
+        fn u128_at(w: &[u32], i: usize) -> Option<u128> {
+            let s = w.get(i..i + 4)?;
+            Some(s.iter().enumerate().fold(0u128, |a, (k, x)| a | (u128::from(*x) << (32 * k))))
+        }
+        let mut recs = self.account_all(ata, channel).ok()?;
+        if recs.len() >= 5000 {
+            return None; // history truncated by the cap: a total would be understated
+        }
+        // oldest first: a balance is a fold over history in order
+        recs.sort_by(|a, b| a.block_id.cmp(&b.block_id).then(a.hash.cmp(&b.hash)));
+
+        let mut bal: u128 = 0;
+        let mut created = false;
+        for r in &recs {
+            // Match the token program the way the rest of this file does. `program` is stored
+            // as whatever label the decoding build produced, which is the raw image-id hex for
+            // any build we do not link, so a literal "token" test skips exactly the foreign
+            // builds this fallback exists for - and, where a store mixes labels for one
+            // program, would fold part of an account's history and drop the rest while still
+            // claiming the result was exact.
+            let Some(prog) = r.program.as_deref() else { continue };
+            if !is_token_program(prog) {
+                // A non-token program can still move a token balance by invoking the token
+                // program, which we cannot see from the call alone, so only ignore programs
+                // known not to: anything unrecognised abandons the derivation.
+                if is_ata_program(prog) || super::is_clock_program(prog) {
+                    continue;
+                }
+                return None;
+            }
+            let w = &r.instruction_data;
+            let Some(&op) = w.first() else { return None };
+            // position of this account among the instruction's accounts decides the direction
+            let pos = r.accounts.iter().position(|a| a == ata)?;
+            match op {
+                0 => {
+                    // Transfer: [sender, recipient]
+                    let amt = u128_at(w, 1)?;
+                    match pos {
+                        0 => bal = bal.checked_sub(amt)?,
+                        1 => bal = bal.checked_add(amt)?,
+                        _ => return None,
+                    }
+                }
+                1 => {
+                    // NewFungibleDefinition { name: String, total_supply: u128 }. risc0 packs a
+                    // String as [len][ceil(len/4) words], so the supply starts after the whole
+                    // name, not after `len` words - r0_str_words is the shared accounting.
+                    if pos != 1 {
+                        continue; // the definition account holds no balance
+                    }
+                    bal = bal.checked_add(u128_at(w, 1 + r0_str_words(w, 1))?)?;
+                    created = true;
+                }
+                2 | 3 => {
+                    // NewDefinitionWithMetadata / InitializeAccount: the holding starts empty.
+                    // Metadata layout is not needed - neither credits a balance.
+                    created = true;
+                }
+                4 => {
+                    if pos == 1 {
+                        bal = bal.checked_sub(u128_at(w, 1)?)?;
+                    }
+                }
+                5 => {
+                    if pos == 1 {
+                        bal = bal.checked_add(u128_at(w, 1)?)?;
+                    }
+                }
+                6 => return None, // NFT printing: not a fungible balance move
+                _ => return None, // unknown op: cannot claim an exact total
+            }
+        }
+        created.then(|| bal.to_string())
+    }
+
     pub fn token_holdings(&self, account: &str) -> Vec<Holding> {
         const CAP: usize = 200;
         let mut out: Vec<Holding> = Vec::new();
@@ -1242,6 +1390,7 @@ impl Db {
             }
             for (h, d) in &holds {
                 hdef.insert(h.as_str(), d.as_str())?;
+                def_holder.insert(format!("{d}\0{h}").as_str(), "")?;
             }
             for (owner, ata, def) in &atas {
                 owner_ata.insert(format!("{owner}\0{ata}").as_str(), def.as_str())?;
@@ -1846,6 +1995,121 @@ mod tests {
     /// Serializes tests that mutate the process-global PROGRAM_INFO (set_program_kinds) so the
     /// default parallel test runner can't race them.
     static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // The token-balance replay used when a zone has no sequencer RPC. Instruction encodings are
+    // the real ones: variant 1 is the live TESTNET-COIN creation from zone 0101 (block 985), and
+    // the variant order comes from the token program's own enum. Burn (4) and Mint (5) are
+    // adjacent and opposite, so a discriminant off-by-one silently inverts a balance - that is
+    // the case worth pinning.
+    #[test]
+    fn derives_token_holding_balance_without_rpc() {
+        let _g = GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!("zs-holdbal-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let put = |hash: &str, blk: u64, accts: Vec<&str>, w: Vec<u32>| {
+            let mut t = rec(hash, "ch", blk, Some("token"));
+            t.accounts = accts.into_iter().map(String::from).collect();
+            t.instruction_data = w;
+            db.commit(&[t], &[], &[], &[]).unwrap();
+        };
+        // the real on-chain creation: NewFungibleDefinition "TESTNET-COIN", supply 100
+        let create = vec![1u32, 12, 1414743380, 760497486, 1313427267, 100, 0, 0, 0];
+        put("h1", 985, vec!["DEF", "ATA"], create);
+        assert_eq!(db.derive_holding_balance("ATA", "ch").as_deref(), Some("100"));
+
+        // Mint (5) adds, Burn (4) subtracts - swapping them would still "work" but be wrong
+        put("h2", 986, vec!["DEF", "ATA"], vec![5u32, 40, 0, 0, 0]);
+        assert_eq!(db.derive_holding_balance("ATA", "ch").as_deref(), Some("140"));
+        put("h3", 987, vec!["DEF", "ATA"], vec![4u32, 15, 0, 0, 0]);
+        assert_eq!(db.derive_holding_balance("ATA", "ch").as_deref(), Some("125"));
+
+        // Transfer (0): [sender, recipient] - direction comes from the account's position
+        put("h4", 988, vec!["ATA", "OTHER"], vec![0u32, 25, 0, 0, 0]);
+        assert_eq!(db.derive_holding_balance("ATA", "ch").as_deref(), Some("100"));
+        // the recipient was never created in our view, so its history is only a suffix
+        assert_eq!(db.derive_holding_balance("OTHER", "ch"), None, "no creation seen => no claim");
+
+        // an unknown opcode must abandon the derivation rather than under-report
+        put("h5", 989, vec!["DEF", "ATA"], vec![99u32, 1, 0, 0, 0]);
+        assert_eq!(db.derive_holding_balance("ATA", "ch"), None, "unknown op => no claim");
+
+        // A DIFFERENT zone's rows for the same account id must not be folded in. Account ids
+        // carry no zone component - an ATA id hashes owner+definition - so the same wallet or
+        // genesis on two zones produces byte-identical ids, and summing them would report one
+        // zone's balance plus another's as an exact figure.
+        let put2 = |hash: &str, blk: u64, accts: Vec<&str>, w: Vec<u32>| {
+            let mut t = rec(hash, "other", blk, Some("token"));
+            t.accounts = accts.into_iter().map(String::from).collect();
+            t.instruction_data = w;
+            db.commit(&[t], &[], &[], &[]).unwrap();
+        };
+        put2("z1", 5, vec!["DEF2", "ATA2"], vec![1u32, 12, 1414743380, 760497486, 1313427267, 70, 0, 0, 0]);
+        assert_eq!(db.derive_holding_balance("ATA2", "other").as_deref(), Some("70"));
+        // the same id on a zone that never created it stays unclaimed
+        assert_eq!(db.derive_holding_balance("ATA2", "ch"), None, "must not borrow another zone's history");
+        assert_eq!(db.derive_holding_balance("ATA2", ""), None, "unscoped must refuse");
+    }
+
+    // The replay must recognise a token program by the same rule as the rest of the store.
+    // `program` holds whatever label the decoding build produced - the raw image-id hex for any
+    // build we do not link - so matching the literal "token" skipped exactly the foreign builds
+    // this fallback exists for, and a store mixing labels for one program would fold part of an
+    // account's history and drop the rest while still presenting the total as exact.
+    #[test]
+    fn derives_balance_for_a_foreign_token_build() {
+        let _g = GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!("zs-holdfgn-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        // the rc5 token image id: a real label this store carries, and not the literal "token"
+        let rc5 = "c4584a559312f876bbde4248b1daf95f6fc895a42171734d3ffd32940c0adf24";
+        let put = |hash: &str, blk: u64, prog: &str, accts: Vec<&str>, w: Vec<u32>| {
+            let mut t = rec(hash, "ch", blk, Some(prog));
+            t.accounts = accts.into_iter().map(String::from).collect();
+            t.instruction_data = w;
+            db.commit(&[t], &[], &[], &[]).unwrap();
+        };
+        put("f1", 1, rc5, vec!["DEF", "ATA"], vec![1u32, 12, 1414743380, 760497486, 1313427267, 100, 0, 0, 0]);
+        assert_eq!(db.derive_holding_balance("ATA", "ch").as_deref(), Some("100"));
+        // mixed labels for the same program must still fold together, not silently drop
+        put("f2", 2, "token", vec!["ATA", "OTHER"], vec![0u32, 30, 0, 0, 0]);
+        assert_eq!(
+            db.derive_holding_balance("ATA", "ch").as_deref(),
+            Some("70"),
+            "a transfer out under a different label for the same program must still count"
+        );
+    }
+
+    // The token page's holder list is driven by DEF_HOLDER, which used to be written only from
+    // an ata Create. A token whose holdings were opened any other way therefore listed NO
+    // holders however much of it was held: live token PROJECT on zone 0101 showed an empty list
+    // with a 10,000,000 supply, one holding created by its own NewFungibleDefinition and
+    // another by InitializeAccount.
+    #[test]
+    fn holders_are_learned_from_every_holding_creation() {
+        let _g = GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!("zs-holders-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let put = |hash: &str, blk: u64, accts: Vec<&str>, w: Vec<u32>| {
+            let mut t = rec(hash, "ch", blk, Some("token"));
+            t.accounts = accts.into_iter().map(String::from).collect();
+            t.instruction_data = w;
+            db.commit(&[t], &[], &[], &[]).unwrap();
+        };
+        // NewFungibleDefinition "PROJECT" supply 10_000_000: [definition, supply holding]
+        put("d1", 1168, vec!["DEF", "SUPPLY"], vec![1u32, 7, 1246712400, 5522245, 10_000_000, 0, 0, 0]);
+        // InitializeAccount: [definition, holding] - opens a second, non-ATA holding
+        put("d2", 1177, vec!["DEF", "OTHER"], vec![3u32]);
+
+        let holders: Vec<String> =
+            db.token_holders("DEF", None, 50).into_iter().map(|h| h.account).collect();
+        assert!(holders.contains(&"SUPPLY".to_string()), "supply holding is a holder: {holders:?}");
+        assert!(holders.contains(&"OTHER".to_string()), "InitializeAccount opens a holder: {holders:?}");
+        // the definition itself is not one of its own holders
+        assert!(!holders.contains(&"DEF".to_string()), "definition must not list itself");
+    }
 
     #[test]
     fn token_mappings_learns_name_offline() {

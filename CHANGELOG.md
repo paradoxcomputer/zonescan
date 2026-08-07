@@ -3,6 +3,53 @@
 Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a minor bump
 (`0.x`) carries new features, a patch bump (`0.x.y`) carries fixes.
 
+## [0.8.0] - 2026-08-07
+
+The Logos testnet reset its chain on 2026-08-05 alongside blockchain_module 0.2.1, and LEZ
+repinned onto a bedrock whose wire format had changed. This release follows the chain through
+that, and fixes what the move exposed.
+
+### Added
+- **Sequencer funding balance.** The per-channel collateral the balance row used to show was
+  removed from the L1 in blockchain_module 0.2.1, so it read blank for every zone. The balance
+  that matters is the sequencer's funding account - it pays for inscriptions, and a zone stops
+  producing when it runs dry - and the L1 does publish that. Set it as the fifth field of a
+  zone's `ZONE_SCAN_SEQUENCERS` entry (`channel|rpc_url|label|full|funding_key`) to show it.
+- **An `unregistered` badge.** The chain accepts inscriptions addressed to a channel it has no
+  record of, so blocks keep arriving and a tip keeps climbing for a channel that no longer
+  exists - which is what a sequencer left running across a chain reset produces. Those zones now
+  say so instead of looking like ordinary sequencers. A transport failure leaves the state
+  unknown rather than marking a healthy zone, so a brief node outage cannot mislabel anything.
+- **Token holdings on zones with no sequencer RPC.** A token balance is account state, and the
+  only reader was the sequencer RPC, so holdings on a zone tracked from the L1 alone showed
+  nothing. The balance is now derived by replaying the holding's own token history. It is exact
+  or absent: without having seen the account created, or on an instruction it cannot classify,
+  it reports nothing rather than a total it cannot stand behind.
+- `ZONE_SCAN_IGNORE_CHANNELS` drops a channel from tracking entirely. Discovery re-finds a
+  channel from L1 history every time the walk reaches its old inscriptions, so this refuses it
+  at ingest, which is the only point that keeps it out for good.
+
+### Fixed
+- **Decoding follows LEZ to v0.2.4.** v0.2.2 bundled the privacy-preserving message's parallel
+  vectors into action structs, so public account ids and balances are no longer paired by
+  position. Zones now report their exact release rather than a `v0.2` family, and a test reads
+  the pin back out of the manifest so a retag cannot leave the badge behind.
+- **A reset zone no longer reads as INCONSISTENT.** Chain verification compared each block to
+  whichever preceded it in the walk. A zone that restarts its block ids has two generations
+  interleaved by id, so nearly every adjacent pair straddled them: one zone reported 985 chain
+  breaks with zero hash failures - every block individually valid, only the cross-generation
+  links failing. Verification now links to the blocks that actually claim the parent height.
+- **Transaction ages.** A row's age came from the zone's own sequencer clock, which some zones
+  set wrong by weeks. It now prefers the time the row was indexed, then L1 consensus time, and
+  falls back to the zone clock last.
+- **A token's holders are listed however the holding was created.** The holder list was fed only
+  by Associated Token Account creations, so a token whose holdings were opened by its own
+  definition or by `InitializeAccount` listed none at all, whatever was held.
+- **Searching a program id** opens that program's page instead of a zone page for a channel that
+  does not exist.
+- The channel API's `withdraw_threshold` was renamed `transfer_threshold` in the same release
+  and had been reading as absent.
+
 ## [0.7.0] - 2026-08-03
 
 ### Added
