@@ -29,7 +29,7 @@ axum = "0.7"
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 redb = "4"
-bincode = "1.3"
+bincode = "3.0"
 
 # decode build pinned to the v0.2.2 tag - the version the live sequencer runs. The Logos
 # testnet reset on 2026-08-05 with blockchain_module 0.2.1, whose bedrock changed wire format
