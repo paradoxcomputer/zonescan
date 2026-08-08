@@ -1,6 +1,6 @@
 [package]
 name = "zone-scan"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 description = "Sequencer-agnostic L1 observer for LEZ sequencers - CLI + live web dashboard, reads only public on-chain settlement data"
 license = "GPL-3.0-or-later"

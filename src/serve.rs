@@ -507,6 +507,74 @@ const ALIVE_SLOTS: u64 = 400;
 /// it settled a block recently. Independent of the (Tor-flaky) blocks stream.
 const ALIVE_TIP_SECS: u64 = 600;
 
+/// A zone is settling when its inscriptions are still landing near the frontier of the L1.
+/// Measured in slots for the same reason `ALIVE_SLOTS` is: finalized blocks are always about a
+/// finality window old in wall-clock, so slots are the only frame in which "keeping up with the
+/// chain" means one thing.
+///
+/// Sized from the measured gap between a zone's consecutive inscriptions, not from the average,
+/// because it is the tail that produces false accusations. Over a 4000-slot sample of the three
+/// live zones: median 61-65 slots, p95 ~120, longest 191 - and a 284-slot gap observed live
+/// minutes later. So the healthy tail runs well past any figure the mean suggests, and 1200 sits
+/// about ten times the p95 above it. It still surfaces a stalled outbox inside ~20 minutes,
+/// which is the right trade: telling someone a working zone has stopped settling costs more than
+/// telling them twenty minutes late.
+const SETTLE_SLOTS: u64 = 1200;
+
+/// Are this zone's blocks actually reaching the L1?
+///
+/// A separate question from liveness, and the reason the two are tracked apart: a stalled outbox
+/// mints blocks every minute while nothing of theirs lands on the chain, so a healthy `alive`
+/// says nothing about whether anything settled.
+///
+/// The signal is the zone's own inscriptions on the L1 - the thing settlement literally is - and
+/// NOT the `/channel/:id` record's tip. That record is not a per-block signal: zone 0101 sat at
+/// tip_slot 283143 across two readings 23 minutes apart, then jumped ~5000 slots in one step,
+/// while inscribing 67 times in the same window. A tip that has not moved says nothing about a
+/// zone, which is the whole trap this function exists to avoid.
+///
+/// Measured against `frontier` - the newest L1 slot WE have read a block at - rather than the
+/// node's head, so an explorer that falls behind never renders as a zone that stopped:
+///   `Some(true)`  - its newest inscription is within `SETTLE_SLOTS` of that frontier
+///   `Some(false)` - it is demonstrably producing, and nothing of its has landed in that span
+///   `None`        - no evidence either way: no L1 read yet, quiet on both sides, or too early
+fn settling_verdict(
+    latest_slot: u64,
+    frontier: u64,
+    watched_from: u64,
+    producing: bool,
+) -> Option<bool> {
+    // No L1 block read: nothing to measure a zone against, and our own blindness must never
+    // render as its failure.
+    if frontier == 0 {
+        return None;
+    }
+    if latest_slot > 0 && frontier.saturating_sub(latest_slot) < SETTLE_SLOTS {
+        return Some(true);
+    }
+    // Only an accusation once we have read a full window of chain: a zone cannot be shown to
+    // have missed a window nobody watched.
+    if producing && frontier.saturating_sub(watched_from) >= SETTLE_SLOTS {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+impl L1Track {
+    /// Record that we have read an L1 block at this slot. Monotonic: a backfill walking old
+    /// slots must not drag the frontier backwards and turn every live zone into a stalled one.
+    fn note_read_slot(&mut self, slot: u64) {
+        if slot == 0 {
+            return;
+        }
+        if self.first_ingested_slot == 0 {
+            self.first_ingested_slot = slot;
+        }
+        self.ingested_slot = self.ingested_slot.max(slot);
+    }
+}
+
 fn now_unix() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
@@ -520,6 +588,12 @@ struct L1Track {
     tip_slot: Option<u64>,
     lib_slot: Option<u64>,
     prev_slot: Option<u64>,
+    /// Newest L1 slot we have actually READ a block at, and the first one this run. Not the
+    /// node's head: settlement is judged against what this explorer has seen, so a stream that
+    /// falls behind stalls the yardstick along with the measurements and cannot turn into an
+    /// accusation against every zone at once.
+    ingested_slot: u64,
+    first_ingested_slot: u64,
     /// wall-clock of the last tip/lib increase; `advancing` is derived from this over a
     /// time window, so it doesn't flicker when consecutive events repeat the same slot.
     last_advance_unix: u64,
@@ -687,11 +761,48 @@ struct SeqTrack {
     l1_signers: usize,
     /// Chain-consistency verdict over the scanned window.
     consistency: Consistency,
+    /// When the sequencer's self-reported tip last ADVANCED, as observed over its RPC. This is
+    /// direct evidence the zone is producing, independent of whether it is settling: a zone can
+    /// mint blocks steadily while its L1 channel tip sits still, which is what a stalled outbox
+    /// looks like from outside. `0` until seen to move.
+    #[serde(default)]
+    seq_tip_change_unix: u64,
     /// The sequencer's self-reported tip (`getLastBlockId` via its RPC), to
     /// cross-check against what it actually settled on L1.
     seq_tip: Option<u64>,
+    /// The previous `getLastBlockId` answer, kept apart from `seq_tip` so that detecting an
+    /// advance is not confused by the block reader writing its own ingest high-water mark
+    /// there. `skip`: an advance has to be two readings taken by this process.
+    #[serde(skip)]
+    rpc_tip_seen: Option<u64>,
     /// L1 slot of this channel's latest inscription (for frontier-relative liveness).
+    ///
+    /// NOT usable as a settlement signal: the sequencer-RPC block reader also feeds this, and
+    /// there a "slot" is the block's own id (sequencer mode has no L1 slot at all), so on a
+    /// `full` zone it holds small block numbers rather than chain slots. Seen live: zone 7777
+    /// read `latest_slot = 1291`, its L2 block id, against an L1 head of 288683.
     latest_slot: u64,
+    /// L1 slot of this channel's newest inscription READ FROM THE L1 - the walk, the discovery
+    /// scan, or the live block stream, never the sequencer's own RPC. This is settlement:
+    /// the zone's block, in a block of the chain. 0 until one has been read.
+    #[serde(default)]
+    l1_slot_seen: u64,
+    /// The highest block id of this zone's that we have SEEN in an L1 block, and the highest
+    /// seen at a slot at/below `lib`. These are the only finality facts the chain actually
+    /// evidences, and they exist because the others do not:
+    ///
+    /// `safe_block_id` is lifted by the sequencer-RPC block reader for every block the
+    /// sequencer serves, on the assumption that settlement is its whole job. `finalized_block_id`
+    /// is lifted from `bedrock_status = Finalized`, a flag the sequencer writes into its own
+    /// block and hands back over its own RPC. Neither consults the L1. A sequencer whose outbox
+    /// is dead therefore reports its own transactions as irreversibly settled: zone 7777 showed
+    /// `finalized_block_id = 1291` - marking its newest tx "final" - while its channel had not
+    /// appeared in an L1 block for 77,000 slots and its publisher was failing on every attempt.
+    /// The snapshot clamps the reported tiers to these whenever there is an L1 to check against.
+    #[serde(default)]
+    l1_safe_block_id: u64,
+    #[serde(default)]
+    l1_final_block_id: u64,
     /// (block_id, hash) of the last block fed to the live per-block verifier, so
     /// the next streamed block can be chain-checked against it.
     verify_cursor: Option<(u64, String)>,
@@ -1051,6 +1162,19 @@ fn version_from_txs(txs: &[TxInfo]) -> Option<&'static str> {
 /// This is the primary Safe/Finalized signal in L1 mode, because the sequencer freezes
 /// inscribed blocks at `bedrock_status = Pending` (so the decoded status can't tell us).
 /// Additive: never lowers a threshold.
+/// Record a block of this zone's seen in an actual L1 block - the only thing that makes a tx
+/// "on L1", and past `lib`, "final". Separate from `raise_finality`, which the sequencer's own
+/// RPC also drives.
+fn note_l1_settled(e: &mut SeqTrack, block_id: u64, slot: Option<u64>, lib: Option<u64>) {
+    if block_id >= MAX_PLAUSIBLE_BLOCK_ID {
+        return;
+    }
+    e.l1_safe_block_id = e.l1_safe_block_id.max(block_id);
+    if matches!((slot, lib), (Some(sl), Some(l)) if sl <= l) {
+        e.l1_final_block_id = e.l1_final_block_id.max(block_id);
+    }
+}
+
 fn raise_finality(e: &mut SeqTrack, block_id: u64, finalized: bool) {
     e.safe_block_id = e.safe_block_id.max(block_id);
     if finalized {
@@ -1155,6 +1279,9 @@ struct Snapshot {
 struct L1Snap {
     reachable: bool,
     height: Option<u64>,
+    /// Newest L1 slot this explorer has read a block at. Settlement is judged against this
+    /// rather than `tip_slot`, so falling behind never reads as every zone stalling at once.
+    ingested_slot: u64,
     tip_slot: Option<u64>,
     lib_slot: Option<u64>,
     finality_lag: Option<u64>,
@@ -1210,9 +1337,22 @@ struct SeqSnap {
     /// None = not verified (no decode / no blocks); Some(true/false) = chain verdict.
     consistent: Option<bool>,
     /// sequencer's self-reported tip (getLastBlockId) for the L1 cross-check.
+    /// When the sequencer's own tip last advanced, so the UI can tell producing from
+    /// settling. 0 = never observed to move.
+    #[serde(default)]
+    seq_tip_change_unix: u64,
     seq_tip: Option<u64>,
     /// unix secs when the channel tip last changed (it settled a block); 0 if unseen.
     tip_change_unix: u64,
+    /// Whether its blocks are reaching the L1. Absent = no evidence either way; the UI tags
+    /// only what was observed. Deliberately independent of `alive`, which a stalled outbox
+    /// leaves true: the zone keeps minting and the chain never hears about it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settling: Option<bool>,
+    /// L1 slot of this zone's newest inscription - a block of its demonstrably on the chain.
+    /// 0 when none has been read. Compare against `l1.ingested_slot` for how far behind the
+    /// chain frontier its settlement sits.
+    settled_slot: u64,
     /// detected LEZ build ("rc3"/"rc4"/"rc5"/"v0.2"), or None if not yet recognized.
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
@@ -1284,7 +1424,15 @@ fn build_snapshot(
                     (t.latest_block_id - t.first_block_id) as f64 / mins
                 })
                 .filter(|v| v.is_finite());
-            let alive = if t.tip_change_unix > 0 {
+            // A zone that is minting blocks is alive even when it is not settling them. Those
+            // are different failures: a stalled outbox freezes the L1 channel tip while the
+            // sequencer keeps producing every minute, and reporting that as IDLE says the zone
+            // is doing nothing when it is doing almost everything. Seen live on 0101… and on
+            // 7777…, both minting once a minute with a channel tip that had not moved in 20.
+            let producing = t.seq_tip_change_unix > 0
+                && now.saturating_sub(t.seq_tip_change_unix) < ALIVE_TIP_SECS;
+            let alive = producing
+                || if t.tip_change_unix > 0 {
                 // primary: did its channel tip move recently (it settled a block)?
                 now.saturating_sub(t.tip_change_unix) < ALIVE_TIP_SECS
             } else {
@@ -1293,6 +1441,24 @@ fn build_snapshot(
                     Some(lib) if t.latest_slot > 0 => lib.saturating_sub(t.latest_slot) < ALIVE_SLOTS,
                     _ => false,
                 }
+            };
+            // Finality has to be evidenced by the chain, not asserted by the zone. With an L1
+            // in view, cap both tiers at what we have actually seen inscribed there. Without
+            // this a sequencer whose outbox is dead keeps marking its own blocks Finalized and
+            // zonescan repeats it: zone 7777 called its newest tx "final - irreversibly settled
+            // on the L1" while the chain had not carried that channel for 77,000 slots. With no
+            // L1 configured there is nothing to check against and the zone's own account is all
+            // there is, so leave it alone rather than blanking every tx to "pending".
+            let l1_view = s.l1.ingested_slot > 0;
+            let finalized_block_id = if l1_view {
+                t.finalized_block_id.min(t.l1_final_block_id)
+            } else {
+                t.finalized_block_id
+            };
+            let safe_block_id = if l1_view {
+                t.safe_block_id.min(t.l1_safe_block_id)
+            } else {
+                t.safe_block_id
             };
             let activity_state = activity_state(t, s.l1.lib_slot);
             // Never surface a garbage block_id from a mis-parsed non-rc5 body (belt-and-
@@ -1306,10 +1472,10 @@ fn build_snapshot(
                 channel: ch.clone(),
                 channel_short: short(ch),
                 latest_block_id,
-                finalized_block_id: t.finalized_block_id,
+                finalized_block_id,
                 // guarantee safe >= finalized for the client thresholds, even if a source
                 // raised finalized without a matching safe (shouldn't happen, but cheap).
-                safe_block_id: t.safe_block_id.max(t.finalized_block_id),
+                safe_block_id: safe_block_id.max(finalized_block_id),
                 inscriptions_seen: t.inscriptions_seen,
                 tx_count_last: t.tx_count_last,
                 tx_mix: t.tx_mix.clone(),
@@ -1323,7 +1489,15 @@ fn build_snapshot(
                 consistency: t.consistency.clone(),
                 consistent: (t.consistency.checked > 0).then(|| t.consistency.ok()),
                 seq_tip: t.seq_tip,
+                seq_tip_change_unix: t.seq_tip_change_unix,
                 tip_change_unix: t.tip_change_unix,
+                settling: settling_verdict(
+                    t.l1_slot_seen,
+                    s.l1.ingested_slot,
+                    s.l1.first_ingested_slot,
+                    producing,
+                ),
+                settled_slot: t.l1_slot_seen,
                 version: t.version.clone(),
                 l1_tip_slot: t.l1_tip_slot,
                 l1_tip_start_slot: t.l1_tip_start_slot,
@@ -1364,6 +1538,7 @@ fn build_snapshot(
         l1: L1Snap {
             reachable: s.l1.reachable,
             height: s.l1.height,
+            ingested_slot: s.l1.ingested_slot,
             tip_slot: s.l1.tip_slot,
             lib_slot: s.l1.lib_slot,
             finality_lag,
@@ -2077,6 +2252,7 @@ async fn discover_seed(
         }
         {
             let mut s = app.inner.lock().unwrap();
+            let lib_slot = s.l1.lib_slot;
             for (ch, agg) in map {
                 let e = s.seqs.entry(ch).or_insert_with(SeqTrack::default);
                 e.latest_block_id = e.latest_block_id.max(agg.latest_block_id);
@@ -2092,6 +2268,9 @@ async fn discover_seed(
                 }
                 if let Some(ls) = agg.latest_slot {
                     e.latest_slot = e.latest_slot.max(ls);
+                    e.l1_slot_seen = e.l1_slot_seen.max(ls);
+                    // read off the L1, so it evidences settlement the sequencer's word cannot
+                    note_l1_settled(e, agg.latest_block_id, Some(ls), lib_slot);
                 }
                 e.seeded = true;
                 e.inited = true;
@@ -2237,12 +2416,16 @@ async fn backfill_walk(
         let from = hi.saturating_sub(chunk).max(lo_stop);
         let url = format!("{base}/cryptarchia/blocks?slot_from={from}&slot_to={hi}");
         let mut decoded: Vec<(String, Option<u64>, Decoded)> = Vec::new();
+        let mut chunk_tip: Option<u64> = None;
         if let EndpointResult::Ok(Value::Array(blocks)) = get_json(client, &url).await {
             for b in &blocks {
                 let slot = b
                     .get("header")
                     .and_then(|h| jget_u64(h, "slot"))
                     .or_else(|| find_u64(b, "slot"));
+                // Every block read moves our frontier, whether or not it carried an inscription:
+                // an empty stretch of chain is exactly what a zone failing to settle looks like.
+                chunk_tip = chunk_tip.max(slot);
                 let mut found = Vec::new();
                 collect_inscriptions(b, &mut found);
                 for ri in found {
@@ -2267,6 +2450,12 @@ async fn backfill_walk(
         let mut recs: Vec<TxRecord> = Vec::new();
         let (summaries, accts) = {
             let mut s = app.inner.lock().unwrap();
+            if let Some(sl) = chunk_tip {
+                s.l1.note_read_slot(sl);
+            }
+            // finality is the block's own slot against the frontier, not an assumption about
+            // which blocks this endpoint returns: it does serve slots above `lib`.
+            let lib_slot = s.l1.lib_slot;
             for (cid, slot, d) in &decoded {
                 ingest(&mut s, cid, *slot, d, 0);
                 let e = s.seqs.entry(cid.clone()).or_default();
@@ -2297,6 +2486,10 @@ async fn backfill_walk(
                 }
                 if let Some(sl) = slot {
                     e.latest_slot = e.latest_slot.max(*sl);
+                    e.l1_slot_seen = e.l1_slot_seen.max(*sl);
+                }
+                if !d.undecodable {
+                    note_l1_settled(e, d.block_id, *slot, lib_slot);
                 }
                 e.seeded = true;
                 recs.extend(records_from(cid, *slot, d, 0));
@@ -2758,10 +2951,38 @@ async fn refresh_channels(client: &Client, base: &str, app: &AppState) {
             if let Some(tip) = rpc_get_last_block_id(client, url).await {
                 let mut s = app.inner.lock().unwrap();
                 if let Some(t) = s.seqs.get_mut(&ch) {
+                    // Compare against the last value THIS poll saw, not the shared `seq_tip`:
+                    // the sequencer-RPC block reader overwrites that field with the highest
+                    // block it has ingested, which on a zone whose chain runs ahead of its own
+                    // sequencer sits permanently above what `getLastBlockId` answers. Comparing
+                    // against it would then never register an advance, and a zone that is
+                    // plainly minting would read as producing nothing.
+                    if t.rpc_tip_seen.is_some_and(|prev| tip > prev) {
+                        t.seq_tip_change_unix = now_unix();
+                    }
+                    t.rpc_tip_seen = Some(tip);
                     t.seq_tip = Some(tip);
                 }
             }
         }
+    }
+}
+
+/// Where the sequencer-RPC reader resumes from, given its own high-water mark and the tip the
+/// sequencer reports now. Normally `have`; when the tip has fallen below it the chain reset (or
+/// we were never on this chain at all), so re-seed rather than wait for it to climb back.
+///
+/// A cursor above the tip is not a rare edge: a channel can carry two producers' block-id spaces,
+/// and reading the cursor from the shared `latest_block_id` put zone 0101's reader at 3406
+/// against a tip of 1770, where it stopped ingesting permanently.
+fn seq_reader_cursor(have: u64, tip: u64, full: bool, window: u64) -> u64 {
+    if have <= tip {
+        return have;
+    }
+    if full {
+        0
+    } else {
+        tip.saturating_sub(window)
     }
 }
 
@@ -2993,6 +3214,13 @@ async fn sequencer_loop(
             .unwrap_or(0)
     };
     let mut backfilled = false;
+    // This reader's OWN high-water mark. Deliberately not `latest_block_id`: that field is a
+    // monotonic max shared with the L1 walk, and a channel can carry two block-id spaces at
+    // once - zone 0101 had the walk raise it to 3405 off one producer's inscriptions while the
+    // sequencer we poll answered 1770. Reading the cursor from there asks for block 3406 of a
+    // chain whose tip is 1770, so the fetch loop never runs again and the zone silently stops
+    // ingesting for good: it cannot recover until the RPC tip climbs 1600 blocks.
+    let mut have: u64 = 0;
     println!("sequencer source {}: {rpc_url}", short(&channel));
 
     while app.generation.load(Ordering::SeqCst) == generation {
@@ -3023,14 +3251,17 @@ async fn sequencer_loop(
             };
             (start, "backfill")
         } else {
-            let have = app
-                .inner
-                .lock()
-                .unwrap()
-                .seqs
-                .get(&channel)
-                .map(|t| t.latest_block_id)
-                .unwrap_or(0);
+            // Same rollback test as the first pass, applied every time rather than once: a
+            // sequencer that resets (or a channel with a second producer on it) leaves our
+            // cursor above its tip, and only re-seeding gets the reader moving again.
+            let reseeded = seq_reader_cursor(have, tip, full, window);
+            if reseeded != have {
+                eprintln!(
+                    "sequencer {}: tip {tip} < cursor {have} (rollback/reset) - re-seeding from {reseeded}",
+                    short(&channel)
+                );
+                have = reseeded;
+            }
             (have + 1, "live")
         };
         let had_new = next <= tip;
@@ -3043,6 +3274,7 @@ async fn sequencer_loop(
             ingest_seq_chunk(&app, &channel, &chunk).await;
             next = end + 1;
         }
+        have = have.max(next.saturating_sub(1));
         backfilled = true;
         // Advance the L1-finality frontier: re-read a bounded chunk of blocks just above the
         // finalized threshold so their bedrock_status pending->Finalized flips are picked up
@@ -3056,6 +3288,10 @@ async fn sequencer_loop(
                 .get(&channel)
                 .map(|t| t.finalized_block_id)
                 .unwrap_or(0);
+            // clamp for the same reason as the cursor above: `finalized_block_id` is shared
+            // with the L1 walk, so on a two-producer channel it can sit above this sequencer's
+            // entire chain and freeze the finality re-read forever.
+            let fin = fin.min(tip);
             if fin + 1 <= tip {
                 let to = (fin + CHUNK).min(tip);
                 let chunk = seq_fetch_chunk(&client, &rpc_url, fin + 1, to).await;
@@ -3254,6 +3490,9 @@ async fn handle_event(
         let mut decoded: Vec<(String, Decoded)> = Vec::new();
         {
             let mut s = app.inner.lock().unwrap();
+            if let Some(sl) = slot {
+                s.l1.note_read_slot(sl);
+            }
             // This is a *live* L1 block off the stream: its inscriptions are on the L1 (at
             // least Safe). It's Finalized only once we know its slot is at/below `lib`; a
             // freshly streamed tip block (slot > lib) stays Safe until finality catches up.
@@ -3269,8 +3508,12 @@ async fn handle_event(
                 if let Some(d) = decode_inscription_with(&ri.value, ri.tx_hash.as_deref()) {
                     ingest(&mut s, &ch, slot, &d, now);
                     let e = s.seqs.entry(ch.clone()).or_default();
+                    if let Some(sl) = slot {
+                        e.l1_slot_seen = e.l1_slot_seen.max(sl);
+                    }
                     if !d.undecodable {
                         raise_finality(e, d.block_id, l1_final);
+                        note_l1_settled(e, d.block_id, slot, lib);
                     }
                     e.observe(&d, now);
                     e.verify(&d); // re-check accuracy on every new block
@@ -5491,6 +5734,10 @@ const DASH_HTML: &str = r#"<!doctype html>
   .v-data{background:#fef9c3;color:#854d0e}
   /* a channel the L1 has no record of: inscriptions land as data but settle nothing */
   .v-unreg{background:#fee2e2;color:#991b1b}
+  /* is the zone's output reaching the L1? amber, not red: a zone that is minting and not
+     settling is degraded, not gone - unlike an unregistered channel, which cannot settle at all */
+  .v-settling{background:rgba(19,169,123,.14);color:var(--green)}
+  .v-nosettle{background:#fef3c7;color:#92400e}
   /* L1-finality badge: green "final" > blue "on L1 · finalizing" > grey "pending" */
   .fbadge{display:inline-block;font-size:10px;font-weight:700;padding:1px 6px;border-radius:5px;vertical-align:middle}
   .fbadge.fin{background:rgba(19,169,123,.14);color:var(--green)}
@@ -6010,6 +6257,30 @@ function dataBadge(s){ return s&&s.data_channel?`<span class="vbadge v-data" tit
 // publishing to its old channel. Only badge on an explicit false: undefined means not asked.
 function unregBadge(s){ return s&&s.l1_registered===false
   ? `<span class="vbadge v-unreg" title="the L1 has no channel record for this id - its inscriptions are accepted as data but settle nothing. Usually a sequencer still publishing to a channel that a chain reset wiped.">unregistered</span>` : ''; }
+// Whether the zone's blocks are reaching the L1, which `alive` does not answer: a stalled
+// outbox keeps minting while nothing settles. Absent means no evidence either way - no L1 in
+// view, too early to tell, or quiet on both sides - and says nothing rather than guessing, so
+// this must compare against null explicitly, never test truthiness, or a settling zone would
+// read as not settling. Two kinds of channel are skipped outright, because "settling" would not
+// mean there what it means elsewhere: a data channel, whose inscriptions ARE the payload rather
+// than blocks a sequencer settles, and an unregistered one, whose inscriptions land as data and
+// update no channel state - 8888 and 8201 inscribe every ~60 slots and settle nothing by doing
+// it, so a green tag beside their red one would be exactly backwards.
+function settleBadge(s){
+  if(!s || s.data_channel || s.l1_registered===false || s.settling==null) return '';
+  return s.settling
+    ? `<span class="vbadge v-settling" title="its blocks are reaching the L1 - its newest inscription is near the frontier of the chain we have read">settling</span>`
+    : `<span class="vbadge v-nosettle" title="the sequencer is minting blocks but none of them have landed on the L1 in the last 1200 slots - the zone is running, its blocks are not settling">not settling</span>`;
+}
+// How far behind the chain we have read this zone's newest inscription sits. Slots, not
+// seconds: a finalized block is always about a finality window old in wall-clock, so an age
+// here would read as a lag every healthy zone shares.
+function settledLag(s){
+  const f=state&&state.l1&&state.l1.ingested_slot;
+  if(!f || !s.settled_slot) return '';
+  const n=Math.max(0, f-s.settled_slot);
+  return ` <span class="mut" style="font-size:11px">(${num(n)} slot${n===1?'':'s'} behind the chain we have read)</span>`;
+}
 // a zone's display title: the friendly alias when known, else the short hex.
 function zoneTitle(s){ return aliasOf(s.channel) || s.channel_short || sh(s.channel); }
 // sequencer (LEZ/zone) version as a labeled value: the rc-family badge (rc3/rc4/rc5),
@@ -6044,6 +6315,8 @@ function chainCheckText(s){
 function tipNote(s){
   if(s.seq_tip==null) return '';
   if(s.seq_tip < s.latest_block_id) return ` · <span class="tipwarn" title="sequencer reports a lower tip than it has settled on L1">seq tip #${num(s.seq_tip)} &lt; L1 #${num(s.latest_block_id)} ⚠</span>`;
+  // Producing-but-not-settling is its own tag now (settleBadge), derived server-side from the
+  // same window as liveness rather than re-guessed here from two timestamps.
   return ` · seq tip #${num(s.seq_tip)} (L1 #${num(s.latest_block_id)})`;
 }
 
@@ -6818,7 +7091,7 @@ function renderSeqs(){
   const none={all:'sequencers',rc:'sequencer zones',data:'data channels'}[zoneFilter]||'sequencers';
   el.innerHTML = seqs.length ? slice.map(s=>`<a class="srow" href="/zone/${u(s.channel)}" style="text-decoration:none;color:inherit">
       <span class="dot ${s.alive?'on':'off'}"></span>
-      <div class="sm"><div class="a">${esc(zoneTitle(s))}${dataBadge(s)}${unregBadge(s)}${consBadge(s)}</div>
+      <div class="sm"><div class="a">${esc(zoneTitle(s))}${dataBadge(s)}${unregBadge(s)}${settleBadge(s)}${consBadge(s)}</div>
         <div class="zmeta"><span class="zf"><span class="zk">Channel ID</span> <span class="chex">${esc(s.channel_short)}</span></span><span class="zf"><span class="zk">Sequencer version</span> ${verValue(s)}</span></div>
         <div class="b">L2 ${l2Tip(s)} · funding ${s.l1_balance!=null?grp(s.l1_balance):'n/a'} · ${s.l1_signers||0} key(s)${bpmStr(s)?' · '+bpmStr(s):''}${tipNote(s)}${activityChip(s)}</div></div>
       <span class="st ${s.alive?'alive':'idle'}">${s.alive?'ALIVE':'IDLE'}</span></a>`).join('')
@@ -6890,7 +7163,7 @@ async function renderZone(seq){
   const s=(seq===LOCAL_ZONE)?localZoneSnap()
     :(((state&&state.sequencers)||[]).find(x=>x.channel===seq)||{channel:seq,channel_short:sh(seq)});
   $('view').innerHTML=`${crumb([{t:'Home',href:'/'},{t:'Zone '+sh(seq)}])}
-  <div class="panel" style="margin-bottom:16px"><div class="phead">${s.data_channel?'Channel':'Sequencer'} ${chanLabel(s.channel, s.channel_short)} ${dataBadge(s)}${unregBadge(s)}${verBadge(s)}${consBadge(s)}</div>
+  <div class="panel" style="margin-bottom:16px"><div class="phead">${s.data_channel?'Channel':'Sequencer'} ${chanLabel(s.channel, s.channel_short)} ${dataBadge(s)}${unregBadge(s)}${settleBadge(s)}${verBadge(s)}${consBadge(s)}</div>
     <div class="ovw">
       <div><div class="k">Latest L2 Block</div><div class="v">${l2Tip(s)}</div></div>
       <div><div class="k" title="the sequencer&#39;s L1 funding account - what pays for inscriptions">Sequencer Funding Balance</div><div class="v">${s.l1_balance!=null?grp(s.l1_balance):`<span class="mut" title="set this zone's funding account as the 5th field of its ZONE_SCAN_SEQUENCERS entry to show it. The L1 stopped publishing per-channel collateral in blockchain_module 0.2.1, and channels hold no deposits on this chain.">n/a</span>`}</div></div>
@@ -6901,7 +7174,7 @@ async function renderZone(seq){
       <div class="k">Channel id</div><div class="v">${esc(seq)}</div>
       ${txMixStr(s)?`<div class="k">Tx mix</div><div class="v">${txMixStr(s)}</div>`:''}
       <div class="k">LEZ Version</div><div class="v">${s.version?esc(s.version):'-'}</div>
-      <div class="k">Last settled</div><div class="v">${s.tip_change_unix?fmtAge(s.tip_change_unix):'-'} <span class="mut" style="font-size:11px">(channel tip)</span></div>
+      <div class="k">Last settled</div><div class="v">${s.settled_slot?`L1 slot ${num(s.settled_slot)}`:'-'}${settledLag(s)}${settleBadge(s)}</div>
       <div class="k">Signer keys</div><div class="v">${num(s.l1_signers)}</div>
       <div class="k">Sequencer tip (RPC)</div><div class="v">${s.seq_tip!=null?'#'+num(s.seq_tip)+(s.seq_tip<s.latest_block_id?' ⚠ below L1':''):'-'}</div>
       <div class="k">Chain check</div><div class="v">${esc(chainCheckText(s))}</div>
@@ -7706,6 +7979,178 @@ mod tests {
         assert!(js.contains("${unregBadge(s)}"), "badge is defined but never rendered");
     }
 
+    // Same rule for the settling tag, for the same reason and one more: `settling` is absent
+    // from the snapshot whenever there is no evidence, so a truthiness test would render the
+    // "not settling" tag on every zone that simply has not been observed yet - accusing a
+    // healthy sequencer of a failure it does not have.
+    #[test]
+    fn settling_badge_needs_an_explicit_null_check() {
+        let js = DASH_HTML;
+        let f = js
+            .split("function settleBadge(s){")
+            .nth(1)
+            .expect("settleBadge is defined in the dashboard");
+        let body = &f[..f.find("\n}").unwrap_or(f.len().min(600))];
+        assert!(
+            body.contains("s.settling==null"),
+            "must bail on an absent verdict explicitly, not test truthiness: {body}"
+        );
+        // a channel that settles nothing by construction must never be tagged as settling
+        assert!(
+            body.contains("s.data_channel") && body.contains("s.l1_registered===false"),
+            "data and unregistered channels must be skipped: {body}"
+        );
+        assert!(js.contains("${settleBadge(s)}"), "tag is defined but never rendered");
+    }
+
+    // Settlement is judged from the zone's own inscriptions on the L1, measured against the
+    // chain WE have read. The states are load-bearing: a zone quiet on both sides is idle rather
+    // than failing to settle, and an explorer that has fallen behind must never render its own
+    // blindness as every zone stalling at once.
+    #[test]
+    fn settling_is_measured_against_the_chain_we_have_read() {
+        const FRONTIER: u64 = 288_000;
+        let near = FRONTIER - 50;
+        let far = FRONTIER - (SETTLE_SLOTS + 100);
+        let watched = FRONTIER - (SETTLE_SLOTS + 10); // read a full window this run
+        // (latest_slot, frontier, watched_from, producing)
+        let v = settling_verdict;
+
+        // its newest inscription is at the frontier: settling
+        assert_eq!(v(near, FRONTIER, watched, true), Some(true));
+        // ...and settling is settling even when the sequencer's own RPC is unreachable
+        assert_eq!(v(near, FRONTIER, watched, false), Some(true));
+        // minting, nothing of its on the chain for the whole window: the stalled outbox
+        assert_eq!(v(far, FRONTIER, watched, true), Some(false));
+        // never seen to inscribe at all, and still minting: the same failure, and the one that
+        // matters most - it must not render as silence
+        assert_eq!(v(0, FRONTIER, watched, true), Some(false));
+        // quiet on both sides: idle, which is a different failure - claim nothing
+        assert_eq!(v(far, FRONTIER, watched, false), None);
+        assert_eq!(v(0, FRONTIER, watched, false), None);
+        // read less than a window of chain this run: no grounds to accuse anyone yet
+        assert_eq!(v(far, FRONTIER, FRONTIER - 10, true), None);
+        assert_eq!(v(0, FRONTIER, FRONTIER, true), None);
+        // no L1 block read at all: nothing to measure against
+        assert_eq!(v(0, 0, 0, true), None);
+        assert_eq!(v(near, 0, 0, true), None);
+    }
+
+    // "final" means the L1 carried it and finalized it. The sequencer cannot establish either:
+    // `bedrock_status = Finalized` is a flag it writes into its own block and hands back over
+    // its own RPC, and the RPC block reader lifts the Safe tier for every block it is served.
+    // A zone whose outbox is dead therefore reports its own transactions as irreversibly
+    // settled - live on 7777, which called its newest tx final while its channel had not
+    // appeared in an L1 block for 77,000 slots.
+    #[test]
+    fn finality_needs_l1_evidence_not_the_sequencers_word() {
+        let mut t = SeqTrack::default();
+        // the sequencer's own account, believed wholesale by the RPC paths
+        raise_finality(&mut t, 1313, false); // safe, from the block reader
+        raise_finality(&mut t, 1291, true); // "Finalized", from bedrock_status
+        assert_eq!(t.safe_block_id, 1313);
+        assert_eq!(t.finalized_block_id, 1291);
+        // ...and nothing of this zone's has ever been read out of an L1 block
+        assert_eq!(t.l1_safe_block_id, 0);
+        assert_eq!(t.l1_final_block_id, 0);
+
+        // Seeing block 600 inscribed at a slot ABOVE lib makes it "on L1", not final.
+        note_l1_settled(&mut t, 600, Some(290_000), Some(287_000));
+        assert_eq!(t.l1_safe_block_id, 600);
+        assert_eq!(t.l1_final_block_id, 0, "above lib is inscribed, not irreversible");
+        // ...and at/below lib, final.
+        note_l1_settled(&mut t, 590, Some(286_000), Some(287_000));
+        assert_eq!(t.l1_final_block_id, 590);
+        // an unknown slot proves nothing about finality
+        note_l1_settled(&mut t, 610, None, Some(287_000));
+        assert_eq!(t.l1_safe_block_id, 610);
+        assert_eq!(t.l1_final_block_id, 590);
+        // a garbage id from a mis-parsed body must not poison the ceiling
+        note_l1_settled(&mut t, MAX_PLAUSIBLE_BLOCK_ID, Some(286_000), Some(287_000));
+        assert_eq!(t.l1_safe_block_id, 610);
+
+        // The clamp the snapshot applies: the zone's claim, capped by the chain's evidence.
+        assert_eq!(t.finalized_block_id.min(t.l1_final_block_id), 590);
+        assert_eq!(t.safe_block_id.min(t.l1_safe_block_id), 610);
+    }
+
+    // The sequencer-RPC reader must keep its own cursor and re-check it against the tip on every
+    // pass. A channel can carry two producers' block-id spaces at once, and the shared
+    // `latest_block_id` is a monotonic max over both: zone 0101 had it raised to 3405 off the L1
+    // walk while the sequencer being polled answered 1770, which parked the reader at block 3406
+    // of a 1770-block chain. It ingested nothing further for 15 hours and could not self-heal.
+    #[test]
+    fn a_reader_cursor_above_the_tip_reseeds_instead_of_wedging() {
+        // ordinary case: keep the high-water mark
+        assert_eq!(seq_reader_cursor(100, 200, false, 50), 100);
+        assert_eq!(seq_reader_cursor(200, 200, false, 50), 200);
+        // cursor above the tip: a full-history reader restarts from the beginning...
+        assert_eq!(seq_reader_cursor(3405, 1770, true, 50), 0);
+        // ...and a windowed one from the window floor, never from the stale cursor
+        assert_eq!(seq_reader_cursor(3405, 1770, false, 500), 1270);
+        // window wider than the chain must not underflow
+        assert_eq!(seq_reader_cursor(3405, 10, false, 500), 0);
+    }
+
+    // The live cursor must never be read back out of the shared per-channel tip, which the L1
+    // walk also writes. That is the exact wiring that wedged 0101.
+    #[test]
+    fn the_live_reader_does_not_read_the_shared_latest_block_id() {
+        let src = include_str!("serve.rs");
+        let body = src
+            .split("fn sequencer_loop(")
+            .nth(1)
+            .and_then(|f| f.split_once("\n}\n"))
+            .map(|(b, _)| b)
+            .expect("sequencer_loop is defined");
+        let live = body.split("(start, \"backfill\")").nth(1).expect("live branch follows the backfill branch");
+        assert!(
+            !live.contains("latest_block_id"),
+            "the live cursor must come from this reader's own high-water mark: {live}"
+        );
+    }
+
+    // The yardstick is our own read frontier, and it only ever moves forward. The deep backfill
+    // walks OLD slots; if that dragged the frontier down, every live zone would read as settling,
+    // and on recovery as freshly stalled, purely from where the walker happened to be.
+    #[test]
+    fn the_read_frontier_only_moves_forward() {
+        let mut l1 = L1Track::default();
+        l1.note_read_slot(288_000);
+        assert_eq!(l1.ingested_slot, 288_000);
+        assert_eq!(l1.first_ingested_slot, 288_000);
+        l1.note_read_slot(1_200); // backfill, deep in history
+        assert_eq!(l1.ingested_slot, 288_000, "a backfill must not drag the frontier back");
+        assert_eq!(l1.first_ingested_slot, 288_000, "nor restart the watched window");
+        l1.note_read_slot(288_400);
+        assert_eq!(l1.ingested_slot, 288_400);
+        // slot 0 is "unknown", not a real read
+        let mut fresh = L1Track::default();
+        fresh.note_read_slot(0);
+        assert_eq!(fresh.ingested_slot, 0);
+        assert_eq!(fresh.first_ingested_slot, 0);
+    }
+
+    // Settlement must be read off the zone's inscriptions on the L1, never off the `/channel/:id`
+    // record's tip. That record is not a per-block signal - zone 0101 held tip_slot 283143 across
+    // two readings 23 minutes apart, then jumped ~5000 slots, while inscribing 67 times in the
+    // same window - so a verdict derived from it accuses zones that are settling perfectly well.
+    #[test]
+    fn the_verdict_is_not_derived_from_the_channel_tip_record() {
+        let src = include_str!("serve.rs");
+        let body = src
+            .split("fn settling_verdict(")
+            .nth(1)
+            .and_then(|f| f.split_once("\n}"))
+            .map(|(b, _)| b)
+            .expect("settling_verdict is defined");
+        for banned in ["tip_change_unix", "last_tip", "l1_tip_slot", "tip_message"] {
+            assert!(
+                !body.contains(banned),
+                "settling_verdict must not read the channel-tip record ({banned}): {body}"
+            );
+        }
+    }
     #[test]
     fn dashboard_html_has_no_unreplaced_placeholders() {
         let page = DASH_HTML

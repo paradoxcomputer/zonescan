@@ -3,6 +3,55 @@
 Notable changes to **zonescan**. Versioning is semver-ish for a 0.x project: a minor bump
 (`0.x`) carries new features, a patch bump (`0.x.y`) carries fixes.
 
+## [0.8.1] - 2026-08-08
+
+A zone stopped settling to the L1 for a day while still minting a block a minute, and this
+release is what that outage taught. Every fix here is a case of the explorer repeating a
+sequencer's own account of itself instead of checking the chain.
+
+### Fixed
+- **"final" now requires L1 evidence.** The two finality tiers were taken from the sequencer:
+  `finalized` from the `bedrock_status = Finalized` flag a sequencer writes into its own block
+  and hands back over its own RPC, and `safe` lifted for every block the block reader was served,
+  on the assumption that settlement is a sequencer's whole job. Neither consulted the chain, so a
+  zone whose outbox had died certified its own transactions as irreversibly settled: zone 7777
+  reported `finalized_block_id = 1291`, marking its newest transaction final, while its channel
+  had not appeared in an L1 block for 77,000 slots. Both tiers are now capped at the highest
+  block of that zone actually seen inside an L1 block - and, for `final`, seen at or below the
+  finality frontier. With no L1 configured there is nothing to check against, so the zone's own
+  account is left alone rather than blanking every transaction to pending.
+- **A zone whose chain ran ahead of its sequencer stopped ingesting, permanently.** The
+  sequencer-RPC reader took its cursor from `latest_block_id`, a monotonic maximum shared with
+  the L1 walk. A channel can carry two producers' block-id spaces at once, and on zone 0101 the
+  walk raised that field to 3405 while the sequencer being polled answered 1770 - parking the
+  reader at block 3406 of a 1770-block chain, where it fetched nothing further for fifteen hours
+  and could not recover, since the tip would have had to climb 1600 blocks to reach it. The
+  reader now keeps its own high-water mark and re-checks it against the tip on every pass, not
+  just the first. The finality re-read is clamped the same way.
+- **A zone page showed one producer's backlog and hid the live one.** The per-channel feed was
+  ordered by block id, so on a channel with two id spaces every transaction the live sequencer
+  made sorted below the other producer's higher ids and could never reach the top of the page.
+  It is now ordered by wall clock, which is what the global feed already did for this exact
+  reason. Existing history is reindexed on upgrade.
+
+### Added
+- **A settling tag.** Liveness and settlement are different failures and the dashboard could not
+  tell them apart: a stalled outbox mints blocks every minute while nothing reaches the chain.
+  Zones now say `settling` or `not settling` alongside their status, derived from the zone's own
+  inscriptions landing on the L1 - not from the `/channel/:id` record's tip, which is not a
+  per-block signal and can sit still for twenty minutes on a zone that is settling perfectly.
+  Measured in slots rather than seconds, because a finalized block is always about a finality
+  window old in wall-clock, and against the frontier of the chain the explorer has actually read,
+  so falling behind never renders as every zone stalling at once. The threshold is sized from the
+  measured gap between a zone's consecutive inscriptions (median 61-65 slots, p95 ~120), not from
+  the average, because it is the tail that produces false accusations. Channels that settle
+  nothing by construction - data channels and unregistered ones - are not tagged at all.
+
+### Changed
+- Channel `8888…` is labelled `rogue publisher`. It was meant to be frozen when the zone moved to
+  `7777…`, yet it is still inscribing every ~60 slots, signed with this org's bedrock key, from a
+  publisher not running on any host we control.
+
 ## [0.8.0] - 2026-08-07
 
 The Logos testnet reset its chain on 2026-08-05 alongside blockchain_module 0.2.1, and LEZ

@@ -8,7 +8,8 @@
 //!
 //! - `txs`          hash+0+channel → TxRecord                (source of truth, dedup)
 //! - `idx_feed`     inv(block_id)+tail → txkey               (global newest-first feed)
-//! - `idx_channel`  channel+0+inv(block_id)+tail → txkey     (per-sequencer feed)
+//! - `idx_channel`  channel+0+inv(block_id)+tail → txkey     (block-id order; finality scan)
+//! - `idx_chan_time` channel+0+inv(ts)+inv(block_id)+tail → txkey  (per-sequencer FEED)
 //! - `idx_account`  account+0+inv(block_id)+tail → txkey     (account fan-out)
 //!
 //! where `txkey`/`tail` are `hash+0+channel` (see [`tx_key`]). A tx hash covers program +
@@ -41,6 +42,14 @@ const TXS: TableDefinition<&str, &[u8]> = TableDefinition::new("txs");
 // left on disk are harmless orphans.
 const IDX_FEED_TIME: TableDefinition<&[u8], &str> = TableDefinition::new("idx_feed_time");
 const IDX_CHANNEL: TableDefinition<&[u8], &str> = TableDefinition::new("idx_channel");
+// The per-channel FEED index, ordered by wall-clock like the global one. `idx_channel` is
+// ordered by block id and stays that way because `finalized_block_for` depends on walking it
+// highest-id-first - but block id is not a sound sort key for a channel, because a channel can
+// carry more than one producer's id space at once. Zone 0101 does: the L1 shows its inscriptions
+// running to 4713 while its own sequencer answers 1848, so every tx the live sequencer makes
+// sorts below the other producer's backlog and can never reach the top of the page. Ordering the
+// feed by time is the same fix `idx_feed_time` already applies globally.
+const IDX_CHAN_TIME: TableDefinition<&[u8], &str> = TableDefinition::new("idx_chan_time");
 const IDX_ACCOUNT: TableDefinition<&[u8], &str> = TableDefinition::new("idx_account");
 // per-(channel,program) index: key = "channel\0program\0" + inv(block) + hash, value = hash.
 // Range-scan "channel\0program\0".."channel\0program\1" for O(limit) newest-first program txs
@@ -70,9 +79,10 @@ const DEF_HOLDER: TableDefinition<&str, &str> = TableDefinition::new("def_holder
 // only when the program's definitions carry exactly ONE distinct name (see token_op).
 const PROG_DEF: TableDefinition<&str, &str> = TableDefinition::new("prog_def");
 const TOKEN_MAP_VERSION: u64 = 2; // v2: (re)populates prog_def from stored txs
-// Bumped when the tx primary key changes shape. v1 = `hash+0+channel` (was a bare `hash`,
-// which collided across zones with identical genesis txs — see the module docs).
-const TX_KEY_VERSION: u64 = 1;
+// Bumped when the tx primary key changes shape, or when a derived index rebuilt by
+// `migrate_tx_keys` changes layout. v1 = `hash+0+channel` (was a bare `hash`, which collided
+// across zones with identical genesis txs — see the module docs). v2 adds `idx_chan_time`.
+const TX_KEY_VERSION: u64 = 2;
 // Bumped when raw-inscription txs need re-timestamping for the recency-ordered global feed.
 const RAW_TS_VERSION: u64 = 1;
 // Bumped to rebuild the per-(channel,program) index from stored txs (backfill_program_index).
@@ -483,6 +493,7 @@ impl Db {
             let mut txs = w.open_table(TXS)?;
             let mut feed_time = w.open_table(IDX_FEED_TIME)?;
             let mut chan = w.open_table(IDX_CHANNEL)?;
+            let mut chan_time = w.open_table(IDX_CHAN_TIME)?;
             let mut acct = w.open_table(IDX_ACCOUNT)?;
             let mut prog = w.open_table(IDX_PROGRAM)?;
             let mut tdef = w.open_table(TOKEN_DEF)?;
@@ -584,6 +595,14 @@ impl Db {
                 ck.extend_from_slice(&iv);
                 ck.extend_from_slice(h);
                 chan.insert(ck.as_slice(), key.as_str())?;
+
+                let mut ctk = Vec::with_capacity(r.channel.len() + 17 + h.len());
+                ctk.extend_from_slice(r.channel.as_bytes());
+                ctk.push(0);
+                ctk.extend_from_slice(&it);
+                ctk.extend_from_slice(&iv);
+                ctk.extend_from_slice(h);
+                chan_time.insert(ctk.as_slice(), key.as_str())?;
 
                 // per-(channel,program) index for O(limit) program lookups + exact totals.
                 if let Some(p) = r.program.as_deref().filter(|p| !p.is_empty()) {
@@ -717,11 +736,13 @@ impl Db {
             let mut txs = w.open_table(TXS)?;
             let mut feed_time = w.open_table(IDX_FEED_TIME)?;
             let mut chan = w.open_table(IDX_CHANNEL)?;
+            let mut chan_time = w.open_table(IDX_CHAN_TIME)?;
             let mut acct = w.open_table(IDX_ACCOUNT)?;
             let mut prog = w.open_table(IDX_PROGRAM)?;
             txs.retain(|_, _| false)?;
             feed_time.retain(|_, _| false)?;
             chan.retain(|_, _| false)?;
+            chan_time.retain(|_, _| false)?;
             acct.retain(|_, _| false)?;
             prog.retain(|_, _| false)?;
             for rec in &all {
@@ -745,6 +766,14 @@ impl Db {
                 ck.extend_from_slice(&iv);
                 ck.extend_from_slice(&tail);
                 chan.insert(ck.as_slice(), key.as_str())?;
+
+                let mut ctk = Vec::with_capacity(rec.channel.len() + 17 + tail.len());
+                ctk.extend_from_slice(rec.channel.as_bytes());
+                ctk.push(0);
+                ctk.extend_from_slice(&inv(rec.timestamp));
+                ctk.extend_from_slice(&iv);
+                ctk.extend_from_slice(&tail);
+                chan_time.insert(ctk.as_slice(), key.as_str())?;
 
                 if let Some(p) = rec.program.as_deref().filter(|p| !p.is_empty()) {
                     prog.insert(prog_key(&rec.channel, p, &iv, &tail).as_slice(), key.as_str())?;
@@ -1513,7 +1542,9 @@ impl Db {
 
         use std::ops::Bound;
         if let Some(ch) = o.channel {
-            let idx = match r.open_table(IDX_CHANNEL) {
+            // Time-ordered, like the global feed: a channel can carry two producers' block-id
+            // spaces, and sorting by id buries the live one under the other's backlog.
+            let idx = match r.open_table(IDX_CHAN_TIME) {
                 Ok(t) => t,
                 Err(_) => return Ok(vec![]),
             };
@@ -1521,9 +1552,10 @@ impl Db {
             prefix0.push(0);
             let mut hi = ch.as_bytes().to_vec();
             hi.push(1);
-            let cursor = o.after.map(|(_, bid, h, c)| {
+            let cursor = o.after.map(|(ts, bid, h, c)| {
                 let mut k = ch.as_bytes().to_vec();
                 k.push(0);
+                k.extend_from_slice(&inv(ts));
                 k.extend_from_slice(&inv(bid));
                 k.extend_from_slice(&idx_tail(h, c));
                 k
@@ -2547,6 +2579,56 @@ mod tests {
         // a non-token public program: no amount, no token
         let n = rec("h3", "ch", 3, Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"));
         assert_eq!(db.token_op(&n), (None, None));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A channel can carry two producers' block-id spaces at once. Zone 0101 does: the L1 runs
+    // its inscriptions to 4713 while the sequencer we poll answers 1848. Ordering the per-channel
+    // feed by block id therefore buries every tx the live sequencer makes under the other
+    // producer's higher ids, and the zone page shows only the stale generation - which is exactly
+    // what it showed. The feed must order by wall clock, like the global one.
+    #[test]
+    fn a_channel_feed_orders_by_time_not_block_id() {
+        let path = std::env::temp_dir().join(format!("zs-chanorder-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let mk = |hash: &str, blk: u64, ts: u64| TxRecord {
+            hash: hash.into(),
+            kind: "public".into(),
+            subtype: String::new(),
+            program: Some("token".into()),
+            accounts: vec!["a".into()],
+            nullifiers: vec![],
+            commitments: vec![],
+            encrypted_outputs: None,
+            pub_balance: None,
+            instruction_data: vec![],
+            deploy_program: String::new(),
+            bytecode_len: 0,
+            raw_payload: Vec::new(),
+            block_id: blk,
+            channel: "ch".into(),
+            channel_short: "ch".into(),
+            slot: Some(blk),
+            timestamp: ts,
+            seen_unix: 0,
+        };
+        // the other producer's backlog: high ids, but OLD. then the live sequencer: low id, NEW.
+        db.commit(
+            &[mk("old_high", 4700, 1_000), mk("older_high", 4699, 900), mk("live_low", 1848, 9_000)],
+            &[], &[], &[],
+        )
+        .unwrap();
+
+        let got = db
+            .feed(&FeedOpts { channel: Some("ch"), limit: 10, ..Default::default() })
+            .unwrap();
+        let order: Vec<&str> = got.iter().map(|r| r.hash.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["live_low", "old_high", "older_high"],
+            "the newest tx must lead even though its block id is the lowest"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

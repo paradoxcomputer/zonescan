@@ -54,11 +54,16 @@ pub const CHANNEL_ALIASES: &[(&str, &str)] = &[
         "7777777777777777777777777777777777777777777777777777777777777777",
         "Paradox Computer",
     ),
-    // The rc5-era Paradox zone, frozen at block 42036 when the sequencer moved to
-    // 7777… on 2026-07-31. Kept tracked (history + rc5 badge), no sequencer RPC.
+    // Named for what it is, not what it was. This is the rc5-era Paradox channel, and it was
+    // supposed to be frozen at block 42036 when the sequencer moved to 7777… on 2026-07-31 -
+    // yet on 2026-08-08 it was still inscribing to the L1 every ~60 slots, signed with the
+    // bedrock key this org holds, from a publisher we could not find on any box we control.
+    // It shares the funding wallet, so every note it spends is a note our own sequencer then
+    // double-spends against - which is why 7777… settled nothing for a day while this kept
+    // landing. Kept tracked so it stays visible.
     (
         "8888888888888888888888888888888888888888888888888888888888888888",
-        "Paradox Computer (old)",
+        "rogue publisher",
     ),
     // The default LEZ "dev" channel: stock config (default all-0x25 key) settles here,
     // so it's a shared/contended commons, not our zone. We were on it pre-2026-07-01 reset.
@@ -1360,9 +1365,10 @@ mod tests {
         // known id -> friendly name (accepts a 0x prefix / any case)
         assert_eq!(channel_alias(paradox), Some("Paradox Computer"));
         assert_eq!(channel_alias(&format!("0x{}", paradox.to_uppercase())), Some("Paradox Computer"));
-        // prior zones kept as archived aliases
+        // The rc5-era channel, named for its behaviour: it never stopped inscribing after the
+        // zone moved off it, and it spends the funding wallet 7777… needs.
         let rc5 = "8888888888888888888888888888888888888888888888888888888888888888";
-        assert_eq!(channel_alias(rc5), Some("Paradox Computer (old)"));
+        assert_eq!(channel_alias(rc5), Some("rogue publisher"));
         let old = "0101010101010101010101010101010101010101010101010101010101010101";
         assert_eq!(channel_alias(old), Some("dev · shared default channel"));
         // unknown id -> None (caller keeps the short-hex rendering)
