@@ -50,4 +50,4 @@ programs = { git = "https://github.com/logos-blockchain/logos-execution-zone.git
 # `host` feature, so naming it here costs no extra compilation - it just makes it nameable.
 lee_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.4", features = ["host"], optional = true }
 borsh = { version = "1.5", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
